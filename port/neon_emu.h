@@ -83,6 +83,16 @@ NE_STATIC int32x2_t vreinterpret_s32_u32(uint32x2_t a) { int32x2_t r; memcpy(r.v
 NE_STATIC int32x2_t vpmin_s32(int32x2_t a, int32x2_t b) { int32x2_t r; r.v[0] = a.v[0] < a.v[1] ? a.v[0] : a.v[1]; r.v[1] = b.v[0] < b.v[1] ? b.v[0] : b.v[1]; return r; }
 NE_STATIC int32x2_t vpmax_s32(int32x2_t a, int32x2_t b) { int32x2_t r; r.v[0] = a.v[0] > a.v[1] ? a.v[0] : a.v[1]; r.v[1] = b.v[0] > b.v[1] ? b.v[0] : b.v[1]; return r; }
 NE_STATIC int32_t vget_lane_s32(int32x2_t a, int n) { return a.v[n]; }
+NE_STATIC int16x4_t vshrn_n_s32(int32x4_t a, int n) { NE_RANGE(n, 1, 16); int16x4_t r; for (int i = 0; i < 4; i++) r.v[i] = (int16_t) (a.v[i] >> n); return r; }
+NE_STATIC int16x8_t vcombine_s16(int16x4_t lo, int16x4_t hi) { int16x8_t r; memcpy(r.v, lo.v, 8); memcpy(r.v + 4, hi.v, 8); return r; }
+NE_STATIC int16x8_t vdupq_n_s16(int16_t x) { int16x8_t r; for (int i = 0; i < 8; i++) r.v[i] = x; return r; }
+NE_STATIC int16x8_t vandq_s16(int16x8_t a, int16x8_t b) { for (int i = 0; i < 8; i++) a.v[i] &= b.v[i]; return a; }
+NE_STATIC int16x8_t vaddq_s16(int16x8_t a, int16x8_t b) { for (int i = 0; i < 8; i++) a.v[i] = (int16_t) (a.v[i] + b.v[i]); return a; }
+NE_STATIC int16x8_t vsubq_s16(int16x8_t a, int16x8_t b) { for (int i = 0; i < 8; i++) a.v[i] = (int16_t) (a.v[i] - b.v[i]); return a; }
+NE_STATIC int16x8_t vminq_s16(int16x8_t a, int16x8_t b) { for (int i = 0; i < 8; i++) a.v[i] = a.v[i] < b.v[i] ? a.v[i] : b.v[i]; return a; }
+NE_STATIC int16x8_t vmaxq_s16(int16x8_t a, int16x8_t b) { for (int i = 0; i < 8; i++) a.v[i] = a.v[i] > b.v[i] ? a.v[i] : b.v[i]; return a; }
+NE_STATIC uint16x8_t vcgtq_s16(int16x8_t a, int16x8_t b) { uint16x8_t r; for (int i = 0; i < 8; i++) r.v[i] = a.v[i] > b.v[i] ? 0xFFFF : 0; return r; }
+NE_STATIC uint16x8_t vmulq_n_u16(uint16x8_t a, uint16_t b) { for (int i = 0; i < 8; i++) a.v[i] = (uint16_t) (a.v[i] * b); return a; }
 NE_STATIC uint16x8_t vorrq_u16(uint16x8_t a, uint16x8_t b) { for (int i = 0; i < 8; i++) a.v[i] |= b.v[i]; return a; }
 NE_STATIC uint32x4_t vcgeq_u32(uint32x4_t a, uint32x4_t b) { uint32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] >= b.v[i] ? 0xFFFFFFFFu : 0; return r; }
 NE_STATIC uint32x4_t vbslq_u32(uint32x4_t m, uint32x4_t a, uint32x4_t b) { uint32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = (m.v[i] & a.v[i]) | (~m.v[i] & b.v[i]); return r; }

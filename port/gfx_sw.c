@@ -603,6 +603,11 @@ static const float kInvLen[33] = {
     1.0f / 31, 1.0f / 32,
 };
 
+/* extra "texenv" of the NEON spans: MODULATE by a black flat colour plus a flat offset
+   colour (the front-end's way of drawing a texture's shape in one colour: the clouds, the
+   speedometer...) is that offset colour with the texel's alpha */
+#define NV_TEXA 4
+
 /* exact DIV255 of a product (<= 255 * 255) */
 static inline __attribute__((always_inline)) uint8x8_t nv_div255(uint16x8_t x) {
     return vrshrn_n_u16(vaddq_u16(x, vrshrq_n_u16(x, 8)), 8);
@@ -723,6 +728,8 @@ static inline __attribute__((always_inline)) void nv_shade(uint8x8_t *pr, uint8x
         } else if (TEX == GFX_TEXENV_MODULATE) {
             r = nv_div255(vmull_u8(r, t.val[2])); g = nv_div255(vmull_u8(g, t.val[1])); b = nv_div255(vmull_u8(b, t.val[0]));
             al = t.val[3];
+        } else if (TEX == NV_TEXA) {
+            al = t.val[3];   /* r g b: the flat colour (the offset colour, see raster_tri) */
         } else if (TEX == GFX_TEXENV_DECAL) {
             uint8x8_t ia = vmvn_u8(t.val[3]);
             r = nv_div255(vmlal_u8(vmull_u8(r, ia), t.val[2], t.val[3]));
@@ -889,7 +896,7 @@ static void nv_fetch3_ref(uint32_t *out, int len, int32_t U, int32_t dU, int32_t
 }
 #endif
 
-static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, int32_t dV, const TriCtx *c) {
+static void nv_fetch3_32(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, int32_t dV, const TriCtx *c) {
     uint32_t ia[8] __attribute__((aligned(16))), ib[8] __attribute__((aligned(16))), ic[8] __attribute__((aligned(16)));
     uint32_t A[8] __attribute__((aligned(16))), B[8] __attribute__((aligned(16))), C[8] __attribute__((aligned(16)));
     static const int32_t kLane[4] = { 0, 1, 2, 3 };
@@ -938,6 +945,72 @@ static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, 
         }
         uint8x8x4_t a = vld4_u8((const uint8_t *) A), b = vld4_u8((const uint8_t *) B), cc = vld4_u8((const uint8_t *) C), r;
         const uint8x8_t s8 = vmovn_u16(vcombine_u16(sh[0], sh[1])), t8 = vmovn_u16(vcombine_u16(th4[0], th4[1]));
+        const uint8x8_t w0 = vsub_u8(vsub_u8(vdup_n_u8(128), s8), t8);
+        for (int k = 0; k < 4; k++)
+            r.val[k] = vrshrn_n_u16(vmlal_u8(vmlal_u8(vmull_u8(a.val[k], w0), b.val[k], s8), cc.val[k], t8), 7);
+        vst4_u8((uint8_t *) (out + o), r);
+    }
+}
+
+/* the same with the texel indices and weights in 16-bit lanes (8 pixels per instruction):
+   textures of up to 65536 texels; U >> 16 always fits 16 bits */
+static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, int32_t dV, const TriCtx *c) {
+    const int tw = c->tw, th = c->th;
+    if (tw * th > 65536) {
+        nv_fetch3_32(out, len, U, dU, V, dV, c);
+        return;
+    }
+    uint16_t ia[8] __attribute__((aligned(16))), ib[8] __attribute__((aligned(16))), ic[8] __attribute__((aligned(16)));
+    uint32_t A[8] __attribute__((aligned(16))), B[8] __attribute__((aligned(16))), C[8] __attribute__((aligned(16)));
+    static const int32_t kLane[4] = { 0, 1, 2, 3 };
+    const uint32_t *tpx = c->tpx;
+    const int ur = c->uwrap == WR_REPEAT2, vr = c->vwrap == WR_REPEAT2;
+    const int32x4_t lane = vld1q_s32(kLane);
+    const int16x8_t k127 = vdupq_n_s16(127), k128 = vdupq_n_s16(128), one = vdupq_n_s16(1), zero = vdupq_n_s16(0),
+                    umax = vdupq_n_s16((int16_t) (tw - 1)), vmax = vdupq_n_s16((int16_t) (th - 1));
+    U -= 32768 + 256;   /* texel centres (and without the 1/256 nudge of the point sampler) */
+    V -= 32768 + 256;
+    for (int o = 0; o < len; o += 8) {
+        const int32_t U0 = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) o);
+        const int32_t V0 = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) o);
+        const int32x4_t ua = vmlaq_n_s32(vdupq_n_s32(U0), lane, dU);
+        const int32x4_t ub = vaddq_s32(ua, vdupq_n_s32((int32_t) ((uint32_t) dU * 4)));
+        const int32x4_t va = vmlaq_n_s32(vdupq_n_s32(V0), lane, dV);
+        const int32x4_t vb = vaddq_s32(va, vdupq_n_s32((int32_t) ((uint32_t) dV * 4)));
+        const int16x8_t iu = vcombine_s16(vshrn_n_s32(ua, 16), vshrn_n_s32(ub, 16));
+        const int16x8_t iv = vcombine_s16(vshrn_n_s32(va, 16), vshrn_n_s32(vb, 16));
+        const int16x8_t fs = vandq_s16(vcombine_s16(vshrn_n_s32(ua, 9), vshrn_n_s32(ub, 9)), k127);
+        const int16x8_t ft = vandq_s16(vcombine_s16(vshrn_n_s32(va, 9), vshrn_n_s32(vb, 9)), k127);
+        int16x8_t u0, u1, v0, v1;
+        if (ur) {
+            u0 = vandq_s16(iu, umax);
+            u1 = vandq_s16(vaddq_s16(iu, one), umax);
+        } else {
+            u0 = vmaxq_s16(vminq_s16(iu, umax), zero);
+            u1 = vmaxq_s16(vminq_s16(vaddq_s16(iu, one), umax), zero);
+        }
+        if (vr) {
+            v0 = vandq_s16(iv, vmax);
+            v1 = vandq_s16(vaddq_s16(iv, one), vmax);
+        } else {
+            v0 = vmaxq_s16(vminq_s16(iv, vmax), zero);
+            v1 = vmaxq_s16(vminq_s16(vaddq_s16(iv, one), vmax), zero);
+        }
+        const uint16x8_t r0 = vmulq_n_u16(vreinterpretq_u16_s16(v0), (uint16_t) tw);
+        const uint16x8_t r1 = vmulq_n_u16(vreinterpretq_u16_s16(v1), (uint16_t) tw);
+        const uint16x8_t U0v = vreinterpretq_u16_s16(u0), U1v = vreinterpretq_u16_s16(u1);
+        /* far side of the diagonal (s + t > 1): the opposite corner and 1 - s, 1 - t */
+        const uint16x8_t far = vcgtq_s16(vaddq_s16(fs, ft), k128);
+        vst1q_u16(ia, vbslq_u16(far, vaddq_u16(r1, U1v), vaddq_u16(r0, U0v)));
+        vst1q_u16(ib, vbslq_u16(far, vaddq_u16(r1, U0v), vaddq_u16(r0, U1v)));
+        vst1q_u16(ic, vbslq_u16(far, vaddq_u16(r0, U1v), vaddq_u16(r1, U0v)));
+        const uint8x8_t s8 = vmovn_u16(vbslq_u16(far, vreinterpretq_u16_s16(vsubq_s16(k128, fs)), vreinterpretq_u16_s16(fs)));
+        const uint8x8_t t8 = vmovn_u16(vbslq_u16(far, vreinterpretq_u16_s16(vsubq_s16(k128, ft)), vreinterpretq_u16_s16(ft)));
+        for (int i = 0; i < 8; i++) {
+            const uint32_t a = tpx[ia[i]], b = tpx[ib[i]], cc = tpx[ic[i]];
+            A[i] = a; B[i] = b; C[i] = cc;
+        }
+        uint8x8x4_t a = vld4_u8((const uint8_t *) A), b = vld4_u8((const uint8_t *) B), cc = vld4_u8((const uint8_t *) C), r;
         const uint8x8_t w0 = vsub_u8(vsub_u8(vdup_n_u8(128), s8), t8);
         for (int k = 0; k < 4; k++)
             r.val[k] = vrshrn_n_u16(vmlal_u8(vmlal_u8(vmull_u8(a.val[k], w0), b.val[k], s8), cc.val[k], t8), 7);
@@ -1102,14 +1175,14 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
         return nv_span(c, py, xs, xe, a, d, O, T - 1, C); \
     }
 #define NV_DEF_T(O, T) NV_DEF(O, T, 0) NV_DEF(O, T, 1) NV_DEF(O, T, 2) NV_DEF(O, T, 3) NV_DEF(O, T, 4)
-#define NV_DEF_O(O) NV_DEF_T(O, 0) NV_DEF_T(O, 1) NV_DEF_T(O, 2) NV_DEF_T(O, 3) NV_DEF_T(O, 4)
+#define NV_DEF_O(O) NV_DEF_T(O, 0) NV_DEF_T(O, 1) NV_DEF_T(O, 2) NV_DEF_T(O, 3) NV_DEF_T(O, 4) NV_DEF_T(O, 5)
 NV_DEF_O(0)
 NV_DEF_O(1)
 NV_DEF_O(2)
 #define NV_REF_T(O, T) { nv_##O##_##T##_0, nv_##O##_##T##_1, nv_##O##_##T##_2, nv_##O##_##T##_3, nv_##O##_##T##_4 }
-#define NV_REF_O(O) { NV_REF_T(O, 0), NV_REF_T(O, 1), NV_REF_T(O, 2), NV_REF_T(O, 3), NV_REF_T(O, 4) }
+#define NV_REF_O(O) { NV_REF_T(O, 0), NV_REF_T(O, 1), NV_REF_T(O, 2), NV_REF_T(O, 3), NV_REF_T(O, 4), NV_REF_T(O, 5) }
 /* [list kind][texenv + 1 (0 = untextured)][colour mode] */
-static const SpanFn sNvFns[3][5][5] = { NV_REF_O(0), NV_REF_O(1), NV_REF_O(2) };
+static const SpanFn sNvFns[3][6][5] = { NV_REF_O(0), NV_REF_O(1), NV_REF_O(2) };
 static int sUseNeon = 1;
 
 static int wrap_mode(int n, int clamp, int mirror) {
@@ -1253,6 +1326,16 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
             opaque = va255 && tx->opaque;
         else
             opaque = tx->opaque;
+        int env = textured ? c.texenv + 1 : 0;
+        if (textured && c.texenv == GFX_TEXENV_MODULATE && !c.fog && (c0 & 0x00FFFFFFu) == 0 &&
+            v1->color.packed == c0 && v2->color.packed == c0 &&
+            ((v0->pad0.vertindex ^ v1->pad0.vertindex) & 0x00FFFFFFu) == 0 &&
+            ((v0->pad0.vertindex ^ v2->pad0.vertindex) & 0x00FFFFFFu) == 0) {
+            const uint32_t o = v0->pad0.vertindex;
+            env = NV_TEXA + 1;
+            col = 0;
+            c.r = (o >> 16) & 0xFF; c.g = (o >> 8) & 0xFF; c.b = o & 0xFF;
+        }
         int out = kind;
         if (opaque && kind == KIND_TR) {
             out = KIND_OP;
@@ -1261,7 +1344,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         } else if (opaque && kind == KIND_PT) {
             out = KIND_OP;
         }
-        span = sNvFns[out][textured ? c.texenv + 1 : 0][col];
+        span = sNvFns[out][env][col];
         nv_prepare(&nvs, ddx, col);
         c.nvs = &nvs;
     }
