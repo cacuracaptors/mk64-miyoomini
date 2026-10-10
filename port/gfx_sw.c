@@ -264,7 +264,9 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     const float ftw = (float) tw, fth = (float) th;
     const uint32_t *tpx = textured ? tx->px : NULL;
     const int texenv = st->texenv;
-    const int dtest = st->depth_test;
+    /* PVR translucent list (autosort): always depth-tested against the opaque/punch-through
+       depth, whatever the poly's compare mode, and never writes depth */
+    const int dtest = st->depth_test || kind == KIND_TR;
     const int dwrite = st->depth_write && kind != KIND_TR;
     const int fog = st->fog;
     const int fr = (sFogColor >> 16) & 0xFF, fg = (sFogColor >> 8) & 0xFF, fb = sFogColor & 0xFF;
@@ -810,9 +812,63 @@ static void flush_bucket(Bucket *b, int kind) {
     }
 }
 
+/* TR list = PVR autosort: translucent triangles are composited back to front by depth
+   (z = 1/w, smaller = farther), not in submission order. Approximated per triangle by
+   its mean z; equal depths keep submission order (2D overlays step z per quad). */
+typedef struct {
+    float key;
+    uint32_t seq;
+    uint16_t batch;
+} TrSort;
+
+static TrSort sTrSort[BUCKET_VERTS / 3];
+
+static int tr_cmp(const void *a, const void *b) {
+    const TrSort *x = a, *y = b;
+    if (x->key < y->key) return -1;
+    if (x->key > y->key) return 1;
+    return (x->seq > y->seq) - (x->seq < y->seq);
+}
+
+static void flush_tr_sorted(void) {
+    Bucket *b = &sTR;
+    uint32_t nt = 0;
+    for (int i = 0; i < b->nbatch; i++) {
+        Batch *bt = &b->batch[i];
+        if (sCapF && bt->count)
+            cap_draw(&b->verts[bt->start], bt->count, &bt->st, KIND_TR);
+        for (uint32_t t = 0; t + 2 < bt->count; t += 3) {
+            const dc_fast_t *v = &b->verts[bt->start + t];
+            sTrSort[nt].key = v[0].vert.z + v[1].vert.z + v[2].vert.z;
+            sTrSort[nt].seq = bt->start + t;
+            sTrSort[nt].batch = (uint16_t) i;
+            nt++;
+        }
+    }
+    qsort(sTrSort, nt, sizeof(sTrSort[0]), tr_cmp);
+    for (uint32_t i = 0; i < nt; i++) {
+        const dc_fast_t *v = &b->verts[sTrSort[i].seq];
+        raster_tri(&v[0], &v[1], &v[2], &b->batch[sTrSort[i].batch].st, KIND_TR);
+    }
+    stTrTris += nt;
+}
+
+/* replay tool only: append a captured batch with its recorded state */
+static __attribute__((unused)) void bucket_add_batch(Bucket *b, const RState *st, const dc_fast_t *v, size_t n) {
+    if (b->nbatch >= BUCKET_BATCH || b->nverts + n > BUCKET_VERTS)
+        return;
+    Batch *bt = &b->batch[b->nbatch++];
+    bt->st = *st;
+    bt->start = b->nverts;
+    bt->count = (uint32_t) n;
+    memcpy(&b->verts[b->nverts], v, n * sizeof(dc_fast_t));
+    b->nverts += (uint32_t) n;
+    b->cur = -1;
+}
+
 static void sw_end_frame(void) {
     flush_bucket(&sPT, KIND_PT);
-    flush_bucket(&sTR, KIND_TR);
+    flush_tr_sorted();
     stRasterMs += port_now_ms() - sFrameT0;
     if (sCapF)
         cap_end();
