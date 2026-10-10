@@ -274,7 +274,7 @@ static inline __attribute__((always_inline)) void tex_combine(const int env, uin
 }
 
 /* fog, list-specific step (PT alpha test / TR blend) and the store */
-static inline __attribute__((always_inline)) void px_finish(uint16_t *cp, float *zp, float z, int r, int g, int b, int al,
+static inline __attribute__((always_inline)) void px_finish(uint16_t *cp, uint32_t *zp, uint32_t z, int r, int g, int b, int al,
                                                             int f, const TriCtx *c, int dwrite, const int KIND, const int FOG) {
     if (FOG && c->fog) {
         r += ((c->fr - r) * f) / 255;
@@ -334,6 +334,19 @@ static inline int axis_mask(int32_t U, int32_t dU, int n, int size, int mode, ui
     return 0;
 }
 
+/* Depth is stored as an unsigned integer: z (= 1/w, larger = nearer) x 2^28. Comparing
+   integers keeps the per-pixel test out of the VFP (a float compare plus moving its flags
+   to the ARM core costs a pipeline stall on the Cortex-A7 at every pixel). It is stepped
+   in integers and recomputed from the exact float value every 16 pixels. */
+#define ZSCALE 268435456.0f
+static inline uint32_t zfix(float z) {
+    if (!(z > 0.0f))
+        return 0;
+    if (z >= 15.99f)
+        return 0xFFFFFFF0u;
+    return (uint32_t) (z * ZSCALE);
+}
+
 /* one horizontal span: pixels [xs, xe) of row py, attributes a[] at pixel xs */
 static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c, int py, int xs, int xe,
                                                                  const float *a, const float *ddx,
@@ -341,9 +354,10 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
     /* TEX: 0 = untextured, 1 = textured (c->persp picks affine or perspective-correct) */
     const int W = port_render_w;
     uint16_t *restrict cp = port_color + py * W + xs;
-    float *restrict zp = port_depth + py * W + xs;
-    float z = a[A_Z];
+    uint32_t *restrict zp = port_depth + py * W + xs;
+    float zf = a[A_Z];
     const float dz = ddx[A_Z];
+    const int32_t dzi = (int32_t) lrintf(dz * ZSCALE);
     const int dtest = c->dtest, dwrite = c->dwrite;
     int32_t R = 0, G = 0, B = 0, A = 0, OR = 0, OG = 0, OB = 0, F = 0;
     int32_t dR = 0, dG = 0, dB = 0, dA = 0, dOR = 0, dOG = 0, dOB = 0, dF = 0;
@@ -376,26 +390,31 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
         if (b > 255) b = 255;                                                                    \
     }
 #define PX_STEP()                                                                                \
-    z += dz;                                                                                     \
+    zi += (uint32_t) dzi;                                                                        \
     if (GOUR) { R += dR; G += dG; B += dB; A += dA; }                                            \
     if (GOUR == 2) { OR += dOR; OG += dOG; OB += dOB; F += dF; }
 
     if (TEX == 0) {
-        for (int n = xe - xs; n > 0; n--, cp++, zp++) {
-            if (!dtest || z >= *zp) {
-                PX_COLOUR();
-                px_finish(cp, zp, z, r, g, b, al, clamp8(F >> 16), c, dwrite, KIND, GOUR == 2);
+        for (int px = xs; px < xe; px += 16) {
+            int len = xe - px < 16 ? xe - px : 16;
+            uint32_t zi = zfix(zf);
+            for (int n = len; n > 0; n--, cp++, zp++) {
+                if (!dtest || zi >= *zp) {
+                    PX_COLOUR();
+                    px_finish(cp, zp, zi, r, g, b, al, clamp8(F >> 16), c, dwrite, KIND, GOUR == 2);
+                }
+                PX_STEP();
             }
-            PX_STEP();
+            zf += dz * len;
         }
         return (uint32_t) (xe - xs);
     }
 
-    /* textured: runs of pixels with linear texel coordinates (the whole span when affine,
-       16 pixels when perspective-correct), each drawn by the fastest loop that fits */
+    /* textured: runs of 16 pixels with linear texel coordinates (exact at each run start when
+       perspective-correct), each drawn by the fastest loop that fits */
     const uint32_t *const tpx = c->tpx;
     const int tw = c->tw, th = c->th;
-    float uz = 0, vz = 0, duz = 0, dvz = 0, zz = 0;
+    float uz = 0, vz = 0, duz = 0, dvz = 0;
     int32_t U = 0, V = 0, dU = 0, dV = 0;
     const int persp = c->persp;
     if (!persp) {
@@ -405,18 +424,16 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
         U = (int32_t) lrintf(u * 65536.0f) + 256; dU = (int32_t) lrintf(ddx[A_U] * c->ftw * 65536.0f);
         V = (int32_t) lrintf(v * 65536.0f) + 256; dV = (int32_t) lrintf(ddx[A_V] * c->fth * 65536.0f);
     } else {
-        uz = a[A_U]; vz = a[A_V]; zz = z;
+        uz = a[A_U]; vz = a[A_V];
         duz = ddx[A_U]; dvz = ddx[A_V];
     }
-    int px = xs;
-    while (px < xe) {
-        int len = xe - px;
+    for (int px = xs; px < xe; px += 16) {
+        int len = xe - px < 16 ? xe - px : 16;
+        uint32_t zi = zfix(zf);
         if (persp) {
-            if (len > 16)
-                len = 16;
-            float iz0 = 1.0f / zz;
+            float iz0 = 1.0f / zf;
             float u0 = uz * iz0 * c->ftw + c->bias, v0 = vz * iz0 * c->fth + c->bias;
-            float zz1 = zz + dz * len;
+            float zz1 = zf + dz * len;
             float iz1 = 1.0f / zz1;
             float u1 = (uz + duz * len) * iz1 * c->ftw + c->bias, v1 = (vz + dvz * len) * iz1 * c->fth + c->bias;
             float fu = tc_fold(u0, tw, c->uwrap), fv = tc_fold(v0, th, c->vwrap);
@@ -425,18 +442,18 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
             float il = 1.0f / (float) len;
             U = (int32_t) lrintf(fu * 65536.0f) + 256; dU = (int32_t) lrintf((u1 - fu) * il * 65536.0f);
             V = (int32_t) lrintf(fv * 65536.0f) + 256; dV = (int32_t) lrintf((v1 - fv) * il * 65536.0f);
-            uz += duz * len; vz += dvz * len; zz = zz1;
+            uz += duz * len; vz += dvz * len;
         }
         uint32_t um, vm;
         if (axis_mask(U, dU, len, tw, c->uwrap, &um) && axis_mask(V, dV, len, th, c->vwrap, &vm)) {
 #define FAST_LOOP(ENV)                                                                           \
             for (int n = len; n > 0; n--, cp++, zp++) {                                          \
-                if (!dtest || z >= *zp) {                                                        \
+                if (!dtest || zi >= *zp) {                                                       \
                     PX_COLOUR();                                                                 \
                     uint32_t tc = tpx[((uint32_t) (V >> 16) & vm) * tw + ((uint32_t) (U >> 16) & um)]; \
                     tex_combine(ENV, tc, &r, &g, &b, &al);                                       \
                     PX_OFFSET();                                                                 \
-                    px_finish(cp, zp, z, r, g, b, al, clamp8(F >> 16), c, dwrite, KIND, GOUR == 2); \
+                    px_finish(cp, zp, zi, r, g, b, al, clamp8(F >> 16), c, dwrite, KIND, GOUR == 2); \
                 }                                                                                \
                 PX_STEP();                                                                       \
                 U += dU; V += dV;                                                                \
@@ -452,19 +469,19 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
             /* clamp / mirror / odd sizes crossing an edge: wrap every texel */
             const int env = c->texenv;
             for (int n = len; n > 0; n--, cp++, zp++) {
-                if (!dtest || z >= *zp) {
+                if (!dtest || zi >= *zp) {
                     PX_COLOUR();
                     int iu = tc_wrap(U >> 16, tw, c->umask, c->uwrap);
                     int iv = tc_wrap(V >> 16, th, c->vmask, c->vwrap);
                     tex_combine(env, tpx[iv * tw + iu], &r, &g, &b, &al);
                     PX_OFFSET();
-                    px_finish(cp, zp, z, r, g, b, al, clamp8(F >> 16), c, dwrite, KIND, GOUR == 2);
+                    px_finish(cp, zp, zi, r, g, b, al, clamp8(F >> 16), c, dwrite, KIND, GOUR == 2);
                 }
                 PX_STEP();
                 U += dU; V += dV;
             }
         }
-        px += len;
+        zf += dz * len;
     }
 #undef PX_COLOUR
 #undef PX_OFFSET
@@ -1107,7 +1124,7 @@ static void raster_frame_band(int mask, int val) {
             continue;
         int rows = H - y0 < 8 ? H - y0 : 8;
         memset(port_color + y0 * W, 0, (size_t) rows * W * sizeof(uint16_t));
-        memset(port_depth + y0 * W, 0, (size_t) rows * W * sizeof(float));
+        memset(port_depth + y0 * W, 0, (size_t) rows * W * sizeof(uint32_t));
     }
     double t1 = port_now_ms();
     flush_bucket(&sOP, KIND_OP);

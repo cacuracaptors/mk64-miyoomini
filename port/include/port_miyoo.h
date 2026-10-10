@@ -20,7 +20,7 @@ void port_audio_pump(void);
 /* port/video_miyoo.c: the software renderer draws into port_color / port_depth */
 extern int port_render_w, port_render_h;
 extern uint16_t *port_color;   /* RGB565, port_render_w x port_render_h */
-extern float *port_depth;      /* 1/w, larger = nearer, cleared to 0 */
+extern uint32_t *port_depth;   /* 1/w x 2^28, larger = nearer, cleared to 0 */
 void port_video_init(int hires);
 void port_video_present(void);
 void port_video_shutdown(void);

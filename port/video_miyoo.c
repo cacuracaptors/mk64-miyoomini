@@ -31,7 +31,7 @@
 
 int port_render_w = 320, port_render_h = 240;
 uint16_t *port_color;
-float *port_depth;
+uint32_t *port_depth;
 
 static uint16_t *cbuf[3];
 static int cur_idx;          /* buffer being drawn */
@@ -263,7 +263,7 @@ void port_video_init(int hires) {
             exit(1);
         }
     }
-    port_depth = calloc(n, sizeof(float));
+    port_depth = calloc(n, sizeof(uint32_t));
     if (!port_depth) {
         fprintf(stderr, "video: sem memoria\n");
         exit(1);
