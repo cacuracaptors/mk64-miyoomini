@@ -283,8 +283,14 @@ static inline float tc_fold(float u, int n, int mode) {
     if (mode == WR_CLAMP)
         return u < -64.0f ? -64.0f : (u > (float) n + 64.0f ? (float) n + 64.0f : u);
     float period = (mode == WR_MIRROR2 || mode == WR_MIRRORN) ? 2.0f * n : (float) n;
-    if (u >= 0.0f && u < 16384.0f && (mode == WR_REPEAT2 || mode == WR_MIRROR2))
-        return u;   /* pow2 wrap only looks at the low bits: no folding needed */
+    if (mode == WR_REPEAT2 || mode == WR_MIRROR2) {
+        /* pow2 wrap only looks at the low bits: no folding needed while |u| < 16384
+           (tested on the float's bits: no compare, so no wait for the VFP flags) */
+        uint32_t b;
+        memcpy(&b, &u, 4);
+        if ((b & 0x7FFFFFFFu) < 0x46800000u)
+            return u;
+    }
     float q = u / period;
     float fq;
     if (q > -8388608.0f && q < 8388608.0f) {   /* floorf without the library call */
@@ -386,11 +392,24 @@ static inline int axis_mask(int32_t U, int32_t dU, int n, int size, int mode, ui
    in integers and recomputed from the exact float value every 16 pixels. */
 #define ZSCALE 268435456.0f
 static inline uint32_t zfix(float z) {
-    if (!(z > 0.0f))
-        return 0;
-    if (z >= 15.99f)
-        return 0xFFFFFFF0u;
-    return (uint32_t) (z * ZSCALE);
+    const float t = z * ZSCALE;
+#if defined(__arm__) && defined(__ARM_FP)
+    /* the VFP conversion saturates (negative and NaN -> 0, too big -> 0xFFFFFFFF): no
+       compare, so no wait for the VFP flags */
+    float c;
+    uint32_t r;
+    __asm__("vcvt.u32.f32 %0, %1" : "=t"(c) : "t"(t));
+    memcpy(&r, &c, 4);
+#else
+    uint32_t r;
+    if (!(t > 0.0f))
+        r = 0;
+    else if (t >= 4294967296.0f)
+        r = 0xFFFFFFFFu;
+    else
+        r = (uint32_t) t;
+#endif
+    return r > 0xFFFFFFF0u ? 0xFFFFFFF0u : r;
 }
 
 /* one horizontal span: pixels [xs, xe) of row py, attributes a[] at pixel xs */
