@@ -285,6 +285,22 @@ static inline void ceil2_minmax(float a, float b, int *lo, int *hi) {
     *hi = vget_lane_s32(mm, 1);
 }
 
+/* the same, with the start clamped to 0 and the end to w, and the start also as a float
+   (made in NEON: no trip through the integer registers back to the VFP) */
+static inline float ceil2_clamp(float a, float b, int w, int *lo, int *hi) {
+    static const int32_t kMin[2] = { 0, -2147483647 - 1 };
+    const float32x2_t x = vset_lane_f32(b, vdup_n_f32(a), 1);
+    const int32x2_t t = vcvt_s32_f32(x);
+    const uint32x2_t up = vcgt_f32(x, vcvt_f32_s32(t));
+    const int32x2_t c = vsub_s32(t, vreinterpret_s32_u32(up));
+    int32x2_t mm = vpmax_s32(vpmin_s32(c, c), c);   /* lane 0 = min, lane 1 = max */
+    const int32_t kMax[2] = { 2147483647, w };
+    mm = vmin_s32(vmax_s32(mm, vld1_s32(kMin)), vld1_s32(kMax));
+    *lo = vget_lane_s32(mm, 0);
+    *hi = vget_lane_s32(mm, 1);
+    return vget_lane_f32(vcvt_f32_s32(mm), 0);
+}
+
 /* (int) ceilf(f) for |f| < 2^24, without the library call */
 static inline int ceil_i(float f) {
     int i = (int) f;
@@ -1067,6 +1083,113 @@ static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, 
     }
 }
 
+/* ---- texel fetch along a run (no wrap inside it, or power-of-two wrap by mask) ----
+ * tex[i] = tpx[((V >> 16) & vm) * tw + ((U >> 16) & um)], U += dU, V += dV, for i < n.
+ * Inside nv_span the compiler runs out of registers and reloads its variables from the
+ * stack in this loop; written by hand it keeps everything in registers and starts both
+ * texel loads before using either (the Cortex-A7 waits 3 cycles for a load). */
+typedef struct { int32_t U, V, dU, dV; uint32_t um, vm; int32_t tw; } TexWalk;
+
+static void fetch_texels_c(uint32_t *tex, const uint32_t *tpx, int n, TexWalk *w) {
+    uint32_t U = (uint32_t) w->U, V = (uint32_t) w->V;
+    for (int i = 0; i < n; i++) {
+        tex[i] = tpx[((uint32_t) ((int32_t) V >> 16) & w->vm) * (uint32_t) w->tw + ((uint32_t) ((int32_t) U >> 16) & w->um)];
+        U += (uint32_t) w->dU;
+        V += (uint32_t) w->dV;
+    }
+    w->U = (int32_t) U;
+    w->V = (int32_t) V;
+}
+
+#if defined(__arm__) && !defined(__thumb__) && !defined(GFX_SW_NO_ASM)
+#define HAVE_FETCH_ASM 1
+/* r0 tex, r1 tpx, r2 n (>= 1), r3 TexWalk */
+void sw_fetch_texels(uint32_t *tex, const uint32_t *tpx, int n, TexWalk *w);
+__asm__(
+    "    .text\n"
+    "    .align  2\n"
+    "    .global sw_fetch_texels\n"
+    "    .type   sw_fetch_texels, %function\n"
+    "    .arm\n"
+    "sw_fetch_texels:\n"
+    "    push    {r4-r11, lr}\n"
+    "    ldm     r3, {r4-r10}\n"              /* r4 U, r5 V, r6 dU, r7 dV, r8 um, r9 vm, r10 tw */
+    "    subs    r2, r2, #2\n"
+    "    blt     2f\n"
+    "1:  and     r11, r8, r4, asr #16\n"      /* two texels per pass */
+    "    and     r12, r9, r5, asr #16\n"
+    "    add     r4, r4, r6\n"
+    "    add     r5, r5, r7\n"
+    "    and     lr, r8, r4, asr #16\n"
+    "    mla     r11, r12, r10, r11\n"
+    "    and     r12, r9, r5, asr #16\n"
+    "    add     r4, r4, r6\n"
+    "    mla     lr, r12, r10, lr\n"
+    "    add     r5, r5, r7\n"
+    "    ldr     r11, [r1, r11, lsl #2]\n"
+    "    subs    r2, r2, #2\n"
+    "    ldr     lr, [r1, lr, lsl #2]\n"
+    "    str     r11, [r0], #4\n"
+    "    str     lr, [r0], #4\n"
+    "    bge     1b\n"
+    "2:  adds    r2, r2, #2\n"                /* the odd one */
+    "    beq     3f\n"
+    "    and     r11, r8, r4, asr #16\n"
+    "    and     r12, r9, r5, asr #16\n"
+    "    add     r4, r4, r6\n"
+    "    add     r5, r5, r7\n"
+    "    mla     r11, r12, r10, r11\n"
+    "    ldr     r11, [r1, r11, lsl #2]\n"
+    "    str     r11, [r0]\n"
+    "3:  stm     r3, {r4, r5}\n"
+    "    pop     {r4-r11, pc}\n"
+    "    .size   sw_fetch_texels, .-sw_fetch_texels\n");
+
+/* the hand-written loop is checked against the C one before it is used */
+static int sFetchAsm = -1;
+static int fetch_asm_selftest(void) {
+    static uint32_t tpx[64 * 32], a[40], b[40];
+    uint32_t r = 12345;
+    for (int i = 0; i < 64 * 32; i++) { r = r * 1103515245u + 12345u; tpx[i] = r; }
+    for (int t = 0; t < 4000; t++) {
+        r = r * 1103515245u + 12345u;
+        const int n = 1 + (int) (r % 37);
+        const int tw = (r >> 8) & 1 ? 64 : 61;
+        const int wrap = (r >> 9) & 1;
+        TexWalk w1, w2;
+        w1.um = wrap ? 63u : 0xFFFFFFFFu;
+        w1.vm = wrap ? 31u : 0xFFFFFFFFu;
+        w1.tw = wrap ? 64 : tw;
+        r = r * 1103515245u + 12345u;
+        w1.dU = (int32_t) (r % 131072u) - 65536;
+        r = r * 1103515245u + 12345u;
+        w1.dV = (int32_t) (r % 65536u) - 32768;
+        /* starts that stay inside the texture when there is no wrap */
+        w1.U = (int32_t) ((wrap ? (r % 5000000u) : 20u << 16) + 0x8000u);
+        w1.V = (int32_t) ((wrap ? (r % 3000000u) : 15u << 16) + 0x100u);
+        if (!wrap) { w1.dU /= 4; w1.dV /= 8; }
+        w2 = w1;
+        memset(a, 0, sizeof(a));
+        memset(b, 0, sizeof(b));
+        fetch_texels_c(a, tpx, n, &w1);
+        sw_fetch_texels(b, tpx, n, &w2);
+        if (memcmp(a, b, sizeof(a)) || w1.U != w2.U || w1.V != w2.V)
+            return 0;
+    }
+    return 1;
+}
+static inline void fetch_texels(uint32_t *tex, const uint32_t *tpx, int n, TexWalk *w) {
+    if (sFetchAsm > 0)
+        sw_fetch_texels(tex, tpx, n, w);
+    else
+        fetch_texels_c(tex, tpx, n, w);
+}
+#else
+static inline void fetch_texels(uint32_t *tex, const uint32_t *tpx, int n, TexWalk *w) {
+    fetch_texels_c(tex, tpx, n, w);
+}
+#endif
+
 /* 16 fetched texels that all leave the picture as it is: alpha 0 (translucent) or
    alpha <= 0xC0 (punch-through test). The largest texel word has the largest alpha. */
 static inline __attribute__((always_inline)) int nv_invisible16(const uint32_t *tex, int pt) {
@@ -1234,21 +1357,10 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
                 V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
             } else if (axis_mask(U, dU, len, tw, c->uwrap, &um) && axis_mask(V, dV, len, th, c->vwrap, &vm)) {
-                /* two texels per pass: the second load does not wait for the first */
-                int i = 0;
-                for (; i + 1 < len; i += 2) {
-                    int32_t U1 = (int32_t) ((uint32_t) U + (uint32_t) dU), V1 = (int32_t) ((uint32_t) V + (uint32_t) dV);
-                    uint32_t a0 = ((uint32_t) (V >> 16) & vm) * tw + ((uint32_t) (U >> 16) & um);
-                    uint32_t a1 = ((uint32_t) (V1 >> 16) & vm) * tw + ((uint32_t) (U1 >> 16) & um);
-                    uint32_t t0 = tpx[a0], t1 = tpx[a1];
-                    tex[i] = t0;
-                    tex[i + 1] = t1;
-                    U = (int32_t) ((uint32_t) U1 + (uint32_t) dU); V = (int32_t) ((uint32_t) V1 + (uint32_t) dV);
-                }
-                if (i < len) {
-                    tex[i] = tpx[((uint32_t) (V >> 16) & vm) * tw + ((uint32_t) (U >> 16) & um)];
-                    U += dU; V += dV;
-                }
+                TexWalk w = { U, V, dU, dV, um, vm, tw };
+                fetch_texels(tex, tpx, len, &w);
+                U = w.U;
+                V = w.V;
             } else {
                 for (int i = 0; i < len; i++) {
                     int iu = tc_wrap(U >> 16, tw, c->umask, c->uwrap);
@@ -1574,6 +1686,23 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     uint32_t pixels = 0;
     /* attributes the span reads: depth and texture, + colour (gouraud), + offset and fog */
     const int natt = extras ? NATTR : (flat ? A_R : A_OR);
+    /* the row's attributes at its first pixel, 4 at a time in NEON: the same two fused
+       multiply-adds per attribute as the scalar loop, so the same values */
+    float32x4_t va0[3], vdx[3], vdy[3];
+    const int nvec = (natt + 3) >> 2;
+    {
+        float t0[12] = { 0 }, tx[12] = { 0 }, ty[12] = { 0 };
+        for (int k = 0; k < natt; k++) {
+            t0[k] = at[0][k];
+            tx[k] = ddx[k];
+            ty[k] = ddy[k];
+        }
+        for (int j = 0; j < 3; j++) {
+            va0[j] = vld1q_f32(t0 + 4 * j);
+            vdx[j] = vld1q_f32(tx + 4 * j);
+            vdy[j] = vld1q_f32(ty + 4 * j);
+        }
+    }
     /* first row whose centre is not above vertex b (fy >= yb), found once so the row loop
        compares integers: on the Cortex-A7 every float compare waits for the VFP to drain */
     int rb = ceil_i(yb - 0.5f);
@@ -1593,9 +1722,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
             xr = xb + (fy - yb) * slope_bc;
         /* ceil of both ends at once in NEON (same result as ceil_i); the smaller is the start */
         int xs, xe;
-        ceil2_minmax(xl - 0.5f, xr - 0.5f, &xs, &xe);
-        if (xs < 0) xs = 0;
-        if (xe > W) xe = W;
+        const float fxs = ceil2_clamp(xl - 0.5f, xr - 0.5f, W, &xs, &xe);
         if (xs >= xe)
             continue;
 
@@ -1613,10 +1740,13 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
             __builtin_prefetch(nc + 32);
 #endif
         }
-        const float ox = (float) xs + 0.5f - X[0], oy = fy - Y[0];
-        float a[NATTR];
-        for (int k = 0; k < natt; k++)
-            a[k] = at[0][k] + ddx[k] * ox + ddy[k] * oy;
+        const float ox = fxs + 0.5f - X[0], oy = fy - Y[0];
+        float a[12] __attribute__((aligned(16)));
+        {
+            const float32x4_t vo = vdupq_n_f32(ox), vp = vdupq_n_f32(oy);
+            for (int j = 0; j < nvec; j++)
+                vst1q_f32(a + 4 * j, vfmaq_f32(vfmaq_f32(va0[j], vdx[j], vo), vdy[j], vp));
+        }
         pixels += span(&c, py, xs, xe, a, ddx);
     }
     tlPixels += pixels;
@@ -2092,6 +2222,12 @@ static int tr_cmp(const void *a, const void *b) {
 
 static void sort_tr(void) {
     Bucket *b = &sTR;
+#ifdef HAVE_FETCH_ASM
+    if (sFetchAsm < 0) {   /* first frame, before any raster thread runs */
+        sFetchAsm = fetch_asm_selftest();
+        printf("gfx: busca de texels em assembly: %s\n", sFetchAsm ? "ok" : "FALHOU no teste, usando C");
+    }
+#endif
     if (!sExp6[63]) {   /* blend tables (first frame, before any raster thread runs) */
         for (int i = 0; i < 32; i++) sExp5[i] = (uint8_t) (i * 255 / 31);
         for (int i = 0; i < 64; i++) sExp6[i] = (uint8_t) (i * 255 / 63);

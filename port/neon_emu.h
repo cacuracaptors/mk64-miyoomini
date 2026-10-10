@@ -10,6 +10,7 @@
 #define NEON_EMU_H
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <stdlib.h>
 #define NE_RANGE(n, lo, hi) do { if ((n) < (lo) || (n) > (hi)) abort(); } while (0)
 
@@ -86,6 +87,13 @@ NE_STATIC int32_t vget_lane_s32(int32x2_t a, int n) { return a.v[n]; }
 NE_STATIC uint32x4_t vmaxq_u32(uint32x4_t a, uint32x4_t b) { for (int i = 0; i < 4; i++) a.v[i] = a.v[i] > b.v[i] ? a.v[i] : b.v[i]; return a; }
 NE_STATIC uint32x2_t vpmax_u32(uint32x2_t a, uint32x2_t b) { uint32x2_t r; r.v[0] = a.v[0] > a.v[1] ? a.v[0] : a.v[1]; r.v[1] = b.v[0] > b.v[1] ? b.v[0] : b.v[1]; return r; }
 NE_STATIC uint32_t vget_lane_u32(uint32x2_t a, int n) { return a.v[n]; }
+NE_STATIC float32x4_t vfmaq_f32(float32x4_t a, float32x4_t b, float32x4_t c) { for (int i = 0; i < 4; i++) a.v[i] = fmaf(b.v[i], c.v[i], a.v[i]); return a; }
+NE_STATIC void vst1q_f32(float *p, float32x4_t a) { memcpy(p, a.v, 16); }
+NE_STATIC float32x4_t vld1q_f32(const float *p) { float32x4_t r; memcpy(r.v, p, 16); return r; }
+NE_STATIC int32x2_t vmax_s32(int32x2_t a, int32x2_t b) { for (int i = 0; i < 2; i++) a.v[i] = a.v[i] > b.v[i] ? a.v[i] : b.v[i]; return a; }
+NE_STATIC int32x2_t vmin_s32(int32x2_t a, int32x2_t b) { for (int i = 0; i < 2; i++) a.v[i] = a.v[i] < b.v[i] ? a.v[i] : b.v[i]; return a; }
+NE_STATIC int32x2_t vld1_s32(const int32_t *p) { int32x2_t r; memcpy(r.v, p, 8); return r; }
+NE_STATIC float vget_lane_f32(float32x2_t a, int n) { return a.v[n]; }
 NE_STATIC uint32x2_t vget_low_u32(uint32x4_t a) { uint32x2_t r; r.v[0] = a.v[0]; r.v[1] = a.v[1]; return r; }
 NE_STATIC uint32x2_t vget_high_u32(uint32x4_t a) { uint32x2_t r; r.v[0] = a.v[2]; r.v[1] = a.v[3]; return r; }
 NE_STATIC int16x4_t vshrn_n_s32(int32x4_t a, int n) { NE_RANGE(n, 1, 16); int16x4_t r; for (int i = 0; i < 4; i++) r.v[i] = (int16_t) (a.v[i] >> n); return r; }
