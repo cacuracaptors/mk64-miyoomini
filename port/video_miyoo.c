@@ -296,6 +296,33 @@ void port_video_present(void) {
     port_color = cbuf[cur_idx];
 }
 
+/* -perf: memory speed at startup (MB/s), to know how much the frame buffers cost */
+void port_video_membench(void) {
+    const size_t n = 1u << 20;   /* 1 MB */
+    uint8_t *a = malloc(n), *b = malloc(n);
+    if (!a || !b) { free(a); free(b); return; }
+    memset(a, 1, n); memset(b, 2, n);
+    double t0 = port_now_ms();
+    for (int i = 0; i < 8; i++) memset(a, i, n);
+    double t1 = port_now_ms();
+    volatile uint32_t sink = 0;
+    for (int i = 0; i < 8; i++) { const uint32_t *p = (const uint32_t *) b; uint32_t s = 0; for (size_t k = 0; k < n / 4; k += 8) s += p[k]; sink += s; }
+    double t2 = port_now_ms();
+    for (int i = 0; i < 8; i++) memcpy(a, b, n);
+    double t3 = port_now_ms();
+    double t4 = t3;
+    if (fb_mem && fb_pages == 2) {
+        uint8_t *page = fb_mem + (size_t) (fb_page ^ 1) * PANEL_W * PANEL_H * 4;
+        for (int i = 0; i < 8; i++) memcpy(page, a, n);
+        t4 = port_now_ms();
+    }
+    fprintf(stderr, "perf memoria (MB/s): memset %.0f  leitura %.0f  memcpy %.0f  copia p/ tela %.0f\n",
+            8.0 / ((t1 - t0) / 1000.0), 8.0 / ((t2 - t1) / 1000.0), 8.0 / ((t3 - t2) / 1000.0),
+            t4 > t3 ? 8.0 / ((t4 - t3) / 1000.0) : 0.0);
+    (void) sink;
+    free(a); free(b);
+}
+
 void port_video_shutdown(void) {
     /* back to page 0, where OnionOS draws */
     if (fb_fd >= 0 && fb_pages == 2 && fb_var.yoffset != 0) {

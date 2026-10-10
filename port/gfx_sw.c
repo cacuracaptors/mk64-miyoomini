@@ -154,6 +154,8 @@ static void current_state(RState *s) {
 static uint32_t stTris, stPixels, stTexUp, stOpTris, stPtTris, stTrTris;
 static __thread uint32_t tlPixels, tlTris;   /* per raster thread, summed after each frame */
 static double stRasterMs, stWalkMs, stCore0Ms, stCore1Ms;
+/* per core, per phase (clear, OP, PT, TR) -- measurement */
+static double stPhase[2][4];
 
 void gfx_sw_perf_report(int frames, double ms) {
     (void) ms;
@@ -163,6 +165,10 @@ void gfx_sw_perf_report(int frames, double ms) {
             stTris / frames, stOpTris / frames, stPtTris / frames, stTrTris / frames, stPixels / frames,
             stTexUp / frames, stWalkMs / frames, stRasterMs / frames, stCore0Ms / frames, stCore1Ms / frames,
             port_render_w, port_render_h);
+    fprintf(stderr, "perf fases (ms/quadro): core0 limpa %.2f op %.2f pt %.2f tr %.2f | core1 limpa %.2f op %.2f pt %.2f tr %.2f\n",
+            stPhase[0][0] / frames, stPhase[0][1] / frames, stPhase[0][2] / frames, stPhase[0][3] / frames,
+            stPhase[1][0] / frames, stPhase[1][1] / frames, stPhase[1][2] / frames, stPhase[1][3] / frames);
+    memset(stPhase, 0, sizeof(stPhase));
     stTris = stPixels = stTexUp = stOpTris = stPtTris = stTrTris = 0;
     stRasterMs = stWalkMs = stCore0Ms = stCore1Ms = 0;
 }
@@ -1093,6 +1099,7 @@ static void raster_tr_sorted(void) {
 /* clears this thread's rows (black, depth 0 = farthest) and draws the three lists on them */
 static void raster_frame_band(int mask, int val) {
     const int W = port_render_w, H = port_render_h;
+    double t0 = port_now_ms();
     sBandMask = mask;
     sBandVal = val;
     for (int y0 = 0; y0 < H; y0 += 8) {
@@ -1102,9 +1109,15 @@ static void raster_frame_band(int mask, int val) {
         memset(port_color + y0 * W, 0, (size_t) rows * W * sizeof(uint16_t));
         memset(port_depth + y0 * W, 0, (size_t) rows * W * sizeof(float));
     }
+    double t1 = port_now_ms();
     flush_bucket(&sOP, KIND_OP);
+    double t2 = port_now_ms();
     flush_bucket(&sPT, KIND_PT);
+    double t3 = port_now_ms();
     raster_tr_sorted();
+    double t4 = port_now_ms();
+    double *ph = stPhase[val & 1];   /* each core writes only its own row */
+    ph[0] += t1 - t0; ph[1] += t2 - t1; ph[2] += t3 - t2; ph[3] += t4 - t3;
 }
 
 static void flush_tr_sorted(void) {   /* replay tool: single thread, whole frame */

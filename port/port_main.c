@@ -73,6 +73,8 @@ void port_init(int argc, char **argv) {
     mkdir("saves", 0777);
 
     port_video_init(hires);
+    if (port_opt_perf)
+        port_video_membench();
     port_input_init();
 
     signal(SIGSEGV, on_signal);
