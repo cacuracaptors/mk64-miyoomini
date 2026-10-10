@@ -367,10 +367,12 @@ static void *flip_proc(void *arg) {
     pin_cpu(1);
     for (;;) {
         pthread_mutex_lock(&flip_mutex);
-        if (!vsync_cb || fb_pages != 2) {   /* not the clock: just wait for frames */
-            while (!job_pending)
-                pthread_cond_wait(&flip_cond, &flip_mutex);
-        }
+        /* not the clock: just wait for frames. Once it becomes the clock it must leave this
+           wait even with no frame queued: with -paralelo the first frame is only shown after
+           the game's next frame, and that one waits for the clock (it used to stay here
+           until a frame came, so both waited for each other at startup) */
+        while (!job_pending && !(vsync_cb && fb_pages == 2))
+            pthread_cond_wait(&flip_cond, &flip_mutex);
         int job = job_pending;
         job_pending = 0;
         const uint16_t *src = snap;
