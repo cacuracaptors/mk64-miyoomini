@@ -80,7 +80,7 @@ static void wm_swap_buffers_end(void) {
     if (force_30fps) {
         const uint64_t target = last_ticker + 2;
         while (vblticker < target)
-            genwait_wait((void *) &vblticker, NULL, 0, NULL);
+            genwait_wait((void *) &vblticker, NULL, 100, NULL);   /* timeout: never hang on a dead clock */
         last_ticker = (vblticker > target) ? vblticker : target;
     }
 }

@@ -89,55 +89,113 @@ static void pin_cpu(int cpu) {
     syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask);
 }
 
+/* The flip thread is also the game's 60 Hz clock: every pass of its loop ends at a
+ * real vsync (FBIOPAN_DISPLAY waits for it), and then calls the vsync callback.
+ * With a frame queued it shows that frame; otherwise it re-shows the current page,
+ * which changes nothing on screen but still waits for the next vsync. So the game
+ * ticks exactly with the panel (~16.75 ms on the Miyoo) and every 30 fps frame stays
+ * on screen for exactly two refreshes. (A sleeping 60 Hz timer only wakes in 10 ms
+ * steps on the Miyoo and drifts against the panel: frames lasted 1 to 3 refreshes.)
+ * Everything touching /dev/fb0 stays in this one thread. */
+static void (*vsync_cb)(void);
+static void (*vsync_fallback)(void);
+
 static void *flip_proc(void *arg) {
     (void) arg;
-    double t_conv = 0, t_show = 0, last_print = 0;
-    int frames = 0;
+    double t_conv = 0, t_show = 0, last_print = 0, last_tick = 0, tmin = 1e9, tmax = 0;
+    int frames = 0, ticks = 0, fast = 0;
     pin_cpu(1);
     for (;;) {
         pthread_mutex_lock(&flip_mutex);
-        while (!job_pending)
-            pthread_cond_wait(&flip_cond, &flip_mutex);
+        if (!vsync_cb || fb_pages != 2) {   /* not the clock: just wait for frames */
+            while (!job_pending)
+                pthread_cond_wait(&flip_cond, &flip_mutex);
+        }
+        int job = job_pending;
         job_pending = 0;
         const uint16_t *src = snap;
         pthread_mutex_unlock(&flip_mutex);
 
         double t0 = port_now_ms();
         if (fb_pages == 2) {
-            convert_frame(src, port_render_w, port_render_h, outbuf);
-            int back = fb_page ^ 1;
-            memcpy(fb_mem + (size_t) back * PANEL_W * PANEL_H * 4, outbuf, (size_t) PANEL_W * PANEL_H * 4);
-            double t1 = port_now_ms();
-            t_conv += t1 - t0;
-            fb_var.yoffset = back * PANEL_H;
-            ioctl(fb_fd, FBIOPAN_DISPLAY, &fb_var);
-            fb_page = back;
-            t_show += port_now_ms() - t1;
-        } else if (fb_pages == 1) {
+            if (job) {
+                convert_frame(src, port_render_w, port_render_h, outbuf);
+                int back = fb_page ^ 1;
+                memcpy(fb_mem + (size_t) back * PANEL_W * PANEL_H * 4, outbuf, (size_t) PANEL_W * PANEL_H * 4);
+                double t1 = port_now_ms();
+                t_conv += t1 - t0;
+                fb_var.yoffset = back * PANEL_H;
+                ioctl(fb_fd, FBIOPAN_DISPLAY, &fb_var);
+                fb_page = back;
+                t_show += port_now_ms() - t1;
+            } else {
+                fb_var.yoffset = fb_page * PANEL_H;   /* same page: just wait for the vsync */
+                ioctl(fb_fd, FBIOPAN_DISPLAY, &fb_var);
+            }
+        } else if (fb_pages == 1 && job) {
             convert_frame(src, port_render_w, port_render_h, (uint32_t *) fb_mem);
             t_conv += port_now_ms() - t0;
         }
 
-        pthread_mutex_lock(&flip_mutex);
-        snap_free = 1;
-        pthread_cond_broadcast(&flip_cond);
-        pthread_mutex_unlock(&flip_mutex);
+        if (job) {
+            pthread_mutex_lock(&flip_mutex);
+            snap_free = 1;
+            pthread_cond_broadcast(&flip_cond);
+            pthread_mutex_unlock(&flip_mutex);
+            frames++;
+        }
+
+        if (vsync_cb && fb_pages == 2) {
+            double now = port_now_ms();
+            /* safety: if a flip did not wait for the vsync, this is no clock. Ignore the
+               early pass; if it keeps happening, hand the clock back to a timer. */
+            if (last_tick != 0 && now - last_tick < 8.0) {
+                if (++fast > 30) {
+                    printf("video: a troca de pagina nao espera o vsync; usando relogio de 60 Hz\n");
+                    vsync_cb = NULL;
+                    if (vsync_fallback)
+                        vsync_fallback();
+                }
+                continue;
+            }
+            fast = 0;
+            if (last_tick != 0) {
+                double d = now - last_tick;
+                if (d < tmin) tmin = d;
+                if (d > tmax) tmax = d;
+            }
+            last_tick = now;
+            ticks++;
+            vsync_cb();
+        }
 
         if (port_opt_perf) {
             double now = port_now_ms();
-            frames++;
             if (last_print == 0)
                 last_print = now;
             else if (now - last_print >= 2000.0) {
-                fprintf(stderr, "perf flip: convert+copy %.2f  pan(vsync) %.2f  ms/frame (%d frames)\n",
-                        t_conv / frames, t_show / frames, frames);
+                fprintf(stderr, "perf flip: convert+copy %.2f  pan(vsync) %.2f  ms/frame (%d frames) | vsync %d ticks, %.2f..%.2f ms\n",
+                        frames ? t_conv / frames : 0, frames ? t_show / frames : 0, frames, ticks, ticks ? tmin : 0, tmax);
                 t_conv = t_show = 0;
-                frames = 0;
+                frames = ticks = 0;
+                tmin = 1e9; tmax = 0;
                 last_print = now;
             }
         }
     }
     return NULL;
+}
+
+/* 1 = the flip thread will call fn at every vsync; 0 = no page flipping, use a timer */
+int port_video_set_vsync_clock(void (*fn)(void), void (*fallback)(void)) {
+    if (fb_pages != 2)
+        return 0;
+    pthread_mutex_lock(&flip_mutex);
+    vsync_fallback = fallback;
+    vsync_cb = fn;
+    pthread_cond_broadcast(&flip_cond);   /* wake it out of the frame-only wait */
+    pthread_mutex_unlock(&flip_mutex);
+    return 1;
 }
 
 static void fb_init(void) {
@@ -220,13 +278,6 @@ void port_video_present(void) {
     last_idx = cur_idx;
     cur_idx = (cur_idx + 1) % 3;
     port_color = cbuf[cur_idx];
-}
-
-int port_video_wait_vsync(void) {
-    uint32_t arg = 0;
-    if (fb_fd < 0)
-        return -1;
-    return ioctl(fb_fd, FBIO_WAITFORVSYNC, &arg) == 0 ? 0 : -1;
 }
 
 void port_video_shutdown(void) {

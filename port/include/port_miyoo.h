@@ -24,7 +24,7 @@ extern float *port_depth;      /* 1/w, larger = nearer, cleared to 0 */
 void port_video_init(int hires);
 void port_video_present(void);
 void port_video_shutdown(void);
-int port_video_wait_vsync(void);   /* 0 = waited for the panel's vsync; -1 = not available */
+int port_video_set_vsync_clock(void (*fn)(void), void (*fallback)(void));   /* 1 = fn runs at every real vsync */
 uint16_t port_fb_pixel565(int x, int y);   /* last presented frame, N64 320x240 coords */
 
 /* port/input_miyoo.c */
