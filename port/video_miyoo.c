@@ -43,7 +43,6 @@ static uint8_t *fb_mem;
 static size_t fb_len;
 static int fb_pages;         /* 2 = page flipping, 1 = draw straight into the shown page */
 static int fb_page;
-static uint32_t *outbuf;     /* PANEL_W x PANEL_H, flip thread only */
 
 static pthread_t flip_thread;
 static pthread_mutex_t flip_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -59,27 +58,41 @@ static inline uint32_t rgb565_to_x8888(uint32_t c) {
            ((c & 0x001Fu) << 3) | ((c & 0x001Cu) >> 2);
 }
 
-/* src (w x h, RGB565) -> dst (PANEL_W x PANEL_H, XRGB8888), scaled and rotated 180 degrees */
+/* src (w x h, RGB565) -> dst (PANEL_W x PANEL_H, XRGB8888), scaled and rotated 180 degrees.
+ * dst is the hidden screen page itself: each row is built in a small cached line buffer
+ * and written to the page in one forward copy. The screen memory is fast to write
+ * (write-combined) but ~30x slower to read, so it is never read back. */
+static uint32_t line_buf[PANEL_W];
+
 static void convert_frame(const uint16_t *src, int w, int h, uint32_t *dst) {
     if (w * 2 == PANEL_W && h * 2 == PANEL_H) {
         for (int y = 0; y < h; y++) {
             const uint16_t *s = src + y * w;
-            uint32_t *d0 = dst + (PANEL_H - 1 - 2 * y) * PANEL_W;
-            uint32_t *d = d0;
+            uint32_t *d = line_buf;
             for (int x = w - 1; x >= 0; x--) {
                 uint32_t c = rgb565_to_x8888(s[x]);
                 d[0] = c;
                 d[1] = c;
                 d += 2;
             }
-            memcpy(d0 - PANEL_W, d0, PANEL_W * 4);
+            uint32_t *row = dst + (PANEL_H - 1 - 2 * y) * PANEL_W;
+            memcpy(row, line_buf, PANEL_W * 4);
+            memcpy(row - PANEL_W, line_buf, PANEL_W * 4);
+        }
+    } else if (w == PANEL_W && h == PANEL_H) {
+        for (int y = 0; y < h; y++) {
+            const uint16_t *s = src + y * w;
+            uint32_t *d = line_buf;
+            for (int x = w - 1; x >= 0; x--)
+                *d++ = rgb565_to_x8888(s[x]);
+            memcpy(dst + (PANEL_H - 1 - y) * PANEL_W, line_buf, PANEL_W * 4);
         }
     } else {
         for (int y = 0; y < PANEL_H; y++) {
             const uint16_t *s = src + (y * h / PANEL_H) * w;
-            uint32_t *d = dst + (PANEL_H - 1 - y) * PANEL_W;
             for (int x = 0; x < PANEL_W; x++)
-                d[PANEL_W - 1 - x] = rgb565_to_x8888(s[x * w / PANEL_W]);
+                line_buf[PANEL_W - 1 - x] = rgb565_to_x8888(s[x * w / PANEL_W]);
+            memcpy(dst + (PANEL_H - 1 - y) * PANEL_W, line_buf, PANEL_W * 4);
         }
     }
 }
@@ -126,9 +139,8 @@ static void *flip_proc(void *arg) {
         double t0 = port_now_ms();
         if (fb_pages == 2) {
             if (job) {
-                convert_frame(src, port_render_w, port_render_h, outbuf);
                 int back = fb_page ^ 1;
-                memcpy(fb_mem + (size_t) back * PANEL_W * PANEL_H * 4, outbuf, (size_t) PANEL_W * PANEL_H * 4);
+                convert_frame(src, port_render_w, port_render_h, (uint32_t *) (fb_mem + (size_t) back * PANEL_W * PANEL_H * 4));
                 release_snap();   /* copied: the game may queue the next frame during the vsync wait */
                 double t1 = port_now_ms();
                 t_conv += t1 - t0;
@@ -252,8 +264,7 @@ void port_video_init(int hires) {
         }
     }
     port_depth = calloc(n, sizeof(float));
-    outbuf = malloc((size_t) PANEL_W * PANEL_H * 4);
-    if (!port_depth || !outbuf) {
+    if (!port_depth) {
         fprintf(stderr, "video: sem memoria\n");
         exit(1);
     }

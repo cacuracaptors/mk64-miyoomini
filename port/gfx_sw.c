@@ -153,17 +153,18 @@ static void current_state(RState *s) {
 
 static uint32_t stTris, stPixels, stTexUp, stOpTris, stPtTris, stTrTris;
 static __thread uint32_t tlPixels, tlTris;   /* per raster thread, summed after each frame */
-static double stRasterMs, stWalkMs;
+static double stRasterMs, stWalkMs, stCore0Ms, stCore1Ms;
 
 void gfx_sw_perf_report(int frames, double ms) {
     (void) ms;
     if (frames <= 0)
         return;
-    fprintf(stderr, "perf gfx: tris %u (op %u pt %u tr %u)  pixels %u  tex uploads %u  per frame | walk %.2f  raster %.2f ms/frame\n",
+    fprintf(stderr, "perf gfx: tris %u (op %u pt %u tr %u)  pixels %u  tex uploads %u  per frame | walk %.2f  raster %.2f (core0 %.2f core1 %.2f) ms/frame  %dx%d\n",
             stTris / frames, stOpTris / frames, stPtTris / frames, stTrTris / frames, stPixels / frames,
-            stTexUp / frames, stWalkMs / frames, stRasterMs / frames);
+            stTexUp / frames, stWalkMs / frames, stRasterMs / frames, stCore0Ms / frames, stCore1Ms / frames,
+            port_render_w, port_render_h);
     stTris = stPixels = stTexUp = stOpTris = stPtTris = stTrTris = 0;
-    stRasterMs = stWalkMs = 0;
+    stRasterMs = stWalkMs = stCore0Ms = stCore1Ms = 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -208,7 +209,7 @@ typedef struct {
     int tw, th, umask, vmask, uwrap, vwrap;
     float ftw, fth;
     float bias;              /* -0.5 texel for filtered textures (see raster_tri) */
-    int texenv, dtest, dwrite, fog;
+    int texenv, dtest, dwrite, fog, persp;
     int fr, fg, fb, bs, bd;
     int r, g, b, a;          /* flat colour (GOUR == 0) */
 } TriCtx;
@@ -243,146 +244,225 @@ static inline float tc_fold(float u, int n, int mode) {
     return u - floorf(u / period) * period;
 }
 
+/* ---- the pixel pipeline, shared by all span loops (inlined, constants fold away) ---- */
+
+static inline __attribute__((always_inline)) void tex_combine(const int env, uint32_t tc, int *r, int *g, int *b, int *al) {
+    int tr = (tc >> 16) & 0xFF, tg = (tc >> 8) & 0xFF, tb = tc & 0xFF, ta = tc >> 24;
+    switch (env) {
+        case GFX_TEXENV_REPLACE:
+            *r = tr; *g = tg; *b = tb; *al = ta;
+            break;
+        case GFX_TEXENV_MODULATE:
+            *r = DIV255(*r * tr); *g = DIV255(*g * tg); *b = DIV255(*b * tb); *al = ta;
+            break;
+        case GFX_TEXENV_DECAL:
+            *r = DIV255(*r * (255 - ta) + tr * ta);
+            *g = DIV255(*g * (255 - ta) + tg * ta);
+            *b = DIV255(*b * (255 - ta) + tb * ta);
+            break;
+        default: /* MODULATEALPHA */
+            *r = DIV255(*r * tr); *g = DIV255(*g * tg); *b = DIV255(*b * tb);
+            *al = DIV255(*al * ta);
+            break;
+    }
+}
+
+/* fog, list-specific step (PT alpha test / TR blend) and the store */
+static inline __attribute__((always_inline)) void px_finish(uint16_t *cp, float *zp, float z, int r, int g, int b, int al,
+                                                            int f, const TriCtx *c, int dwrite, const int KIND, const int FOG) {
+    if (FOG && c->fog) {
+        r += ((c->fr - r) * f) / 255;
+        g += ((c->fg - g) * f) / 255;
+        b += ((c->fb - b) * f) / 255;
+    }
+    if (KIND == KIND_PT) {
+        if (al <= 0xC0)
+            return;
+    } else if (KIND == KIND_TR) {
+        if (!(al == 255 && c->bs == GFX_BLENDF_SRCALPHA && c->bd == GFX_BLENDF_INVSRCALPHA)) {
+            uint32_t d = *cp;
+            int dr = sExp5[(d >> 11) & 31], dg = sExp6[(d >> 5) & 63], db = sExp5[d & 31];
+            int sf, df;
+            switch (c->bs) {
+                case GFX_BLENDF_ZERO: sf = 0; break;
+                case GFX_BLENDF_SRCALPHA: sf = al; break;
+                case GFX_BLENDF_INVSRCALPHA: sf = 255 - al; break;
+                case GFX_BLENDF_ONE: case GFX_BLENDF_DSTALPHA: sf = 255; break;
+                default: sf = 0; break;
+            }
+            switch (c->bd) {
+                case GFX_BLENDF_ZERO: df = 0; break;
+                case GFX_BLENDF_SRCALPHA: df = al; break;
+                case GFX_BLENDF_INVSRCALPHA: df = 255 - al; break;
+                case GFX_BLENDF_ONE: case GFX_BLENDF_DSTALPHA: df = 255; break;
+                default: df = 0; break;
+            }
+            r = DIV255(r * sf + dr * df);
+            g = DIV255(g * sf + dg * df);
+            b = DIV255(b * sf + db * df);
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+        }
+    }
+    *cp = (uint16_t) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    if (dwrite)
+        *zp = z;
+}
+
+/* Can a run of n pixels index the texture without per-pixel wrapping? Yes when the
+   coordinate stays inside the texture (mask = all ones) or the axis repeats with a
+   power-of-two size (mask = size - 1). */
+static inline int axis_mask(int32_t U, int32_t dU, int n, int size, int mode, uint32_t *mask) {
+    int64_t end = (int64_t) U + (int64_t) dU * (n - 1);
+    int32_t i0 = U >> 16, i1 = (int32_t) (end >> 16);
+    int lo = i0 < i1 ? i0 : i1, hi = i0 < i1 ? i1 : i0;
+    if (lo >= 0 && hi < size && end > -2147483647LL && end < 2147483647LL) {
+        *mask = 0xFFFFFFFFu;
+        return 1;
+    }
+    if (mode == WR_REPEAT2) {
+        *mask = (uint32_t) (size - 1);
+        return 1;
+    }
+    return 0;
+}
+
 /* one horizontal span: pixels [xs, xe) of row py, attributes a[] at pixel xs */
 static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c, int py, int xs, int xe,
                                                                  const float *a, const float *ddx,
                                                                  const int KIND, const int TEX, const int GOUR) {
+    /* TEX: 0 = untextured, 1 = textured (c->persp picks affine or perspective-correct) */
     const int W = port_render_w;
-    uint16_t *cp = port_color + py * W + xs;
-    float *zp = port_depth + py * W + xs;
+    uint16_t *restrict cp = port_color + py * W + xs;
+    float *restrict zp = port_depth + py * W + xs;
     float z = a[A_Z];
     const float dz = ddx[A_Z];
+    const int dtest = c->dtest, dwrite = c->dwrite;
     int32_t R = 0, G = 0, B = 0, A = 0, OR = 0, OG = 0, OB = 0, F = 0;
     int32_t dR = 0, dG = 0, dB = 0, dA = 0, dOR = 0, dOG = 0, dOB = 0, dF = 0;
+    const int fr = c->r, fg = c->g, fb = c->b, fa = c->a;
     if (GOUR) {
         R = (int32_t) (a[A_R] * 65536.0f); dR = (int32_t) (ddx[A_R] * 65536.0f);
         G = (int32_t) (a[A_G] * 65536.0f); dG = (int32_t) (ddx[A_G] * 65536.0f);
         B = (int32_t) (a[A_B] * 65536.0f); dB = (int32_t) (ddx[A_B] * 65536.0f);
         A = (int32_t) (a[A_A] * 65536.0f); dA = (int32_t) (ddx[A_A] * 65536.0f);
+    }
+    if (GOUR == 2) {
         OR = (int32_t) (a[A_OR] * 65536.0f); dOR = (int32_t) (ddx[A_OR] * 65536.0f);
         OG = (int32_t) (a[A_OG] * 65536.0f); dOG = (int32_t) (ddx[A_OG] * 65536.0f);
         OB = (int32_t) (a[A_OB] * 65536.0f); dOB = (int32_t) (ddx[A_OB] * 65536.0f);
         F = (int32_t) (a[A_F] * 65536.0f); dF = (int32_t) (ddx[A_F] * 65536.0f);
     }
-    /* texture coordinates in 16.16 texels; perspective: exact every 16 pixels, linear between */
-    int32_t U = 0, V = 0, dU = 0, dV = 0;
+
+#define PX_COLOUR()                                                                              \
+    int r, g, b, al;                                                                             \
+    if (GOUR) {                                                                                  \
+        r = clamp8(R >> 16); g = clamp8(G >> 16); b = clamp8(B >> 16); al = clamp8(A >> 16);     \
+    } else {                                                                                     \
+        r = fr; g = fg; b = fb; al = fa;                                                         \
+    }
+#define PX_OFFSET()                                                                              \
+    if (GOUR == 2) {                                                                             \
+        r += clamp8(OR >> 16); g += clamp8(OG >> 16); b += clamp8(OB >> 16);                     \
+        if (r > 255) r = 255;                                                                    \
+        if (g > 255) g = 255;                                                                    \
+        if (b > 255) b = 255;                                                                    \
+    }
+#define PX_STEP()                                                                                \
+    z += dz;                                                                                     \
+    if (GOUR) { R += dR; G += dG; B += dB; A += dA; }                                            \
+    if (GOUR == 2) { OR += dOR; OG += dOG; OB += dOB; F += dF; }
+
+    if (TEX == 0) {
+        for (int n = xe - xs; n > 0; n--, cp++, zp++) {
+            if (!dtest || z >= *zp) {
+                PX_COLOUR();
+                px_finish(cp, zp, z, r, g, b, al, clamp8(F >> 16), c, dwrite, KIND, GOUR == 2);
+            }
+            PX_STEP();
+        }
+        return (uint32_t) (xe - xs);
+    }
+
+    /* textured: runs of pixels with linear texel coordinates (the whole span when affine,
+       16 pixels when perspective-correct), each drawn by the fastest loop that fits */
+    const uint32_t *const tpx = c->tpx;
+    const int tw = c->tw, th = c->th;
     float uz = 0, vz = 0, duz = 0, dvz = 0, zz = 0;
-    int seg = 0x7FFFFFFF;
-    if (TEX == 1) {
-        float u = tc_fold(a[A_U] * c->ftw + c->bias, c->tw, c->uwrap), v = tc_fold(a[A_V] * c->fth + c->bias, c->th, c->vwrap);
+    int32_t U = 0, V = 0, dU = 0, dV = 0;
+    const int persp = c->persp;
+    if (!persp) {
+        float u = tc_fold(a[A_U] * c->ftw + c->bias, tw, c->uwrap), v = tc_fold(a[A_V] * c->fth + c->bias, th, c->vwrap);
         /* 1:1 2D images land exactly on texel edges: round the step and start a hair (1/256
            texel) above the edge so every pixel picks the same texel, with no drift */
         U = (int32_t) lrintf(u * 65536.0f) + 256; dU = (int32_t) lrintf(ddx[A_U] * c->ftw * 65536.0f);
         V = (int32_t) lrintf(v * 65536.0f) + 256; dV = (int32_t) lrintf(ddx[A_V] * c->fth * 65536.0f);
-    } else if (TEX == 2) {
+    } else {
         uz = a[A_U]; vz = a[A_V]; zz = z;
         duz = ddx[A_U]; dvz = ddx[A_V];
-        seg = 0;
     }
-    const int texenv = c->texenv, dtest = c->dtest, dwrite = c->dwrite;
-    for (int px = xs; px < xe; px++, cp++, zp++) {
-        if (TEX == 2 && seg == 0) {
-            int len = xe - px < 16 ? xe - px : 16;
+    int px = xs;
+    while (px < xe) {
+        int len = xe - px;
+        if (persp) {
+            if (len > 16)
+                len = 16;
             float iz0 = 1.0f / zz;
             float u0 = uz * iz0 * c->ftw + c->bias, v0 = vz * iz0 * c->fth + c->bias;
             float zz1 = zz + dz * len;
             float iz1 = 1.0f / zz1;
             float u1 = (uz + duz * len) * iz1 * c->ftw + c->bias, v1 = (vz + dvz * len) * iz1 * c->fth + c->bias;
-            float fu = tc_fold(u0, c->tw, c->uwrap), fv = tc_fold(v0, c->th, c->vwrap);
+            float fu = tc_fold(u0, tw, c->uwrap), fv = tc_fold(v0, th, c->vwrap);
             u1 += fu - u0;
             v1 += fv - v0;
             float il = 1.0f / (float) len;
             U = (int32_t) lrintf(fu * 65536.0f) + 256; dU = (int32_t) lrintf((u1 - fu) * il * 65536.0f);
             V = (int32_t) lrintf(fv * 65536.0f) + 256; dV = (int32_t) lrintf((v1 - fv) * il * 65536.0f);
             uz += duz * len; vz += dvz * len; zz = zz1;
-            seg = len;
         }
-        if (!dtest || z >= *zp) {
-            int r, g, b, al;
-            if (GOUR) {
-                r = clamp8(R >> 16); g = clamp8(G >> 16); b = clamp8(B >> 16); al = clamp8(A >> 16);
-            } else {
-                r = c->r; g = c->g; b = c->b; al = c->a;
+        uint32_t um, vm;
+        if (axis_mask(U, dU, len, tw, c->uwrap, &um) && axis_mask(V, dV, len, th, c->vwrap, &vm)) {
+#define FAST_LOOP(ENV)                                                                           \
+            for (int n = len; n > 0; n--, cp++, zp++) {                                          \
+                if (!dtest || z >= *zp) {                                                        \
+                    PX_COLOUR();                                                                 \
+                    uint32_t tc = tpx[((uint32_t) (V >> 16) & vm) * tw + ((uint32_t) (U >> 16) & um)]; \
+                    tex_combine(ENV, tc, &r, &g, &b, &al);                                       \
+                    PX_OFFSET();                                                                 \
+                    px_finish(cp, zp, z, r, g, b, al, clamp8(F >> 16), c, dwrite, KIND, GOUR == 2); \
+                }                                                                                \
+                PX_STEP();                                                                       \
+                U += dU; V += dV;                                                                \
             }
-            if (TEX) {
-                int iu = tc_wrap(U >> 16, c->tw, c->umask, c->uwrap);
-                int iv = tc_wrap(V >> 16, c->th, c->vmask, c->vwrap);
-                uint32_t tc = c->tpx[iv * c->tw + iu];
-                int tr = (tc >> 16) & 0xFF, tg = (tc >> 8) & 0xFF, tb = tc & 0xFF, ta = tc >> 24;
-                switch (texenv) {
-                    case GFX_TEXENV_REPLACE:
-                        r = tr; g = tg; b = tb; al = ta;
-                        break;
-                    case GFX_TEXENV_MODULATE:
-                        r = DIV255(r * tr); g = DIV255(g * tg); b = DIV255(b * tb); al = ta;
-                        break;
-                    case GFX_TEXENV_DECAL:
-                        r = DIV255(r * (255 - ta) + tr * ta);
-                        g = DIV255(g * (255 - ta) + tg * ta);
-                        b = DIV255(b * (255 - ta) + tb * ta);
-                        break;
-                    default: /* MODULATEALPHA */
-                        r = DIV255(r * tr); g = DIV255(g * tg); b = DIV255(b * tb);
-                        al = DIV255(al * ta);
-                        break;
-                }
-                if (GOUR) {
-                    r += clamp8(OR >> 16); g += clamp8(OG >> 16); b += clamp8(OB >> 16);
-                    if (r > 255) r = 255;
-                    if (g > 255) g = 255;
-                    if (b > 255) b = 255;
-                }
+            switch (c->texenv) {
+                case GFX_TEXENV_REPLACE: FAST_LOOP(GFX_TEXENV_REPLACE); break;
+                case GFX_TEXENV_MODULATE: FAST_LOOP(GFX_TEXENV_MODULATE); break;
+                case GFX_TEXENV_DECAL: FAST_LOOP(GFX_TEXENV_DECAL); break;
+                default: FAST_LOOP(GFX_TEXENV_MODULATEALPHA); break;
             }
-            if (GOUR && c->fog) {
-                int f = clamp8(F >> 16);
-                r += ((c->fr - r) * f) / 255;
-                g += ((c->fg - g) * f) / 255;
-                b += ((c->fb - b) * f) / 255;
-            }
-            if (KIND == KIND_PT) {
-                if (al <= 0xC0)
-                    goto next;
-            } else if (KIND == KIND_TR) {
-                uint32_t d = *cp;
-                int dr = sExp5[(d >> 11) & 31], dg = sExp6[(d >> 5) & 63], db = sExp5[d & 31];
-                int sf, df;
-                switch (c->bs) {
-                    case GFX_BLENDF_ZERO: sf = 0; break;
-                    case GFX_BLENDF_SRCALPHA: sf = al; break;
-                    case GFX_BLENDF_INVSRCALPHA: sf = 255 - al; break;
-                    case GFX_BLENDF_ONE: case GFX_BLENDF_DSTALPHA: sf = 255; break;
-                    default: sf = 0; break;
+#undef FAST_LOOP
+        } else {
+            /* clamp / mirror / odd sizes crossing an edge: wrap every texel */
+            const int env = c->texenv;
+            for (int n = len; n > 0; n--, cp++, zp++) {
+                if (!dtest || z >= *zp) {
+                    PX_COLOUR();
+                    int iu = tc_wrap(U >> 16, tw, c->umask, c->uwrap);
+                    int iv = tc_wrap(V >> 16, th, c->vmask, c->vwrap);
+                    tex_combine(env, tpx[iv * tw + iu], &r, &g, &b, &al);
+                    PX_OFFSET();
+                    px_finish(cp, zp, z, r, g, b, al, clamp8(F >> 16), c, dwrite, KIND, GOUR == 2);
                 }
-                switch (c->bd) {
-                    case GFX_BLENDF_ZERO: df = 0; break;
-                    case GFX_BLENDF_SRCALPHA: df = al; break;
-                    case GFX_BLENDF_INVSRCALPHA: df = 255 - al; break;
-                    case GFX_BLENDF_ONE: case GFX_BLENDF_DSTALPHA: df = 255; break;
-                    default: df = 0; break;
-                }
-                r = DIV255(r * sf + dr * df);
-                g = DIV255(g * sf + dg * df);
-                b = DIV255(b * sf + db * df);
-                if (r > 255) r = 255;
-                if (g > 255) g = 255;
-                if (b > 255) b = 255;
+                PX_STEP();
+                U += dU; V += dV;
             }
-            *cp = (uint16_t) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-            if (dwrite)
-                *zp = z;
         }
-    next:
-        z += dz;
-        if (GOUR) {
-            R += dR; G += dG; B += dB; A += dA;
-            OR += dOR; OG += dOG; OB += dOB; F += dF;
-        }
-        if (TEX) {
-            U += dU; V += dV;
-            if (TEX == 2)
-                seg--;
-        }
+        px += len;
     }
+#undef PX_COLOUR
+#undef PX_OFFSET
+#undef PX_STEP
     return (uint32_t) (xe - xs);
 }
 
@@ -392,12 +472,15 @@ typedef uint32_t (*SpanFn)(const TriCtx *, int, int, int, const float *, const f
     static uint32_t span_##K##_##T##_##G(const TriCtx *c, int py, int xs, int xe, const float *a, const float *d) { \
         return span_body(c, py, xs, xe, a, d, K, T, G); \
     }
-#define SPAN_DEF_K(K) SPAN_DEF(K, 0, 0) SPAN_DEF(K, 0, 1) SPAN_DEF(K, 1, 0) SPAN_DEF(K, 1, 1) SPAN_DEF(K, 2, 0) SPAN_DEF(K, 2, 1)
+#define SPAN_DEF_T(K, T) SPAN_DEF(K, T, 0) SPAN_DEF(K, T, 1) SPAN_DEF(K, T, 2)
+#define SPAN_DEF_K(K) SPAN_DEF_T(K, 0) SPAN_DEF_T(K, 1)
 SPAN_DEF_K(0)
 SPAN_DEF_K(1)
 SPAN_DEF_K(2)
-#define SPAN_REF(K) { { span_##K##_0_0, span_##K##_0_1 }, { span_##K##_1_0, span_##K##_1_1 }, { span_##K##_2_0, span_##K##_2_1 } }
-static const SpanFn sSpanFns[3][3][2] = { SPAN_REF(0), SPAN_REF(1), SPAN_REF(2) };
+#define SPAN_REF_T(K, T) { span_##K##_##T##_0, span_##K##_##T##_1, span_##K##_##T##_2 }
+#define SPAN_REF(K) { SPAN_REF_T(K, 0), SPAN_REF_T(K, 1) }
+/* [list kind][0 untextured, 1 textured][0 flat colour, 1 gouraud, 2 gouraud + offset/fog] */
+static const SpanFn sSpanFns[3][2][3] = { SPAN_REF(0), SPAN_REF(1), SPAN_REF(2) };
 
 static int wrap_mode(int n, int clamp, int mirror) {
     int pow2 = (n & (n - 1)) == 0;
@@ -472,12 +555,18 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     } else {
         c.tpx = NULL; c.tw = c.th = 1; c.ftw = c.fth = 1.0f; c.bias = 0.0f; c.umask = c.vmask = 0; c.uwrap = c.vwrap = WR_REPEAT2;
     }
-    /* flat: same colour on all three vertices and no offset/fog term -> constant colour */
+    /* colour path: flat (same colour on the three vertices), gouraud, or gouraud with the
+       offset colour (only used when textured) and fog (only when enabled) */
     const uint32_t c0 = v0->color.packed;
-    const int flat = v1->color.packed == c0 && v2->color.packed == c0 &&
-                     (v0->pad0.vertindex | v1->pad0.vertindex | v2->pad0.vertindex) == 0;
+    const uint32_t oall = v0->pad0.vertindex | v1->pad0.vertindex | v2->pad0.vertindex;
+    const int extras = (textured && (oall & 0x00FFFFFFu)) || (st->fog && (oall & 0xFF000000u));
+    const int flat = !extras && v1->color.packed == c0 && v2->color.packed == c0;
     c.r = (c0 >> 16) & 0xFF; c.g = (c0 >> 8) & 0xFF; c.b = c0 & 0xFF; c.a = c0 >> 24;
-    const SpanFn span = sSpanFns[kind][textured ? (persp ? 2 : 1) : 0][flat ? 0 : 1];
+    /* white flat colour: modulate does nothing, the texel goes straight through */
+    if (flat && textured && c0 == 0xFFFFFFFFu && c.texenv != GFX_TEXENV_DECAL)
+        c.texenv = GFX_TEXENV_REPLACE;
+    c.persp = persp;
+    const SpanFn span = sSpanFns[kind][textured ? 1 : 0][extras ? 2 : (flat ? 0 : 1)];
 
     /* attribute gradients */
     const float inv = 1.0f / area;
@@ -1079,11 +1168,14 @@ static void raster_frame(void) {
         pthread_cond_broadcast(&sWCond);
         pthread_mutex_unlock(&sWMutex);
 
+        double t0 = port_now_ms();
         raster_frame_band(1, 0);
+        stCore0Ms += port_now_ms() - t0;
 
         pthread_mutex_lock(&sWMutex);
         while (sWorkDone != gen)
             pthread_cond_wait(&sWCond, &sWMutex);
+        stCore1Ms += sWorkerMs;
         tlPixels += sWorkerPixels;
         tlTris += sWorkerTris;
         pthread_mutex_unlock(&sWMutex);
