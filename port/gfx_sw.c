@@ -743,9 +743,18 @@ static inline __attribute__((always_inline)) void nv_out(uint16_t *cp, uint32_t 
         b = nv_div255(vmlal_u8(vmull_u8(b, al), db, ia));
     }
     vst1q_u16(cp, vbslq_u16(m, nv_pack565(r, g, b), dst));
-    if (OUT != KIND_TR && c->dwrite) {
+    if (OUT == KIND_PT && c->dwrite) {
         vst1q_u32(zp, vbslq_u32(m0, D->z0, D->d0));
         vst1q_u32(zp + 4, vbslq_u32(m1, D->z1, D->d1));
+    }
+}
+
+/* opaque list: the new depth only depends on the depth test, so it is stored at once and
+   the depth vectors do not stay alive through the shading */
+static inline __attribute__((always_inline)) void nv_zstore(uint32_t *zp, const NvDepth *D, const TriCtx *c, const int OUT) {
+    if (OUT == KIND_OP && c->dwrite) {
+        vst1q_u32(zp, vbslq_u32(D->m0, D->z0, D->d0));
+        vst1q_u32(zp + 4, vbslq_u32(D->m1, D->z1, D->d1));
     }
 }
 
@@ -759,6 +768,7 @@ static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_
                                                            const uint8x8_t *flatc, int n, const int OUT, const int TEX, const int COL) {
     NvDepth D;
     nv_depth(&D, zp, zi, s, c, n, OUT);
+    nv_zstore(zp, &D, c, OUT);
     if (nv_none(D.m))
         return;   /* all 8 hidden */
     uint8x8_t r, g, b, al;
@@ -772,8 +782,12 @@ static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32
                                                             const uint8x8_t *flatc, int n, const int OUT, const int TEX, const int COL) {
     /* n = pixels to draw of these 16 (9..16) */
     NvDepth A, B;
+    /* opaque depth stored before the visibility test (with nothing visible it writes the
+       same values back), one half after the other to keep the registers free */
     nv_depth(&A, zp, zi, s, c, 8, OUT);
+    nv_zstore(zp, &A, c, OUT);
     nv_depth(&B, zp + 8, zi + s->dz8, s, c, n - 8, OUT);
+    nv_zstore(zp + 8, &B, c, OUT);
     if (nv_none(vorrq_u16(A.m, B.m)))
         return;   /* all 16 hidden */
     int32_t XB[8];
@@ -792,7 +806,8 @@ static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32
    the texel square's diagonal it falls on, as the N64 RDP does. Weights in 1/128.
    Used only where the texture is magnified (less than one texel per pixel step), with
    repeat (power-of-two) or clamp wrapping on both axes. */
-static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, int32_t dV, const TriCtx *c) {
+#ifdef GFX_SW_FILTER_REF
+static void nv_fetch3_ref(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, int32_t dV, const TriCtx *c) {
     uint32_t A[16] __attribute__((aligned(16))), B[16] __attribute__((aligned(16))), C[16] __attribute__((aligned(16)));
     uint8_t ws[16] __attribute__((aligned(8))), wt[16] __attribute__((aligned(8)));
     const uint32_t *tpx = c->tpx;
@@ -834,6 +849,63 @@ static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, 
                     cc = vld4_u8((const uint8_t *) (C + o)), r;
         uint8x8_t s8 = vld1_u8(ws + o), t8 = vld1_u8(wt + o);
         uint8x8_t w0 = vsub_u8(vsub_u8(vdup_n_u8(128), s8), t8);
+        for (int k = 0; k < 4; k++)
+            r.val[k] = vrshrn_n_u16(vmlal_u8(vmlal_u8(vmull_u8(a.val[k], w0), b.val[k], s8), cc.val[k], t8), 7);
+        vst4_u8((uint8_t *) (out + o), r);
+    }
+}
+#endif
+
+static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, int32_t dV, const TriCtx *c) {
+    uint32_t ia[8] __attribute__((aligned(16))), ib[8] __attribute__((aligned(16))), ic[8] __attribute__((aligned(16)));
+    uint32_t A[8] __attribute__((aligned(16))), B[8] __attribute__((aligned(16))), C[8] __attribute__((aligned(16)));
+    static const int32_t kLane[4] = { 0, 1, 2, 3 };
+    const uint32_t *tpx = c->tpx;
+    const int tw = c->tw, th = c->th;
+    const int ur = c->uwrap == WR_REPEAT2, vr = c->vwrap == WR_REPEAT2;
+    const int32x4_t lane = vld1q_s32(kLane), k127 = vdupq_n_s32(127), k128 = vdupq_n_s32(128), one = vdupq_n_s32(1),
+                    zero = vdupq_n_s32(0), umax = vdupq_n_s32(tw - 1), vmax = vdupq_n_s32(th - 1);
+    U -= 32768 + 256;   /* texel centres (and without the 1/256 nudge of the point sampler) */
+    V -= 32768 + 256;
+    for (int o = 0; o < len; o += 8) {
+        uint16x4_t sh[2], th4[2];
+        for (int h = 0; h < 2; h++) {
+            const int32_t k = o + 4 * h;
+            const int32x4_t u = vmlaq_n_s32(vdupq_n_s32((int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) k)), lane, dU);
+            const int32x4_t v = vmlaq_n_s32(vdupq_n_s32((int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) k)), lane, dV);
+            const int32x4_t iu = vshrq_n_s32(u, 16), iv = vshrq_n_s32(v, 16);
+            const int32x4_t fs = vandq_s32(vshrq_n_s32(u, 9), k127), ft = vandq_s32(vshrq_n_s32(v, 9), k127);
+            int32x4_t u0, u1, v0, v1;
+            if (ur) {
+                u0 = vandq_s32(iu, umax);
+                u1 = vandq_s32(vaddq_s32(iu, one), umax);
+            } else {
+                u0 = vmaxq_s32(vminq_s32(iu, umax), zero);
+                u1 = vmaxq_s32(vminq_s32(vaddq_s32(iu, one), umax), zero);
+            }
+            if (vr) {
+                v0 = vandq_s32(iv, vmax);
+                v1 = vandq_s32(vaddq_s32(iv, one), vmax);
+            } else {
+                v0 = vmaxq_s32(vminq_s32(iv, vmax), zero);
+                v1 = vmaxq_s32(vminq_s32(vaddq_s32(iv, one), vmax), zero);
+            }
+            const int32x4_t r0 = vmulq_n_s32(v0, tw), r1 = vmulq_n_s32(v1, tw);
+            /* far side of the diagonal (s + t > 1): the opposite corner and 1 - s, 1 - t */
+            const uint32x4_t far = vcgtq_s32(vaddq_s32(fs, ft), k128);
+            vst1q_s32((int32_t *) ia + 4 * h, vbslq_s32(far, vaddq_s32(r1, u1), vaddq_s32(r0, u0)));
+            vst1q_s32((int32_t *) ib + 4 * h, vbslq_s32(far, vaddq_s32(r1, u0), vaddq_s32(r0, u1)));
+            vst1q_s32((int32_t *) ic + 4 * h, vbslq_s32(far, vaddq_s32(r0, u1), vaddq_s32(r1, u0)));
+            sh[h] = vmovn_u32(vreinterpretq_u32_s32(vbslq_s32(far, vsubq_s32(k128, fs), fs)));
+            th4[h] = vmovn_u32(vreinterpretq_u32_s32(vbslq_s32(far, vsubq_s32(k128, ft), ft)));
+        }
+        for (int i = 0; i < 8; i++) {
+            const uint32_t a = tpx[ia[i]], b = tpx[ib[i]], cc = tpx[ic[i]];
+            A[i] = a; B[i] = b; C[i] = cc;
+        }
+        uint8x8x4_t a = vld4_u8((const uint8_t *) A), b = vld4_u8((const uint8_t *) B), cc = vld4_u8((const uint8_t *) C), r;
+        const uint8x8_t s8 = vmovn_u16(vcombine_u16(sh[0], sh[1])), t8 = vmovn_u16(vcombine_u16(th4[0], th4[1]));
+        const uint8x8_t w0 = vsub_u8(vsub_u8(vdup_n_u8(128), s8), t8);
         for (int k = 0; k < 4; k++)
             r.val[k] = vrshrn_n_u16(vmlal_u8(vmlal_u8(vmull_u8(a.val[k], w0), b.val[k], s8), cc.val[k], t8), 7);
         vst4_u8((uint8_t *) (out + o), r);
