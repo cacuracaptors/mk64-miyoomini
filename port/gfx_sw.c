@@ -171,6 +171,7 @@ static __thread uint32_t tlPixels, tlTris;   /* per raster thread, summed after 
 static double stRasterMs, stWalkMs, stCore0Ms, stCore1Ms;
 /* per core, per phase (clear, OP, PT, TR) -- measurement */
 static double stPhase[2][4];
+static float sCore0Share;   /* defined with the band split below */
 
 void gfx_sw_perf_report(int frames, double ms) {
     (void) ms;
@@ -180,9 +181,10 @@ void gfx_sw_perf_report(int frames, double ms) {
             stTris / frames, stOpTris / frames, stPtTris / frames, stTrTris / frames, stPixels / frames,
             stTexUp / frames, stWalkMs / frames, stRasterMs / frames, stCore0Ms / frames, stCore1Ms / frames,
             port_render_w, port_render_h);
-    fprintf(stderr, "perf fases (ms/quadro): core0 limpa %.2f op %.2f pt %.2f tr %.2f | core1 limpa %.2f op %.2f pt %.2f tr %.2f\n",
+    fprintf(stderr, "perf fases (ms/quadro): core0 limpa %.2f op %.2f pt %.2f tr %.2f | core1 limpa %.2f op %.2f pt %.2f tr %.2f | linhas do core0 %.0f%%\n",
             stPhase[0][0] / frames, stPhase[0][1] / frames, stPhase[0][2] / frames, stPhase[0][3] / frames,
-            stPhase[1][0] / frames, stPhase[1][1] / frames, stPhase[1][2] / frames, stPhase[1][3] / frames);
+            stPhase[1][0] / frames, stPhase[1][1] / frames, stPhase[1][2] / frames, stPhase[1][3] / frames,
+            sCore0Share * 100.0);
     memset(stPhase, 0, sizeof(stPhase));
     stTris = stPixels = stTexUp = stOpTris = stPtTris = stTrTris = 0;
     stRasterMs = stWalkMs = stCore0Ms = stCore1Ms = 0;
@@ -252,6 +254,7 @@ typedef struct {
     int texenv, dtest, dwrite, fog, persp;
     int fr, fg, fb, bs, bd;
     int r, g, b, a;          /* flat colour (GOUR == 0) */
+    const void *nvs;         /* NvSteps of the NEON spans (per triangle) */
 } TriCtx;
 
 static uint8_t sExp5[32], sExp6[64];   /* 565 -> 8 bit, same rounding as before (v*255/max) */
@@ -560,6 +563,14 @@ static const SpanFn sSpanFns[3][2][3] = { SPAN_REF(0), SPAN_REF(1), SPAN_REF(2) 
  *        4 gouraud that only changes from row to row (flat along each span: the sky) */
 /* ------------------------------------------------------------------------- */
 
+/* 1 / n for a run of n pixels (the same value a division gives, without the division) */
+static const float kInvLen[33] = {
+    0.0f, 1.0f / 1, 1.0f / 2, 1.0f / 3, 1.0f / 4, 1.0f / 5, 1.0f / 6, 1.0f / 7, 1.0f / 8, 1.0f / 9, 1.0f / 10,
+    1.0f / 11, 1.0f / 12, 1.0f / 13, 1.0f / 14, 1.0f / 15, 1.0f / 16, 1.0f / 17, 1.0f / 18, 1.0f / 19, 1.0f / 20,
+    1.0f / 21, 1.0f / 22, 1.0f / 23, 1.0f / 24, 1.0f / 25, 1.0f / 26, 1.0f / 27, 1.0f / 28, 1.0f / 29, 1.0f / 30,
+    1.0f / 31, 1.0f / 32,
+};
+
 /* exact DIV255 of a product (<= 255 * 255) */
 static inline __attribute__((always_inline)) uint8x8_t nv_div255(uint16x8_t x) {
     return vrshrn_n_u16(vaddq_u16(x, vrshrq_n_u16(x, 8)), 8);
@@ -590,26 +601,75 @@ static inline __attribute__((always_inline)) uint32x4_t nv_wide_mask32(uint16x4_
 typedef struct {
     int32x4_t o0[8], o1[8];   /* per-lane steps of R G B A OR OG OB F */
     uint32x4_t zo0, zo1;      /* per-lane depth steps */
+    int32_t dX[8], dX8[8];    /* 1 and 8 steps of each channel */
+    int32_t dzi;              /* depth step */
+    uint32_t dz8;             /* 8 depth steps */
 } NvSteps;
 
-/* one group of (up to) 8 pixels; cp / zp point at 8 writable pixels */
-static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_t *zp, uint32_t zi, const NvSteps *s,
-                                                           const int32_t *X, const uint32_t *tex, const TriCtx *c,
-                                                           const uint8x8_t *flatc, const int OUT, const int TEX, const int COL) {
-    /* depth */
-    uint32x4_t z0 = vaddq_u32(vdupq_n_u32(zi), s->zo0), z1 = vaddq_u32(vdupq_n_u32(zi), s->zo1);
-    uint32x4_t d0 = vld1q_u32(zp), d1 = vld1q_u32(zp + 4);
-    uint32x4_t m0, m1;
-    if (OUT == KIND_TR || c->dtest) {
-        m0 = vcgeq_u32(z0, d0);
-        m1 = vcgeq_u32(z1, d1);
-    } else {
-        m0 = m1 = vdupq_n_u32(0xFFFFFFFFu);
-    }
-    uint16x8_t m = vcombine_u16(vmovn_u32(m0), vmovn_u32(m1));
-    if (vget_lane_u64(vreinterpret_u64_u16(vorr_u16(vget_low_u16(m), vget_high_u16(m))), 0) == 0)
-        return;   /* all 8 hidden */
+static const int kNvAttr[8] = { A_R, A_G, A_B, A_A, A_OR, A_OG, A_OB, A_F };
 
+/* the steps only depend on the triangle's gradients: built once per triangle */
+static void nv_prepare(NvSteps *s, const float *ddx, int col) {
+    const int nch = col == 0 ? 0 : (col == 1 || col == 4 ? 4 : 8);
+    int32_t lo[4], hi[4];
+    for (int k = 0; k < nch; k++) {
+        int32_t d = (int32_t) (ddx[kNvAttr[k]] * 65536.0f);
+        s->dX[k] = d;
+        s->dX8[k] = (int32_t) ((uint32_t) d * 8);
+        for (int i = 0; i < 4; i++) {
+            lo[i] = (int32_t) ((uint32_t) i * (uint32_t) d);
+            hi[i] = (int32_t) ((uint32_t) (i + 4) * (uint32_t) d);
+        }
+        s->o0[k] = vld1q_s32(lo);
+        s->o1[k] = vld1q_s32(hi);
+    }
+    const int32_t dzi = rnd_i(ddx[A_Z] * ZSCALE);
+    s->dzi = dzi;
+    s->dz8 = (uint32_t) dzi * 8;
+    uint32_t zl[4], zh[4];
+    for (int i = 0; i < 4; i++) {
+        zl[i] = (uint32_t) i * (uint32_t) dzi;
+        zh[i] = (uint32_t) (i + 4) * (uint32_t) dzi;
+    }
+    s->zo0 = vld1q_u32(zl);
+    s->zo1 = vld1q_u32(zh);
+}
+
+/* the pixel pipeline in three stages (depth test, shading, output), so that two groups
+   of 8 can be written side by side (nv_group2): the in-order Cortex-A7 then works on
+   one group while the other waits for its results */
+typedef struct {
+    uint32x4_t z0, z1, d0, d1, m0, m1;
+    uint16x8_t m;
+} NvDepth;
+
+static inline __attribute__((always_inline)) void nv_depth(NvDepth *D, const uint32_t *zp, uint32_t zi, const NvSteps *s,
+                                                           const TriCtx *c, int n, const int OUT) {
+    D->z0 = vaddq_u32(vdupq_n_u32(zi), s->zo0);
+    D->z1 = vaddq_u32(vdupq_n_u32(zi), s->zo1);
+    D->d0 = vld1q_u32(zp);
+    D->d1 = vld1q_u32(zp + 4);
+    if (OUT == KIND_TR || c->dtest) {
+        D->m0 = vcgeq_u32(D->z0, D->d0);
+        D->m1 = vcgeq_u32(D->z1, D->d1);
+    } else {
+        D->m0 = D->m1 = vdupq_n_u32(0xFFFFFFFFu);
+    }
+    D->m = vcombine_u16(vmovn_u32(D->m0), vmovn_u32(D->m1));
+    if (n < 8) {
+        /* last pixels of a span: lanes n..7 belong to the next pixels of the row, which
+           are left exactly as they are (their old values are written back) */
+        static const uint16_t kLane[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+        const uint16x8_t lm = vcltq_u16(vld1q_u16(kLane), vdupq_n_u16((uint16_t) (n < 0 ? 0 : n)));
+        D->m = vandq_u16(D->m, lm);
+        D->m0 = vandq_u32(D->m0, nv_wide_mask32(vget_low_u16(lm)));
+        D->m1 = vandq_u32(D->m1, nv_wide_mask32(vget_high_u16(lm)));
+    }
+}
+
+static inline __attribute__((always_inline)) void nv_shade(uint8x8_t *pr, uint8x8_t *pg, uint8x8_t *pb, uint8x8_t *pa,
+                                                           const NvSteps *s, const int32_t *X, const uint32_t *tex,
+                                                           const TriCtx *c, const uint8x8_t *flatc, const int TEX, const int COL) {
     /* vertex colour */
     uint8x8_t r, g, b, al;
     if (COL == 0 || COL == 4) {
@@ -653,7 +713,13 @@ static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_
         g = vsub_u8(vadd_u8(g, nv_floor255(vmull_u8(vqsub_u8(fg, g), f))), nv_floor255(vmull_u8(vqsub_u8(g, fg), f)));
         b = vsub_u8(vadd_u8(b, nv_floor255(vmull_u8(vqsub_u8(fb, b), f))), nv_floor255(vmull_u8(vqsub_u8(b, fb), f)));
     }
+    *pr = r; *pg = g; *pb = b; *pa = al;
+}
 
+static inline __attribute__((always_inline)) void nv_out(uint16_t *cp, uint32_t *zp, const NvDepth *D, uint8x8_t r, uint8x8_t g,
+                                                         uint8x8_t b, uint8x8_t al, const TriCtx *c, const int OUT) {
+    uint16x8_t m = D->m;
+    uint32x4_t m0 = D->m0, m1 = D->m1;
     uint16x8_t dst = vld1q_u16(cp);
     if (OUT == KIND_PT) {
         uint16x8_t am = nv_wide_mask(vcgt_u8(al, vdup_n_u8(0xC0)));
@@ -677,9 +743,47 @@ static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_
     }
     vst1q_u16(cp, vbslq_u16(m, nv_pack565(r, g, b), dst));
     if (OUT != KIND_TR && c->dwrite) {
-        vst1q_u32(zp, vbslq_u32(m0, z0, d0));
-        vst1q_u32(zp + 4, vbslq_u32(m1, z1, d1));
+        vst1q_u32(zp, vbslq_u32(m0, D->z0, D->d0));
+        vst1q_u32(zp + 4, vbslq_u32(m1, D->z1, D->d1));
     }
+}
+
+static inline __attribute__((always_inline)) int nv_none(uint16x8_t m) {
+    return vget_lane_u64(vreinterpret_u64_u16(vorr_u16(vget_low_u16(m), vget_high_u16(m))), 0) == 0;
+}
+
+/* one group of 8 pixels; cp / zp point at 8 writable pixels */
+static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_t *zp, uint32_t zi, const NvSteps *s,
+                                                           const int32_t *X, const uint32_t *tex, const TriCtx *c,
+                                                           const uint8x8_t *flatc, int n, const int OUT, const int TEX, const int COL) {
+    NvDepth D;
+    nv_depth(&D, zp, zi, s, c, n, OUT);
+    if (nv_none(D.m))
+        return;   /* all 8 hidden */
+    uint8x8_t r, g, b, al;
+    nv_shade(&r, &g, &b, &al, s, X, tex, c, flatc, TEX, COL);
+    nv_out(cp, zp, &D, r, g, b, al, c, OUT);
+}
+
+/* two groups of 8 (16 pixels), written side by side */
+static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32_t *zp, uint32_t zi, const NvSteps *s,
+                                                            const int32_t *X, const uint32_t *tex, const TriCtx *c,
+                                                            const uint8x8_t *flatc, int n, const int OUT, const int TEX, const int COL) {
+    /* n = pixels to draw of these 16 (9..16) */
+    NvDepth A, B;
+    nv_depth(&A, zp, zi, s, c, 8, OUT);
+    nv_depth(&B, zp + 8, zi + s->dz8, s, c, n - 8, OUT);
+    if (nv_none(vorrq_u16(A.m, B.m)))
+        return;   /* all 16 hidden */
+    int32_t XB[8];
+    const int nch = COL == 0 ? 0 : (COL == 1 || COL == 4 ? 4 : 8);
+    for (int k = 0; k < nch; k++)
+        XB[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX8[k]);
+    uint8x8_t ra, ga, ba, aa, rb, gb, bb, ab;
+    nv_shade(&ra, &ga, &ba, &aa, s, X, tex, c, flatc, TEX, COL);
+    nv_shade(&rb, &gb, &bb, &ab, s, XB, tex + 8, c, flatc, TEX, COL);
+    nv_out(cp, zp, &A, ra, ga, ba, aa, c, OUT);
+    nv_out(cp + 8, zp + 8, &B, rb, gb, bb, ab, c, OUT);
 }
 
 static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, int py, int xs, int xe, const float *a,
@@ -689,22 +793,12 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     uint32_t *zp = port_depth + py * W + xs;
     float zf = a[A_Z];
     const float dz = ddx[A_Z];
-    const int32_t dzi = rnd_i(dz * ZSCALE);
-    NvSteps s;
-    int32_t X[8], dX[8];
-    static const int kAttr[8] = { A_R, A_G, A_B, A_A, A_OR, A_OG, A_OB, A_F };
+    const NvSteps *const s = (const NvSteps *) c->nvs;
+    const int32_t dzi = s->dzi;
+    int32_t X[8];
     const int nch = COL == 0 ? 0 : (COL == 1 || COL == 4 ? 4 : 8);
-    int32_t lo[4], hi[4];
-    for (int k = 0; k < nch; k++) {
-        X[k] = (int32_t) (a[kAttr[k]] * 65536.0f);
-        dX[k] = (int32_t) (ddx[kAttr[k]] * 65536.0f);
-        for (int i = 0; i < 4; i++) {
-            lo[i] = (int32_t) ((uint32_t) i * (uint32_t) dX[k]);
-            hi[i] = (int32_t) ((uint32_t) (i + 4) * (uint32_t) dX[k]);
-        }
-        s.o0[k] = vld1q_s32(lo);
-        s.o1[k] = vld1q_s32(hi);
-    }
+    for (int k = 0; k < nch; k++)
+        X[k] = (int32_t) (a[kNvAttr[k]] * 65536.0f);
     uint8x8_t flatc[4];
     if (COL == 0) {
         flatc[0] = vdup_n_u8((uint8_t) c->r); flatc[1] = vdup_n_u8((uint8_t) c->g);
@@ -712,15 +806,6 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     } else if (COL == 4) {
         for (int k = 0; k < 4; k++)
             flatc[k] = vdup_n_u8((uint8_t) clamp8(X[k] >> 16));
-    }
-    {
-        uint32_t zl[4], zh[4];
-        for (int i = 0; i < 4; i++) {
-            zl[i] = (uint32_t) i * (uint32_t) dzi;
-            zh[i] = (uint32_t) (i + 4) * (uint32_t) dzi;
-        }
-        s.zo0 = vld1q_u32(zl);
-        s.zo1 = vld1q_u32(zh);
     }
 
     uint32_t tex[16] __attribute__((aligned(16)));
@@ -743,6 +828,12 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     /* perspective: the end of one run is the start of the next (same float operations),
        so its reciprocal and texel coordinates are kept instead of recomputed */
     float pu0 = 0, pv0 = 0, pz = -1.0f;
+#ifdef NV_PERSP32
+    const int PSTEP = W >= 640 ? 32 : 16;   /* experiment: exact perspective every 32 pixels at 640x480 */
+#else
+    const int PSTEP = 16;
+#endif
+    int prun_end = xs;
     for (int px = xs; px < xe; px += 16) {
         const int len = xe - px < 16 ? xe - px : 16;
         uint32_t zi = zfix(zf);
@@ -751,7 +842,8 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
         __builtin_prefetch(cp + 64);
         __builtin_prefetch(cp + 96);
         if (TEX >= 0) {
-            if (persp) {
+            if (persp && px == prun_end) {
+                const int plen = xe - px < PSTEP ? xe - px : PSTEP;
                 float u0, v0;
                 if (pz == zf) {
                     u0 = pu0; v0 = pv0;
@@ -759,17 +851,23 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                     float iz0 = 1.0f / zf;
                     u0 = uz * iz0 * c->ftw + c->bias; v0 = vz * iz0 * c->fth + c->bias;
                 }
-                float zz1 = zf + dz * len;
+                /* the run's end, stepped exactly like zf, uz, vz are stepped per 16 pixels */
+                float zz1 = zf, uz1 = uz, vz1 = vz;
+                for (int q = 0; q < plen; q += 16) {
+                    const int cl = plen - q < 16 ? plen - q : 16;
+                    zz1 += dz * cl; uz1 += duz * cl; vz1 += dvz * cl;
+                }
                 float iz1 = 1.0f / zz1;
-                float u1 = (uz + duz * len) * iz1 * c->ftw + c->bias, v1 = (vz + dvz * len) * iz1 * c->fth + c->bias;
+                float u1 = uz1 * iz1 * c->ftw + c->bias, v1 = vz1 * iz1 * c->fth + c->bias;
                 pu0 = u1; pv0 = v1; pz = zz1;
                 float fu = tc_fold(u0, tw, c->uwrap), fv = tc_fold(v0, th, c->vwrap);
                 u1 += fu - u0;
                 v1 += fv - v0;
-                float il = 1.0f / (float) len;
+                const float il = kInvLen[plen];
                 U = rnd_i(fu * 65536.0f) + 256; dU = rnd_i((u1 - fu) * il * 65536.0f);
                 V = rnd_i(fv * 65536.0f) + 256; dV = rnd_i((v1 - fv) * il * 65536.0f);
-                uz += duz * len; vz += dvz * len;
+                uz = uz1; vz = vz1;
+                prun_end = px + plen;
             }
             uint32_t um, vm;
             if (axis_mask(U, dU, len, tw, c->uwrap, &um) && axis_mask(V, dV, len, th, c->vwrap, &vm)) {
@@ -797,24 +895,36 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 }
             }
         }
-        for (int o = 0; o < len; o += 8) {
-            const int n = len - o < 8 ? len - o : 8;
-            if (n == 8) {
-                nv_group(cp + o, zp + o, zi, &s, X, tex + o, c, flatc, OUT, TEX, COL);
-            } else {
-                /* last pixels of the span: work on a copy so nothing past xe is written */
-                uint16_t ct[8];
-                uint32_t zt[8];
-                memcpy(ct, cp + o, (size_t) n * 2);
-                memcpy(zt, zp + o, (size_t) n * 4);
-                nv_group(ct, zt, zi, &s, X, tex + o, c, flatc, OUT, TEX, COL);
-                memcpy(cp + o, ct, (size_t) n * 2);
-                memcpy(zp + o, zt, (size_t) n * 4);
+        if (px + 16 <= W) {
+            /* 16 pixels of the row are there (the ones past xe only get their own values back) */
+            if (len > 8)
+                nv_group2(cp, zp, zi, s, X, tex, c, flatc, len, OUT, TEX, COL);
+            else
+                nv_group(cp, zp, zi, s, X, tex, c, flatc, len, OUT, TEX, COL);
+        } else {
+            /* end of the row: the pixels after it belong to another row (maybe the other
+               core's), so the last group works on a copy */
+            for (int o = 0; o < len; o += 8) {
+                const int n = len - o < 8 ? len - o : 8;
+                int32_t XO[8];
+                for (int k = 0; k < nch; k++)
+                    XO[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX8[k] * (uint32_t) (o >> 3));
+                const uint32_t zo = zi + s->dz8 * (uint32_t) (o >> 3);
+                if (n == 8) {
+                    nv_group(cp + o, zp + o, zo, s, XO, tex + o, c, flatc, 8, OUT, TEX, COL);
+                } else {
+                    uint16_t ct[8];
+                    uint32_t zt[8];
+                    memcpy(ct, cp + o, (size_t) n * 2);
+                    memcpy(zt, zp + o, (size_t) n * 4);
+                    nv_group(ct, zt, zo, s, XO, tex + o, c, flatc, n, OUT, TEX, COL);
+                    memcpy(cp + o, ct, (size_t) n * 2);
+                    memcpy(zp + o, zt, (size_t) n * 4);
+                }
             }
-            zi += (uint32_t) dzi * 8;
-            for (int k = 0; k < nch; k++)
-                X[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) dX[k] * 8);
         }
+        for (int k = 0; k < nch; k++)
+            X[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX[k] * 16);
         cp += len;
         zp += len;
         zf += dz * len;
@@ -846,6 +956,24 @@ static int wrap_mode(int n, int clamp, int mirror) {
 
 /* rows handled by this call: all, or (for the two-core split) bands of 8 rows by parity */
 static __thread int sBandMask = 0, sBandVal = 0;
+/* two cores: owner (0 / 1) of each band of 8 rows, rebuilt every frame so both cores
+   finish together (core 1 also converts the finished frame for the screen) */
+#define MAX_BANDS 128
+static uint8_t sBandOwner[MAX_BANDS];
+static float sCore0Share = 0.5f;
+static void build_band_owners(void) {
+    float acc = 0.5f;
+    for (int b = 0; b < MAX_BANDS; b++) {
+        acc += sCore0Share;
+        if (acc >= 1.0f) {
+            acc -= 1.0f;
+            sBandOwner[b] = 0;
+        } else {
+            sBandOwner[b] = 1;
+        }
+    }
+}
+#define BAND_SKIP(py) (sBandMask && sBandOwner[(py) >> 3] != sBandVal)
 
 /* draw one triangle with state st and list kind */
 static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t *v2, const RState *st, int kind) {
@@ -934,6 +1062,8 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         ddy[k] = (a2 * dx1 - a1 * dx2) * inv;
     }
 
+    NvSteps nvs;
+    c.nvs = NULL;
     if (nv_pending) {
         /* colour mode: offset only matters when textured, fog only when enabled; a gouraud
            triangle whose colour does not change along x (the sky) is flat on every span */
@@ -963,6 +1093,8 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
             out = KIND_OP;
         }
         span = sNvFns[out][textured ? c.texenv + 1 : 0][col];
+        nv_prepare(&nvs, ddx, col);
+        c.nvs = &nvs;
     }
 
     /* sort by y for the span walk */
@@ -982,9 +1114,11 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     const float slope_ab = (yb - ya) != 0.0f ? (xb - xa) / (yb - ya) : 0.0f;
     const float slope_bc = (yc - yb) != 0.0f ? (xc - xb) / (yc - yb) : 0.0f;
     uint32_t pixels = 0;
+    /* attributes the span reads: depth and texture, + colour (gouraud), + offset and fog */
+    const int natt = extras ? NATTR : (flat ? A_R : A_OR);
 
     for (int py = ystart; py < yend; py++) {
-        if (((py >> 3) & sBandMask) != sBandVal)
+        if (BAND_SKIP(py))
             continue;
         const float fy = (float) py + 0.5f;
         float xl = xa + (fy - ya) * slope_ac, xr;
@@ -1005,7 +1139,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
 
         const float ox = (float) xs + 0.5f - X[0], oy = fy - Y[0];
         float a[NATTR];
-        for (int k = 0; k < NATTR; k++)
+        for (int k = 0; k < natt; k++)
             a[k] = at[0][k] + ddx[k] * ox + ddy[k] * oy;
         pixels += span(&c, py, xs, xe, a, ddx);
     }
@@ -1485,7 +1619,7 @@ static void raster_frame_band(int mask, int val) {
     sBandMask = mask;
     sBandVal = val;
     for (int y0 = 0; y0 < H; y0 += 8) {
-        if (((y0 >> 3) & mask) != val)
+        if (BAND_SKIP(y0))
             continue;
         int rows = H - y0 < 8 ? H - y0 : 8;
         memset(port_color + y0 * W, 0, (size_t) rows * W * sizeof(uint16_t));
@@ -1558,6 +1692,8 @@ static void raster_frame(void) {
     if (!sWorkerOk) {
         raster_frame_band(0, 0);
     } else {
+        if (!sBandOwner[1] && !sBandOwner[2])
+            build_band_owners();   /* first frame */
         pthread_mutex_lock(&sWMutex);
         int gen = ++sWorkGen;
         pthread_cond_broadcast(&sWCond);
@@ -1565,12 +1701,21 @@ static void raster_frame(void) {
 
         double t0 = port_now_ms();
         raster_frame_band(1, 0);
-        stCore0Ms += port_now_ms() - t0;
+        double ms0 = port_now_ms() - t0;
+        stCore0Ms += ms0;
 
         pthread_mutex_lock(&sWMutex);
         while (sWorkDone != gen)
             pthread_cond_wait(&sWCond, &sWMutex);
         stCore1Ms += sWorkerMs;
+        /* share for the next frame: each core's time per unit of share this frame */
+        if (ms0 > 0.2 && sWorkerMs > 0.2) {
+            double r0 = ms0 / sCore0Share, r1 = sWorkerMs / (1.0 - sCore0Share);
+            double target = r1 / (r0 + r1);
+            double f = 0.75 * sCore0Share + 0.25 * target;
+            sCore0Share = (float) (f < 0.3 ? 0.3 : (f > 0.7 ? 0.7 : f));
+            build_band_owners();
+        }
         tlPixels += sWorkerPixels;
         tlTris += sWorkerTris;
         pthread_mutex_unlock(&sWMutex);
