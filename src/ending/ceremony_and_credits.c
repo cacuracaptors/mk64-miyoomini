@@ -419,7 +419,7 @@ void func_802830B4(CinematicCamera* arg0, s16 arg1, s16 arg2, s16 arg3) {
 
 void func_80283100(CinematicCamera* arg0, f32* arg1) {
     if (arg0->unk60 != 0) {
-        arg0->unk6E = (coss((u16) arg0->unk64) * arg0->unk60) / 256;
+        arg0->unk6E = (coss((u16) (s32) arg0->unk64) * arg0->unk60) / 256;
         arg0->unk64 += arg0->unk68;
         adjust_s16_value_transition(&arg0->unk60, 0, arg0->unk6C);
     } else {
@@ -1415,7 +1415,7 @@ void func_802847CC(CinematicCamera* camera) {
     u16 sp2E;
     u16 sp2C;
     // D_802856B4 cast to u32 triggers cfc1.
-    sp2E = D_80286A04[D_800DC5E4].unkC - (10 - (-(((u16) (u32) D_802856B4))));
+    sp2E = D_80286A04[D_800DC5E4].unkC - (10 - (-(((u16) (u32) (s32) D_802856B4))));
     sp2C = D_80286A04[D_800DC5E4].unkC;
 
     cutscene_event(func_80283CD0, camera, 0, 0);

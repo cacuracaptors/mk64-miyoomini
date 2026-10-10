@@ -110,7 +110,13 @@ static float far_pin_z = 0.00001f;
 // GCCs reset them — do not copy this pattern to an old-toolchain tree). Whole-file -O2 was tried
 // and reverted in sf64 for perf; THIS is different (hot members only, rest of file stays -O3).
 // Judge with GFXLITE on HW, not by eye.
+#ifdef TARGET_MIYOO
+// Miyoo: the SH4 I-cache layout trick does not apply, and the Miyoo GCC is older than 12,
+// so optimize("O2") would reset -fno-strict-aliasing/-fwrapv for these functions (see above).
+#define GFX_HOT
+#else
 #define GFX_HOT __attribute__((section(".text.hot.gfx"), optimize("O2")))
+#endif
 // Final-link placement (2026-08-18 findings): the KOS ldscript's .text swallows *(.text.*),
 // and LTO ltrans partitions SCATTER the members of this named section across the image — so
 // the attribute does NOT guarantee contiguity in the linked ELF, only in the .o. Measured
@@ -624,6 +630,13 @@ extern dc_fast_t *pvr_reserve(int kind, size_t n);
 // which requires the bake loop to stamp the strip flags at vertex creation (VERTEX/VERTEX_EOL).
 extern uint8_t gfx_pvr_op_dirty;
 extern void pvr_emit_op_header_slow(void);
+#ifdef TARGET_MIYOO
+// Miyoo: the software backend (port/gfx_sw.c) rasterizes the opaque list as it arrives;
+// pvr_submit_op re-reads the state itself when the header is dirty.
+static inline void pvr_submit_op_inline(const dc_fast_t *tris, size_t n) {
+    pvr_submit_op(tris, n);
+}
+#else
 // KOS sq_fast_cpy's loop (pair-single fmov.d, one SQ line per iteration), inlined. dst = SQ area
 // address, src 32B-aligned, n = number of 32-byte lines (> 0). fschg is balanced inside the asm.
 static inline void pvr_sq_ship(void *dst, const void *src, size_t n) {
@@ -655,6 +668,7 @@ static inline void pvr_submit_op_inline(const dc_fast_t *tris, size_t n) {
     if (gfx_pvr_op_dirty) pvr_emit_op_header_slow();
     pvr_sq_ship(SQ_MASK_DEST(PVR_TA_INPUT), tris, n);
 }
+#endif
 
 static struct GfxWindowManagerAPI* gfx_wapi;
 static struct GfxRenderingAPI* gfx_rapi;
@@ -891,7 +905,7 @@ static  __attribute__((noinline)) uint8_t gfx_texture_cache_lookup(int tile, int
 	}
 
 	struct TextureHashmapNode** node = &gfx_texture_cache.hashmap[hash];
-	if ((uintptr_t)rdp.loaded_texture[dslot].addr < 0x8c010000u) {
+	if ((uintptr_t)rdp.loaded_texture[dslot].addr < RAM_PTR_MIN) {
 		gfx_rapi->select_texture(tile, oops_texture_id);
 		*node = &oops_node;
 		return 1;
@@ -1622,10 +1636,14 @@ static void __attribute__((noinline)) gfx_sp_vertex_light(size_t n_vertices, siz
             float dotx; // = 0,
             float doty; // = 0;
             {
+#ifdef TARGET_MIYOO
+                float fr8 = vn->n[0], fr9 = vn->n[1], fr10 = vn->n[2], fr11 = 0;
+#else
                 register float fr8  asm ("fr8")  = vn->n[0];
                 register float fr9  asm ("fr9")  = vn->n[1];
                 register float fr10 asm ("fr10") = vn->n[2];
                 register float fr11 asm ("fr11") = 0;
+#endif
  
                 dotx = recip127 * shz_dot8f(fr8, fr9, fr10, fr11, rsp.current_lookat_coeffs[0][0],
                                             rsp.current_lookat_coeffs[0][1], rsp.current_lookat_coeffs[0][2], 0);

@@ -527,12 +527,12 @@ void func_800B9BE4(f32 arg0, f32 arg1, u16* arg2) {
 
     for (i = 2; i < 8; i++) {
         //! @bug they probably meant to store the value to tmp[i] and tmp[8 + i]
-        arg2[i] = arg1 * tmp[i - 2] + arg0 * tmp[i - 1];
-        arg2[8 + i] = arg1 * tmp[6 + i] + arg0 * tmp[7 + i];
+        arg2[i] = (u16) (s32) (arg1 * tmp[i - 2] + arg0 * tmp[i - 1]);
+        arg2[8 + i] = (u16) (s32) (arg1 * tmp[6 + i] + arg0 * tmp[7 + i]);
     }
 
     for (i = 0; i < 16; i++) {
-        arg2[i] = tmp[i];
+        arg2[i] = (u16) (s32) tmp[i];
     }
 }
 

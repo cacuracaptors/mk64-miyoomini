@@ -2308,7 +2308,7 @@ void func_8004E06C(s32 arg0, s32 arg1, u8* texture, s32 arg3, s32 arg4) {
 
     for (i = 0; i < arg4; i++) {
         temp_s0 = var_s1;
-        temp_s6 = (u32) ((sins(temp_s0) * temp_f20) + (f32) (arg0 - var));
+        temp_s6 = (u32) (s32) ((sins(temp_s0) * temp_f20) + (f32) (arg0 - var));
 //        sins(temp_s0);
         rsp_load_texture(img, arg3, 1);
         func_8004B97C(temp_s6, var_s4, arg3, 1, 1);

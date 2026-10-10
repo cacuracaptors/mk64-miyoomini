@@ -15,7 +15,9 @@
 #include <ultra64.h>
 #include "save.h"
 
+#ifndef TARGET_MIYOO
 char* get_vmu_fn(maple_device_t* vmudev, char* fn);
+#endif
 void* segmented_to_virtual(void* addr);
 
 u64 osClockRate = 62500000;
@@ -46,7 +48,9 @@ s32 osRecvMesg(UNUSED OSMesgQueue* mq, UNUSED OSMesg* msg, UNUSED s32 flag) {
     return 0;
 }
 
+#ifndef TARGET_MIYOO
 extern mutex_t mq_mutex;
+#endif
 extern OSMesgQueue* D_800EA3B4;
 s32 AosSendMesg(OSMesgQueue* mq, OSMesg msg, UNUSED s32 flag) {
     s32 index;
@@ -139,6 +143,9 @@ s32 osAiSetFrequency(u32 freq) {
     return D_8033491C / (s32) a1;
 }
 
+#ifdef TARGET_MIYOO
+/* Miyoo Mini: EEPROM and Controller Pak saves are plain files, see port/saves_miyoo.c */
+#else
 extern char* fnpre;
 static char texfn[256];
 static uint8_t icondata[512 * 2];
@@ -556,3 +563,4 @@ s32 osPfsFindFile(OSPfs* pfs, u16 company_code, u32 game_code, u8* game_name, u8
     vid_border_color(0, 0, 0);
     return PFS_NO_ERROR;
 }
+#endif /* !TARGET_MIYOO */

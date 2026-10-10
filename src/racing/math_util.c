@@ -273,9 +273,15 @@ void func_802B5794(Mat4 mtx, Vec3f from, Vec3f to) {
     mtx[2][3] = 0.0f;
     mtx[3][3] = 1.0f;
 
+#if defined(TARGET_MIYOO) /* N64: translation = -(from . column) */
+    mtx[3][0] = -(from[0] * xColX + from[1] * yColX + from[2] * zColX);
+    mtx[3][1] = -(from[0] * xColY + from[1] * yColY + from[2] * zColY);
+    mtx[3][2] = -(from[0] * xColZ + from[1] * yColZ + from[2] * zColZ);
+#else
     *((SHZ_ALIASING shz_vec3_t *)mtx[3]) = shz_matrix4x4_trans_vec3_transpose(mtx, (shz_vec3_t) { .x = from[0], .y = from[1], .z = from[2] });
     for(unsigned r = 0; r < 3; ++r)
         mtx[3][r] *= -1.0f;     
+#endif
 }
 
 // create a rotation matrix around the x axis
@@ -315,7 +321,7 @@ void mtxf_s16_rotate_z(Mat4 mat, s16 angle) {
 }
 
 void func_802B5B14(Vec3f b, Vec3s rotate) {
-#if 0
+#if defined(TARGET_MIYOO) /* N64 original: the sh4zam path below differs from the N64 results */
     Mat4 mtx;
     Vec3f copy;
 
@@ -417,7 +423,7 @@ void mtxf_scale(Mat4 mat, f32 coef) {
 
 // look like create a translation and rotation matrix with arg1 position and arg2 rotation
 void mtxf_pos_rotation_xyz(Mat4 out, Vec3f pos, Vec3s orientation) {
-#if 0
+#if defined(TARGET_MIYOO) /* N64 original: the sh4zam path below differs from the N64 results */
     f32 sine1;
     f32 cosine1;
     f32 sine2;
@@ -519,7 +525,7 @@ void func_802B64C4(Vec3f arg0, s16 arg1) {
 }
 
 void calculate_orientation_matrix(Mat3 dest, f32 arg1, f32 arg2, f32 arg3, s16 rotationAngle) {
-#if 0
+#if defined(TARGET_MIYOO) /* N64 original: the sh4zam path below differs from the N64 results */
     Mat3 mtx_rot_y;
     Mat3 matrix;
     s32 i, j;
@@ -688,7 +694,7 @@ void func_802B6BC0(Mat4 arg0, s16 arg1, f32 arg2, f32 arg3, f32 arg4) {
 
 // look like create a translation and rotation matrix with arg1 position and arg2 rotation
 void func_802B6D58(Mat4 arg0, Vec3f arg1, Vec3f arg2) {
-#if 0
+#if defined(TARGET_MIYOO) /* N64 original: the sh4zam path below differs from the N64 results */
     f32 sine1;
     f32 cosine1;
     f32 sine2;
@@ -696,12 +702,13 @@ void func_802B6D58(Mat4 arg0, Vec3f arg1, Vec3f arg2) {
     f32 sine3;
     f32 cosine3;
 
-    sine1 = sins(arg2[0]);
-    cosine1 = coss(arg2[0]);
-    sine2 = sins(arg2[1]);
-    cosine2 = coss(arg2[1]);
-    sine3 = sins(arg2[2]);
-    cosine3 = coss(arg2[2]);
+    /* float angles in N64 units; convert through s32 so negatives wrap like on N64 */
+    sine1 = sins((u16) (s32) arg2[0]);
+    cosine1 = coss((u16) (s32) arg2[0]);
+    sine2 = sins((u16) (s32) arg2[1]);
+    cosine2 = coss((u16) (s32) arg2[1]);
+    sine3 = sins((u16) (s32) arg2[2]);
+    cosine3 = coss((u16) (s32) arg2[2]);
     arg0[0][0] = (cosine2 * cosine3) + ((sine1 * sine2) * sine3);
     arg0[1][0] = (-cosine2 * sine3) + (sine1 * sine2) * cosine3;
     arg0[2][0] = cosine1 * sine2;
@@ -903,7 +910,7 @@ void func_802B7F7C(Vec3f arg0, Vec3f arg1, Vec3s dest) {
 }
 
 f32 sins(u16 arg0) {
-#if 0
+#if defined(TARGET_MIYOO) /* N64 sine table: same values as the N64, and faster than sinf on ARM */
     return gSineTable[arg0 >> 4];
 #else
     float farg0 = (float)(arg0 & 0xfff0) * TRIG_ARG_SCALE;
@@ -912,7 +919,7 @@ f32 sins(u16 arg0) {
 }
 
 f32 coss(u16 arg0) {
-#if 0
+#if defined(TARGET_MIYOO)
     return gCosineTable[arg0 >> 4];
 #else
     float farg0 = (float)(arg0 & 0xfff0) * TRIG_ARG_SCALE;

@@ -1306,7 +1306,7 @@ void move_s16_towards(s16* startingValue, s16 targetValue, f32 somePercent) {
 }
 
 void move_u16_towards(u16* startingValue, s16 targetValue, f32 somePercent) {
-    *startingValue -= ((*startingValue - targetValue) * somePercent);
+    *startingValue = (u16) (s32) (*startingValue - ((*startingValue - targetValue) * somePercent));
 }
 
 void func_80022744(void) {

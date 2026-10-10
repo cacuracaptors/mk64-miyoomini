@@ -83,6 +83,17 @@
         }                                                                                                            \
     }
 
+// Lowest address of real (non-segmented) memory. Segmented N64 addresses are
+// 0x00000000-0x0FFFFFFF (segment in the top byte), so anything the program owns
+// must live above them. Dreamcast: main RAM. Miyoo Mini: the executable is
+// linked at 0x20000000 (see Makefile.miyoo), so its data, bss and heap -- and
+// the mmap areas and stacks far above -- are all at or above 0x10000000.
+#ifdef TARGET_MIYOO
+#define RAM_PTR_MIN 0x10000000u
+#else
+#define RAM_PTR_MIN 0x8C010000u
+#endif
+
 // convert a virtual address to physical.
 #define VIRTUAL_TO_PHYSICAL(addr) ((uintptr_t) (addr))
 

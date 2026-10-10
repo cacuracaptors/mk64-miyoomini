@@ -261,6 +261,18 @@ static void send_display_list(struct SPTask *spTask) {
 
 uint16_t __attribute__((aligned(32))) fb[3][4];
 
+#ifdef TARGET_MIYOO
+#include <pthread.h>
+void create_thread(UNUSED OSThread* thread, UNUSED OSId id, void (*entry)(void*), void* arg, UNUSED void* sp, UNUSED OSPri pri) {
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&at, 256 * 1024);
+    pthread_create(&th, &at, (void* (*)(void*)) entry, arg);
+    pthread_attr_destroy(&at);
+}
+#else
 void create_thread(UNUSED OSThread* thread, UNUSED OSId id, void (*entry)(void*), void* arg, void* sp, OSPri pri) {
     kthread_attr_t main_attr;
     main_attr.create_detached = 1;
@@ -270,6 +282,7 @@ void create_thread(UNUSED OSThread* thread, UNUSED OSId id, void (*entry)(void*)
 	main_attr.label = "thread";
     thd_create_ex(&main_attr, entry, arg);
 }
+#endif
 
 // mio0encode
 s32 func_80040174(UNUSED void*, UNUSED s32, UNUSED s32) {
@@ -288,12 +301,14 @@ u8 *_sequencesSegmentRomStart;
 //extern void init_all_sounds(void);
 void _AudioInit(void);
 
+#ifndef TARGET_MIYOO
 __used void __stack_chk_fail(void) {
     unsigned int pr = (unsigned int)arch_get_ret_addr();
     printf("Stack smashed at PR=0x%08x\n", pr);
     printf("Successfully detected stack corruption!\n");
     exit(EXIT_SUCCESS);
 }
+#endif
 #if 0
 /* Callback function used to handle a breakpoint request. */
 static bool on_break(const ubc_breakpoint_t *bp,
@@ -322,8 +337,12 @@ void setup_audio_data(void) {
     /* Only the ALSeqFile header of audiotables is needed now (for gAlTbl and
        sample-address anchoring); the 2.4MB of VADPCM is dead -- the AICA driver
        plays from the transcoded adpcm_pool instead. */
+#ifdef TARGET_MIYOO
+    u8 *AUDIOTABLES_BUF = NULL; /* allocated below with the real file size */
+#else
     u8 *AUDIOTABLES_BUF = memalign(32,4096);
     if (!AUDIOTABLES_BUF) printf("can't malloc tables\n");
+#endif
     u8 *INSTRUMENT_SETS_BUF = memalign(32,256);
     if (!INSTRUMENT_SETS_BUF) printf("can't malloc instruments\n");
     u8 *SEQUENCES_BUF = memalign(32,143728);
@@ -383,8 +402,13 @@ void setup_audio_data(void) {
         //printf("audiotables is %ld @ %08x\n", filesize, (uintptr_t)AUDIOTABLES_BUF);
         rewind(file);
 
+#ifdef TARGET_MIYOO
+        AUDIOTABLES_BUF = memalign(32, (filesize + 31) & ~31);
+        if (!AUDIOTABLES_BUF) { printf("can't malloc tables\n"); exit(-1); }
+#else
         /* Only load the ALSeqFile header; the VADPCM sample data is unused. */
         if (filesize > 4096) filesize = 4096;
+#endif
 
         long toread = filesize;
         long didread = 0;
@@ -479,6 +503,7 @@ void setup_audio_data(void) {
         _sequencesSegmentRomStart = SEQUENCES_BUF;
     }
 
+#ifndef TARGET_MIYOO
     /* Load the offline-transcoded AICA-ADPCM sample pool resident, for the AICA
        hardware-mixing voice driver (src/audio/aica_synth.c). */
     {
@@ -510,6 +535,7 @@ void setup_audio_data(void) {
         fclose(file);
         gAicaAdpcmPoolBase = POOL_BUF;
     }
+#endif
 
     _AudioInit();
     audio_init();
@@ -517,7 +543,9 @@ void setup_audio_data(void) {
     vid_border_color(0, 0, 0);
 }
 
+#ifndef TARGET_MIYOO
 #include "dcprofiler.h"
+#endif
 
 s32 osAppNmiBuffer[16];
 void isPrintfInit(void);
@@ -534,6 +562,11 @@ const uint32_t rainbow[] = {
     0x801F801F  // Violet  (148,   0, 211)
 };
 
+#ifdef TARGET_MIYOO
+void rainbow_print(UNUSED int x, UNUSED int y, char *text) {
+    printf("%s\n", text);
+}
+#else
 void rainbow_print(int x, int y, char *text) {
     int ci = 0;
     void *ptr = (void*)((uintptr_t)vram_s + ((y*640*2) + (x*2)));
@@ -561,8 +594,35 @@ void rainbow_print(int x, int y, char *text) {
     }
 
 }
+#endif
 
 
+#ifdef TARGET_MIYOO
+#include "port_miyoo.h"
+int main(int argc, char **argv) {
+    must_inval_bg = 0;
+    stupid_fucking_faces_hack = 0;
+    wasSoftReset = (s16)0;
+    gPhysicalFramebuffers[0] = fb[0];
+    gPhysicalFramebuffers[1] = fb[1];
+    gPhysicalFramebuffers[2] = fb[2];
+
+    port_chdir_to_exe(); /* the data sits next to the executable */
+    fnpre = ".";
+    FILE* fntest = fopen("./dc_data/common_data.bin", "rb");
+    if (NULL == fntest) {
+        printf("mk64: ./dc_data/common_data.bin nao encontrado (rode no diretorio do jogo)\n");
+        return 1;
+    }
+    fclose(fntest);
+
+    port_init(argc, argv);
+    setup_audio_data();
+    rainbow_print(0, 0, "Welcome to Mario Kart :)");
+    thread5_game_loop(NULL);
+    return 0;
+}
+#else
 int main(UNUSED int argc, UNUSED char **argv) {
     thd_set_hz(300);
 
@@ -610,6 +670,7 @@ int main(UNUSED int argc, UNUSED char **argv) {
 
     return 0;
 }
+#endif
 
 void setup_mesg_queues(void) {
     return;
@@ -671,6 +732,13 @@ void create_gfx_task_structure(void) {
 int held;
 int sd_x,sd_y;
 
+#ifdef TARGET_MIYOO
+void init_controllers(void) {
+    gControllerBits = 1;
+    gKeyboardBit = 0;
+    sIsController1Unplugged = 0;
+}
+#else
 void init_controllers(void) {
     gControllerBits = 0;
     gKeyboardBit = 0;
@@ -702,6 +770,7 @@ void init_controllers(void) {
     // jnmartin84 - my new vars
     sd_x = sd_y = held = 0;
 }
+#endif
 
 #if 1
 //extern int player_index;
@@ -791,6 +860,7 @@ extern void __osPfsCloseAllFiles(void);
 u16 ucheld;
 u16 stick;
 
+#ifndef TARGET_MIYOO
 void update_keyboard(s32 index) {
 	struct Controller* controller = &gControllers[index];
     maple_device_t *kbd;
@@ -965,6 +1035,10 @@ void update_controller(s32 index) {
     controller->stickDirection = stick;
 }
 #endif
+#endif /* !TARGET_MIYOO (update_keyboard) */
+#ifdef TARGET_MIYOO
+/* update_controller: port/input_miyoo.c */
+#else
 #include <arch/arch.h>
 extern void AicaSynth_Shutdown(void);
 
@@ -1064,6 +1138,7 @@ void update_controller(s32 index) {
     controller->stickDepressed = controller->stickDirection & (stick ^ controller->stickDirection);
     controller->stickDirection = stick;
 }
+#endif /* !TARGET_MIYOO (update_controller) */
 
 
 void read_controllers(void) {
@@ -1279,8 +1354,16 @@ extern void load_ceremony_data(void);
  */
 static char texfn[256];
 
+#ifdef TARGET_MIYOO
+/* segment 0 on N64 = physical RAM; small/garbage addresses land here (reads as zero) */
+static u8 sSegment0Dummy[0x01000000];
+#endif
 void setup_game_memory(void) {
+#ifdef TARGET_MIYOO
+    set_segment_base_addr(0, sSegment0Dummy);
+#else
     set_segment_base_addr(0, 0x8C010000);
+#endif
     func_80000BEC();
 
     memset(COMMON_BUF, 0, sizeof(COMMON_BUF));
@@ -2513,9 +2596,13 @@ void thread5_game_loop(UNUSED void* arg) {
     read_controllers();
     func_800C5CB8();
 	inited = 1;
+#ifdef TARGET_MIYOO
+    port_start_vblank(vblfunc);
+#else
     vblank_handler_add(&vblfunc, NULL);
     create_thread(NULL, 5, &SPINNING_THREAD, NULL, NULL, 12);
 #define MEMTEST
+#endif
 #if defined(MEMTEST)
     for(int mi=0;mi<6*1048576;mi+=65536) {
         void *test_m = malloc(mi);
@@ -2541,10 +2628,18 @@ void thread5_game_loop(UNUSED void* arg) {
 run_game_loop:
 #endif
 
+#ifdef TARGET_MIYOO
+    while (true) {
+        game_loop_one_iteration();
+        port_audio_pump();
+        port_poll_quit();
+    }
+#else
     while (true) {
         game_loop_one_iteration();
 		thd_pass();
     }
+#endif
 }
 
 void _AudioInit(void) {
@@ -2554,6 +2649,20 @@ void _AudioInit(void) {
     }
 }
 
+#ifdef TARGET_MIYOO
+/* Called from the game thread once per frame: run one audio frame per elapsed vblank
+   (the DC did this on SPINNING_THREAD; doing it here avoids data races with game code). */
+void port_audio_pump(void) {
+    static uint64_t last_vbltick = 0;
+    uint64_t now = vblticker;
+    if (last_vbltick == 0 || now - last_vbltick > 4)
+        last_vbltick = now - 1;
+    while (last_vbltick < now) {
+        last_vbltick++;
+        create_next_audio_buffer(audio_buffer, SAMPLES_HIGH);
+    }
+}
+#endif
 void SPINNING_THREAD(UNUSED void *arg) {
     uint64_t last_vbltick = vblticker;
 

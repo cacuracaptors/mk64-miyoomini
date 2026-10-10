@@ -26,7 +26,7 @@ void sequence_channel_process_sound(struct SequenceChannel* seqChannel, s32 reca
     for (i = 0; i < 4; ++i) {
         struct SequenceChannelLayer* layer = seqChannel->layers[i];
         if (layer != NULL && layer->enabled && layer->note != NULL) {
-            if ((uintptr_t)layer->note < (uintptr_t)0x8c010000) {
+            if ((uintptr_t)layer->note < (uintptr_t)RAM_PTR_MIN) {
                 printf("effects.c INVALID NOTE %08x\n", (uintptr_t)layer->note);
           //  printf("\n");
             //while(1){}
@@ -99,7 +99,7 @@ f32 get_portamento_freq_scale(struct Portamento* p) {
     f32 result = 0.0f;
 
     p->cur += p->speed;
-    v0 = (u32) p->cur;
+    v0 = (u32) (s32) p->cur;
 
     if (v0 > 127) {
         v0 = 127;

@@ -264,19 +264,40 @@ void load_ceremony_cutscene(void) {
     init_camera_podium_ceremony();
     func_80093E60();
     // gold
-    uint16_t* reflp = (uint16_t*) segmented_to_virtual(0x0B002F18);
+    uint16_t* reflp = (uint16_t*) segmented_to_virtual(
+#ifdef TARGET_MIYOO
+        /* the DC literal address only matches the DC data layout. The ceremony's gold map
+           can't be named (startup_logo has a reflection_map_gold too, and that one wins the
+           link); it is the 32x32 map right before reflection_map_silver (0x2F18 + 0x800 = 0x3718). */
+        (u16*) reflection_map_silver - 1024
+#else
+        0x0B002F18
+#endif
+    );
     for (int i = 0; i < 32 * 32; i++) {
         uint16_t nextrp = reflp[i];
         nextrp = (nextrp << 8) | ((nextrp >> 8) & 0xff);
         reflp[i] = nextrp;
     } // brass
-    reflp = (uint16_t*) segmented_to_virtual(0x0B003F18);
+    reflp = (uint16_t*) segmented_to_virtual(
+#ifdef TARGET_MIYOO
+        reflection_map_brass /* the DC literal address only matches the DC data layout */
+#else
+        0x0B003F18
+#endif
+    );
     for (int i = 0; i < 32 * 32; i++) {
         uint16_t nextrp = reflp[i];
         nextrp = (nextrp << 8) | ((nextrp >> 8) & 0xff);
         reflp[i] = nextrp;
     } // silver
-    reflp = (uint16_t*) segmented_to_virtual(0x0B003718);
+    reflp = (uint16_t*) segmented_to_virtual(
+#ifdef TARGET_MIYOO
+        reflection_map_silver /* the DC literal address only matches the DC data layout */
+#else
+        0x0B003718
+#endif
+    );
     for (int i = 0; i < 32 * 32; i++) {
         uint16_t nextrp = reflp[i];
         nextrp = (nextrp << 8) | ((nextrp >> 8) & 0xff);

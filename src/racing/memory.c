@@ -63,6 +63,11 @@ void* get_segment_base_addr(s32 segment) {
 
 // borrowed from skmp / DCA3
 // thanks
+#ifdef TARGET_MIYOO
+__attribute__((noinline)) void stacktrace() {
+    printf("[ called from %p ]\n", __builtin_return_address(0));
+}
+#else
 extern const char etext[];
 __attribute__((noinline)) void stacktrace() {
 	uint32 sp=0, pr=0;
@@ -111,6 +116,7 @@ __attribute__((noinline)) void stacktrace() {
 		printf("%08x ]\n", (uintptr_t)sp);
 	}
 }
+#endif
 
 /**
  * @brief converts an RSP segment + offset address to a normal memory address
@@ -128,9 +134,15 @@ void* segmented_to_virtual(const void* addr) {
         }
     */
 
+#ifdef TARGET_MIYOO
+    if (uip_addr >= RAM_PTR_MIN) {
+        return (void*) uip_addr;
+    }
+#else
     if ((uip_addr >= 0x8c010000) && (uip_addr <= 0x8cffffff)) {
         return uip_addr;
     }
+#endif
 
     size_t segment = (uintptr_t) uip_addr >> 24;
 
@@ -527,6 +539,47 @@ u8* load_course(s32 courseId) {
     filesize = ftell(file);
     rewind(file);
 
+#ifdef TARGET_MIYOO
+    /* The packed display lists follow the MIO0-compressed vertices (4-byte aligned).
+       Their offset is computed from the MIO0 stream instead of the packoffs table,
+       which only matches the bytes the Dreamcast compiler produced. */
+    {
+        u8* whole = malloc(filesize);
+        if (!whole || fread(whole, 1, filesize, file) != (size_t) filesize) {
+            printf("load_course: falha lendo %s\n", texfn);
+            exit(-1);
+        }
+        fclose(file);
+        file = NULL;
+        u32 destSize = (whole[4] << 24) | (whole[5] << 16) | (whole[6] << 8) | whole[7];
+        u32 compOff = (whole[8] << 24) | (whole[9] << 16) | (whole[10] << 8) | whole[11];
+        u32 uncompOff = (whole[12] << 24) | (whole[13] << 16) | (whole[14] << 8) | whole[15];
+        u32 written = 0, bit = 0, uncompIdx = 0;
+        while (written < destSize) {
+            if (whole[16 + bit / 8] & (1 << (7 - (bit % 8)))) {
+                written++;
+                uncompIdx++;
+            } else {
+                const u8* vals = &whole[compOff];
+                compOff += 2;
+                written += ((vals[0] & 0xF0) >> 4) + 3;
+            }
+            bit++;
+        }
+        long packoff = (long) ((uncompOff + uncompIdx + 3) & ~3u);
+        if (packoff > filesize) {
+            printf("load_course: geografia invalida (%ld > %ld)\n", packoff, filesize);
+            exit(-1);
+        }
+        memcpy(COMP_VERT_BUF, whole, packoff);
+        memcpy(UNPACK_BUF, whole + packoff, filesize - packoff);
+        free(whole);
+
+        set_segment_base_addr(0xF, (void*) COMP_VERT_BUF);
+        decompress_vtx(COMP_VERT_BUF, vertexCount, DECOMP_VERT_BUF);
+        displaylist_unpack(UNPACK_BUF);
+    }
+#else
     {
         long toread = packoffs[gCurrentCourseId];
         long cvtotal = toread;
@@ -567,6 +620,7 @@ u8* load_course(s32 courseId) {
         displaylist_unpack(UNPACK_BUF);
         //printf("unpack to %08x\n", (uintptr_t*) UNPACK_BUF);
     }
+#endif
     decompress_textures(0);
 //    unmute_stream();
     return COMP_VERT_BUF;

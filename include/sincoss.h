@@ -56,14 +56,16 @@ static inline void scaled_sincoss(u16 arg0, f32* s, f32* c, f32 scale) {
 f32 sins(u16);
 f32 coss(u16);
 
-static inline void sincoss(u16 arg0, f32* s, f32* c) {
-    *s = sins(arg0);
-    *c = coss(arg0);
+/* The angle is taken as s32: callers pass floats (e.g. render_player.c), and a
+   negative float converts to u16 by wrapping on N64/SH4 but saturates to 0 on ARM. */
+static inline void sincoss(s32 arg0, f32* s, f32* c) {
+    *s = sins((u16) arg0);
+    *c = coss((u16) arg0);
 }
 
-static inline void scaled_sincoss(u16 arg0, f32* s, f32* c, f32 scale) {
-    *s = sins(arg0) * scale;
-    *c = coss(arg0) * scale;
+static inline void scaled_sincoss(s32 arg0, f32* s, f32* c, f32 scale) {
+    *s = sins((u16) arg0) * scale;
+    *c = coss((u16) arg0) * scale;
 }
 
 #endif /* SINCOSS_USE_FSCA */

@@ -1567,7 +1567,14 @@ void copy_framebuffer2(s32 xofs, s32 yofs, s32 width, s32 height, UNUSED u16* so
 
         for (x = 0; x < width; x++, targetIndex++) {
             s32 x_w = x + xofs;
+#ifdef TARGET_MIYOO
+            /* last rendered frame, in N64 320x240 coordinates (port/gfx_sw.c) */
+            extern uint16_t port_fb_pixel565(int x, int y);
+            (void) y_h;
+            target[targetIndex] = rgb565_to_rgba5551(port_fb_pixel565(x_w, y + yofs));
+#else
             target[targetIndex] = rgb565_to_rgba5551(vram_s[(y_h * 640) + (x_w * 2)]);
+#endif
         }
     }
 }

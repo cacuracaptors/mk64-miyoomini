@@ -169,7 +169,7 @@ struct Drum* get_drum(s32 bankId, s32 drumId) {
         return NULL;
     }
 
-    if ((uintptr_t) gCtlEntries[bankId].drums < 0x8C010000U) {
+    if ((uintptr_t) gCtlEntries[bankId].drums < RAM_PTR_MIN) {
         stubbed_printf("Audio: voiceman: Percussion table pointer (bank %d) is irregular.\n");
         return NULL;
     }
