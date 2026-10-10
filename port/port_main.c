@@ -23,6 +23,7 @@
 int port_opt_perf = 0;
 int port_opt_60fps = 0;
 int port_opt_filter = 0;
+int port_opt_parallel = 0;
 static int opt_timer = 0;   /* -timer: old free-running 60 Hz clock, for comparison */
 
 double port_now_ms(void) {
@@ -75,6 +76,8 @@ void port_init(int argc, char **argv) {
             port_opt_filter = 1;
         else if (!strcmp(argv[i], "-semgfx"))
             port_opt_nogfx = 1;
+        else if (!strcmp(argv[i], "-paralelo"))
+            port_opt_parallel = 1;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);

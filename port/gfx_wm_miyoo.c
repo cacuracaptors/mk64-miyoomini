@@ -55,7 +55,8 @@ static int perf_frames;
 
 static void wm_swap_buffers_begin(void) {
     double t0 = port_now_ms();
-    port_video_present();
+    if (!gfx_sw_presents)   /* (-paralelo: shown from gfx_sw's end_frame) */
+        port_video_present();
     if (port_opt_perf) {
         extern void gfx_sw_perf_report(int frames, double ms);
         double now = port_now_ms();

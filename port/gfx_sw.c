@@ -114,7 +114,34 @@ static void tex_update_opaque(struct SwTex *t) {
             t->margin = 1;
     }
 }
+/* -paralelo (the frame drawn on core 1 while the game prepares the next one): the frame
+   being drawn reads its own copy of the entries of the textures it uses (sTexR), taken
+   when it was handed over. Until it is finished, the texels and row extents of those
+   textures are not touched: a texture changed or freed meanwhile gets new memory, and
+   the old one is freed once that frame is done. Without -paralelo sTexRd is sTex. */
+static struct SwTex sTexR[TEX_MAX];
+static const struct SwTex *sTexRd = sTex;
+static uint8_t sTexShared[TEX_MAX];    /* used by the frame being drawn */
+static uint16_t sSharedIds[TEX_MAX];
+static int sSharedN;
+static void *sDeferred[2 * TEX_MAX];   /* (each texture lets go of px and ext at most once per frame) */
+static int sDeferredN;
+static void tex_detach(struct SwTex *t) {
+    const uint32_t id = (uint32_t) (t - sTex);
+    if (!sTexShared[id])
+        return;
+    sTexShared[id] = 0;
+    if (t->px)
+        sDeferred[sDeferredN++] = t->px;
+    if (t->ext)
+        sDeferred[sDeferredN++] = t->ext;
+    t->px = NULL;
+    t->alloc = 0;
+    t->ext = NULL;
+    t->exth = 0;
+}
 static void tex_free(struct SwTex *t) {
+    tex_detach(t);
     free(t->px);
     free(t->ext);
     memset(t, 0, sizeof(*t));
@@ -144,6 +171,8 @@ static uint8_t sDepthTest = 1, sDepthWrite = 1, sFog = 0, sTexEnv = GFX_TEXENV_M
 static uint8_t sBlendSrc = GFX_BLENDF_SRCALPHA, sBlendDst = GFX_BLENDF_INVSRCALPHA;
 static uint8_t sListKind = KIND_OP;
 static uint32_t sFogColor = 0;   /* 0x00RRGGBB */
+static uint32_t sFogR;           /* -paralelo: the fog colour of the frame being drawn */
+static const uint32_t *sFogRd = &sFogColor;
 
 /* exported for the front-end (only used by its DC inline OP path) */
 uint8_t gfx_pvr_op_dirty = 1;
@@ -167,10 +196,17 @@ typedef struct {
 static dc_fast_t sOpVerts[BUCKET_VERTS], sPtVerts[BUCKET_VERTS], sTrVerts[BUCKET_VERTS];
 static Batch sOpBatch[BUCKET_BATCH], sPtBatch[BUCKET_BATCH], sTrBatch[BUCKET_BATCH];
 /* All three lists are kept for the end of the frame, as on the PVR (OP, then PT, then TR),
-   and then drawn by both cores at once, each on alternating bands of 8 rows. */
-static Bucket sOP = { sOpVerts, sOpBatch, 0, 0, -1, 1 };
-static Bucket sPT = { sPtVerts, sPtBatch, 0, 0, -1, 1 };
-static Bucket sTR = { sTrVerts, sTrBatch, 0, 0, -1, 1 };
+   and then drawn by both cores at once, each on alternating bands of 8 rows.
+   -paralelo keeps a second set (allocated when it is turned on): the game fills one
+   (sRecB) while the previous frame is drawn from the other (sRenB). Otherwise both
+   point at the same set. */
+static Bucket sBk[2][3] = { { { sOpVerts, sOpBatch, 0, 0, -1, 1 },
+                              { sPtVerts, sPtBatch, 0, 0, -1, 1 },
+                              { sTrVerts, sTrBatch, 0, 0, -1, 1 } } };
+static Bucket *sRecB = sBk[0], *sRenB = sBk[0];
+#define sOP (sRecB[KIND_OP])
+#define sPT (sRecB[KIND_PT])
+#define sTR (sRecB[KIND_TR])
 static int sDropLog;
 
 static void mark_dirty(void) {
@@ -212,6 +248,8 @@ static double stRasterMs, stWalkMs, stCore0Ms, stCore1Ms;
 /* per core, per phase (clear, sky, OP, PT, TR, TR in screen space = HUD) -- measurement */
 static double stPhase[2][6];
 static float sCore0Share;   /* defined with the band split below */
+static double stLeadMs, stPresentMs, stWaitMs;   /* -paralelo: core 1 alone, showing the frame, core 0 waiting for core 1 */
+static int sPipe;                       /* -paralelo on (see pipe_init) */
 
 void gfx_sw_perf_report(int frames, double ms) {
     (void) ms;
@@ -226,6 +264,10 @@ void gfx_sw_perf_report(int frames, double ms) {
                 k, stPhase[k][0] / frames, stPhase[k][1] / frames, stPhase[k][2] / frames, stPhase[k][3] / frames,
                 stPhase[k][4] / frames, stPhase[k][5] / frames, k ? "" : " | ");
     fprintf(stderr, " | linhas do core0 %.0f%%\n", sCore0Share * 100.0);
+    if (sPipe)
+        fprintf(stderr, "perf paralelo: core1 sozinho %.2f  core0 esperando core1 %.2f  mostrar %.2f ms/quadro\n",
+                stLeadMs / frames, stWaitMs / frames, stPresentMs / frames);
+    stLeadMs = stPresentMs = stWaitMs = 0;
     memset(stPhase, 0, sizeof(stPhase));
     stTris = stPixels = stTexUp = stOpTris = stPtTris = stTrTris = 0;
     stRasterMs = stWalkMs = stCore0Ms = stCore1Ms = 0;
@@ -1553,7 +1595,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     if (!(fabsf(area) > 1e-6f))
         return;
 
-    const struct SwTex *tx = st->tex ? &sTex[st->tex] : NULL;
+    const struct SwTex *tx = st->tex ? &sTexRd[st->tex] : NULL;
     const int textured = tx && tx->px;
     const int persp = textured && !(at[0][A_Z] == at[1][A_Z] && at[0][A_Z] == at[2][A_Z]) &&
                       at[0][A_Z] > 0.0f && at[1][A_Z] > 0.0f && at[2][A_Z] > 0.0f;
@@ -1573,7 +1615,8 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         c.dtest = 0;   /* in front of the whole scene: the test always passes */
     c.dwrite = st->depth_write && kind != KIND_TR;
     c.fog = st->fog;
-    c.fr = (sFogColor >> 16) & 0xFF; c.fg = (sFogColor >> 8) & 0xFF; c.fb = sFogColor & 0xFF;
+    const uint32_t fogc = *sFogRd;
+    c.fr = (fogc >> 16) & 0xFF; c.fg = (fogc >> 8) & 0xFF; c.fb = fogc & 0xFF;
     c.bs = st->blend_src; c.bd = st->blend_dst;
     if (textured) {
         c.tpx = tx->px;
@@ -2043,6 +2086,7 @@ static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsig
     struct SwTex *t = &sTex[sCurBound];
     if (width <= 0 || height <= 0)
         return;
+    tex_detach(t);   /* (-paralelo: the frame being drawn keeps the old texels) */
     uint32_t n = (uint32_t) width * (uint32_t) height;
     if (!t->px || t->alloc < n) {
         uint32_t *p = realloc(t->px, n * 4);
@@ -2193,7 +2237,7 @@ static int sSkyN;
 /* can this translucent triangle be drawn before everything (see "the sky, drawn first")?
    box: what the triangles left in the list before it cover, which it must not touch */
 static int sky_candidate(const dc_fast_t *v, const RState *st, float zfar, const float *box) {
-    if ((st->tex && sTex[st->tex].px) || st->fog ||
+    if ((st->tex && sTexRd[st->tex].px) || st->fog ||
         st->blend_src != GFX_BLENDF_SRCALPHA || st->blend_dst != GFX_BLENDF_INVSRCALPHA)
         return 0;
     float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
@@ -2227,7 +2271,7 @@ static int tr_cmp(const void *a, const void *b) {
 }
 
 static void sort_tr(void) {
-    Bucket *b = &sTR;
+    Bucket *b = &sRenB[KIND_TR];
 #ifdef HAVE_FETCH_ASM
     if (sFetchAsm < 0) {   /* first frame, before any raster thread runs */
         sFetchAsm = fetch_asm_selftest();
@@ -2257,7 +2301,7 @@ static void sort_tr(void) {
     sSkyN = 0;
     int zok = sUseNeon && nt;
     float zmin = 1e30f, zmax = -1e30f;
-    const Bucket *ob[2] = { &sOP, &sPT };
+    const Bucket *ob[2] = { &sRenB[KIND_OP], &sRenB[KIND_PT] };
     for (int k = 0; k < 2; k++) {
         for (int i = 0; i < ob[k]->nbatch; i++)
             if (ob[k]->batch[i].count && !ob[k]->batch[i].st.depth_write)
@@ -2303,7 +2347,7 @@ static void sort_tr(void) {
 }
 
 static void raster_tr_sorted(uint32_t from, uint32_t to) {
-    Bucket *b = &sTR;
+    Bucket *b = &sRenB[KIND_TR];
     for (uint32_t i = from; i < to; i++) {
         const dc_fast_t *v = &b->verts[sTrSort[i].seq];
         tlTrNoDepth = sTrSort[i].front;
@@ -2313,7 +2357,7 @@ static void raster_tr_sorted(uint32_t from, uint32_t to) {
 }
 
 static void raster_sky(void) {
-    const Bucket *b = &sTR;
+    const Bucket *b = &sRenB[KIND_TR];
     for (int i = 0; i < sSkyN; i++) {
         const dc_fast_t *v = &b->verts[sSky[i].seq];
         raster_tri(&v[0], &v[1], &v[2], &b->batch[sSky[i].batch].st, KIND_TR);
@@ -2368,9 +2412,9 @@ static void raster_frame_band(int mask, int val) {
         raster_sky();   /* (more rows than the coverage table: in place, as before) */
     }
     double t2 = port_now_ms();
-    flush_bucket(&sOP, KIND_OP);
+    flush_bucket(&sRenB[KIND_OP], KIND_OP);
     double t3 = port_now_ms();
-    flush_bucket(&sPT, KIND_PT);
+    flush_bucket(&sRenB[KIND_PT], KIND_PT);
     double t4 = port_now_ms();
     raster_tr_sorted(0, sTrHud);
     double t5 = port_now_ms();
@@ -2424,12 +2468,48 @@ static void *worker_proc(void *arg) {
     return NULL;
 }
 
+/* -paralelo: the frame is handed to core 1 at the end of the game's frame and drawn
+   while core 0 runs the game and the display list of the next one; core 0 joins in when
+   it gets there. The picture is the same, shown one frame later. */
+static int sPipeState;   /* 0 nothing, 1 core 1 drawing the last frame, 2 last frame drawn, not shown */
+static int sPipeGen;
+static double sPipeKickT;
+int gfx_sw_presents;     /* gfx_wm_miyoo.c: the frame is shown from here, not after end_frame */
+
+static void pipe_init(void) {
+    const size_t nv = (size_t) 3 * BUCKET_VERTS * sizeof(dc_fast_t), nb = (size_t) 3 * BUCKET_BATCH * sizeof(Batch);
+    dc_fast_t *v = malloc(nv);
+    Batch *bt = malloc(nb);
+    if (!v || !bt) {
+        free(v);
+        free(bt);
+        printf("gfx: sem memoria para -paralelo\n");
+        return;
+    }
+    for (int k = 0; k < 3; k++) {
+        sBk[1][k].verts = v + (size_t) k * BUCKET_VERTS;
+        sBk[1][k].batch = bt + (size_t) k * BUCKET_BATCH;
+        sBk[1][k].nverts = 0;
+        sBk[1][k].nbatch = 0;
+        sBk[1][k].cur = -1;
+        sBk[1][k].dirty = 1;
+    }
+    sTexRd = sTexR;
+    sFogRd = &sFogR;
+    sCore0Share = 0.3f;   /* core 1 starts alone: it takes the larger part */
+    build_band_owners();
+    sPipe = 1;
+    gfx_sw_presents = 1;
+}
+
 static void start_worker(void) {
     if (pthread_create(&sWorker, NULL, worker_proc, NULL) == 0) {
         pthread_detach(sWorker);
         sWorkerOk = 1;
     }
-    printf("gfx: desenho em %s\n", sWorkerOk ? "2 nucleos" : "1 nucleo");
+    if (sWorkerOk && port_opt_parallel)
+        pipe_init();
+    printf("gfx: desenho em %s\n", sPipe ? "2 nucleos, em linha de montagem (-paralelo)" : sWorkerOk ? "2 nucleos" : "1 nucleo");
 }
 
 static void raster_frame(void) {
@@ -2490,6 +2570,72 @@ static void count_list(Bucket *b, uint32_t *ntris, int kind) {
     }
 }
 
+/* -paralelo: core 0 draws its bands of the frame core 1 started on, waits for core 1, and
+   lets go of the textures that frame held. The split for the next frame counts the time
+   core 1 worked alone (lead): both should finish together. */
+static void pipe_finish(int adapt) {
+    const double tj = port_now_ms(), lead = tj - sPipeKickT;
+    tlPixels = tlTris = 0;
+    raster_frame_band(1, 0);
+    const double ms0 = port_now_ms() - tj;
+    stCore0Ms += ms0;
+    stLeadMs += lead;
+
+    pthread_mutex_lock(&sWMutex);
+    while (sWorkDone != sPipeGen)
+        pthread_cond_wait(&sWCond, &sWMutex);
+    stWaitMs += port_now_ms() - tj - ms0;
+    const double ms1 = sWorkerMs;
+    tlPixels += sWorkerPixels;
+    tlTris += sWorkerTris;
+    pthread_mutex_unlock(&sWMutex);
+    stCore1Ms += ms1;
+    stPixels += tlPixels;
+
+    if (adapt && ms0 > 0.2 && ms1 > 0.2) {
+        /* each core's time for the whole frame, at this frame's speed; core 1 had a head
+           start of lead: s * r0 + lead = (1 - s) * r1 */
+        const double s = sCore0Share, r0 = ms0 / s, r1 = ms1 / (1.0 - s);
+        const double target = (r1 - lead) / (r0 + r1);
+        const double f = 0.75 * s + 0.25 * target;
+        sCore0Share = (float) (f < 0.1 ? 0.1 : (f > 0.7 ? 0.7 : f));
+        build_band_owners();
+    }
+
+    for (int i = 0; i < sSharedN; i++)
+        sTexShared[sSharedIds[i]] = 0;
+    sSharedN = 0;
+    for (int i = 0; i < sDeferredN; i++)
+        free(sDeferred[i]);
+    sDeferredN = 0;
+    sPipeState = 2;
+}
+
+/* -paralelo: the lists just filled become the frame to draw; the textures it uses are
+   copied (entries only, the texels stay shared until it is done) and core 1 starts */
+static void pipe_handover(void) {
+    Bucket *r = sRecB;
+    sRecB = r == sBk[0] ? sBk[1] : sBk[0];   /* the set that was drawn: free again */
+    sRenB = r;
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < sRenB[k].nbatch; i++) {
+            const uint32_t id = sRenB[k].batch[i].st.tex;
+            if (id && !sTexShared[id]) {
+                sTexShared[id] = 1;
+                sSharedIds[sSharedN++] = (uint16_t) id;
+                sTexR[id] = sTex[id];
+            }
+        }
+    sFogR = sFogColor;
+    sort_tr();
+    pthread_mutex_lock(&sWMutex);
+    sPipeGen = ++sWorkGen;
+    pthread_cond_broadcast(&sWCond);
+    pthread_mutex_unlock(&sWMutex);
+    sPipeKickT = port_now_ms();
+    sPipeState = 1;
+}
+
 static void sw_end_frame(void) {
     double t0 = port_now_ms();
     stWalkMs += t0 - sFrameT0;
@@ -2497,6 +2643,24 @@ static void sw_end_frame(void) {
     count_list(&sPT, &stPtTris, KIND_PT);
     count_list(&sTR, &stTrTris, KIND_TR);
     stTris += (uint32_t) ((sOP.nverts + sPT.nverts + sTR.nverts) / 3);
+    if (sPipe) {
+        /* the last frame: finished and shown (the screen gets the next colour buffer) */
+        if (sPipeState == 1)
+            pipe_finish(1);
+        if (sPipeState == 2) {
+            const double tp = port_now_ms();
+            port_video_present();
+            stPresentMs += port_now_ms() - tp;
+            sPipeState = 0;
+        }
+        pipe_handover();
+        stRasterMs += port_now_ms() - t0;
+        if (sCapF) {   /* the capture keeps the finished picture: this frame is drawn now */
+            pipe_finish(0);
+            cap_end();
+        }
+        return;
+    }
     sort_tr();
     raster_frame();
     stRasterMs += port_now_ms() - t0;
