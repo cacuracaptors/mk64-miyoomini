@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Make the game's GNU-as data files (written for the Dreamcast's sh-elf as)
 assemble with the ARM GNU as:
-  - '#' starts a comment anywhere (ARM as only accepts it at the start of a line)
-    and /* */ comments are dropped,
+  - '#' and '!' (sh-elf as) start a comment anywhere (ARM as only accepts '#' at
+    the start of a line) and /* */ comments are dropped,
   - sh-elf prefixes C symbols with '_', ARM does not: every identifier that starts
     with '_' loses ONE leading underscore ('_gKartLuigi000' -> 'gKartLuigi000',
     '__sequencesSegmentStart' -> '_sequencesSegmentStart').
@@ -40,7 +40,7 @@ def convert(text):
             # keep the line structure
             code.append('\n' * text.count('\n', i, j) or ' ')
             i = j
-        elif c == '#':
+        elif c == '#' or c == '!':   # '!' is the SH assembler's comment character
             j = text.find('\n', i)
             i = n if j < 0 else j
         else:

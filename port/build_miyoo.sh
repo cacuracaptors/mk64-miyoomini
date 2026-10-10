@@ -15,8 +15,10 @@ PKG="$BASE/mk64-pacote"
 CROSS=""
 # a copia do container pode ter o compilador em bin/ ou em usr/bin/
 ACHADO="$(find "$BASE/miyoomini-toolchain" -maxdepth 3 -name arm-linux-gnueabihf-gcc 2>/dev/null | head -1 | sed 's/gcc$//')"
+# O compilador ARM do Ubuntu (/usr/bin/arm-linux-gnueabihf-gcc) NAO serve: ele liga o
+# programa a uma glibc bem mais nova que a do Miyoo, e o jogo nem abriria no aparelho.
+# So o compilador do container (a mesma glibc do OnionOS) e aceito.
 for c in "$CROSS_PREFIX" \
-         "$(command -v arm-linux-gnueabihf-gcc 2>/dev/null | sed 's/gcc$//')" \
          "$ACHADO" \
          "/opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-" \
          "/opt/miyoomini-toolchain/bin/arm-linux-gnueabihf-"; do
@@ -29,13 +31,24 @@ if [ -z "$CROSS" ]; then
     exit 1
 fi
 echo "compilador: ${CROSS}gcc ($(${CROSS}gcc -dumpversion))"
+case "$CROSS" in
+    /usr/bin/*) echo "ERRO: ${CROSS}gcc e o compilador do Ubuntu, nao o do Miyoo (veja o comentario acima)."
+                echo "Copie o do container: docker cp miyoomini-toolchain-debug:/opt/miyoomini-toolchain $BASE/miyoomini-toolchain"
+                exit 1 ;;
+esac
 
 [ -f baserom.us.z64 ] || { echo "ERRO: falta baserom.us.z64 na raiz do repositorio"; exit 1; }
 command -v python3 >/dev/null || { echo "ERRO: falta python3"; exit 1; }
 
-if [ "$1" = "clean" ]; then
+# trocou de compilador desde a ultima vez? entao recompila tudo
+if [ -f build/.compilador ] && [ "$(cat build/.compilador)" != "$CROSS" ]; then
+    echo "compilador mudou desde a ultima compilacao: recompilando tudo"
+    set -- clean
+fi
+if [ "$1" = "clean" ] || { [ -d build ] && [ ! -f build/.compilador ]; }; then
     rm -rf build test.o data_segment2.o dc_data
 fi
+mkdir -p build && echo "$CROSS" > build/.compilador
 
 make -f Makefile.miyoo -j4 CROSS="$CROSS" || {
     echo; echo "=== A COMPILACAO FALHOU (veja as primeiras linhas com 'error') ==="; exit 1; }
@@ -75,3 +88,4 @@ echo
 echo "=== PACOTE PRONTO em $PKG ==="
 du -sh "$GAME"
 md5sum "$GAME/mk64"
+echo "glibc exigida: $(${CROSS}objdump -T "$GAME/mk64" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
