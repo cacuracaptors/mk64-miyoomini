@@ -906,6 +906,15 @@ static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32
     nv_out(cp + 8, zp + 8, &B, rb, gb, bb, ab, c, OUT);
 }
 
+/* the 3-point blend of one channel set; written out per channel: with a loop over .val[k]
+   GCC 8 keeps the vector structs in memory and goes through the stack for every channel */
+#define NV_BLEND1(r, a, b, cc, w0, s8, t8, k) \
+    (r).val[k] = vrshrn_n_u16(vmlal_u8(vmlal_u8(vmull_u8((a).val[k], (w0)), (b).val[k], (s8)), (cc).val[k], (t8)), 7)
+#define NV_BLEND3(r, a, b, cc, w0, s8, t8) do { \
+        NV_BLEND1(r, a, b, cc, w0, s8, t8, 0); NV_BLEND1(r, a, b, cc, w0, s8, t8, 1); \
+        NV_BLEND1(r, a, b, cc, w0, s8, t8, 2); NV_BLEND1(r, a, b, cc, w0, s8, t8, 3); \
+    } while (0)
+
 /* N64-style 3-point texture filter for a run of up to 16 pixels (-filtro). Each pixel
    blends the texel at its corner with its two neighbours along s and t, on the side of
    the texel square's diagonal it falls on, as the N64 RDP does. Weights in 1/128.
@@ -954,8 +963,7 @@ static void nv_fetch3_ref(uint32_t *out, int len, int32_t U, int32_t dU, int32_t
                     cc = vld4_u8((const uint8_t *) (C + o)), r;
         uint8x8_t s8 = vld1_u8(ws + o), t8 = vld1_u8(wt + o);
         uint8x8_t w0 = vsub_u8(vsub_u8(vdup_n_u8(128), s8), t8);
-        for (int k = 0; k < 4; k++)
-            r.val[k] = vrshrn_n_u16(vmlal_u8(vmlal_u8(vmull_u8(a.val[k], w0), b.val[k], s8), cc.val[k], t8), 7);
+        NV_BLEND3(r, a, b, cc, w0, s8, t8);
         vst4_u8((uint8_t *) (out + o), r);
     }
 }
@@ -1011,8 +1019,7 @@ static void nv_fetch3_32(uint32_t *out, int len, int32_t U, int32_t dU, int32_t 
         uint8x8x4_t a = vld4_u8((const uint8_t *) A), b = vld4_u8((const uint8_t *) B), cc = vld4_u8((const uint8_t *) C), r;
         const uint8x8_t s8 = vmovn_u16(vcombine_u16(sh[0], sh[1])), t8 = vmovn_u16(vcombine_u16(th4[0], th4[1]));
         const uint8x8_t w0 = vsub_u8(vsub_u8(vdup_n_u8(128), s8), t8);
-        for (int k = 0; k < 4; k++)
-            r.val[k] = vrshrn_n_u16(vmlal_u8(vmlal_u8(vmull_u8(a.val[k], w0), b.val[k], s8), cc.val[k], t8), 7);
+        NV_BLEND3(r, a, b, cc, w0, s8, t8);
         vst4_u8((uint8_t *) (out + o), r);
     }
 }
@@ -1077,8 +1084,7 @@ static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, 
         }
         uint8x8x4_t a = vld4_u8((const uint8_t *) A), b = vld4_u8((const uint8_t *) B), cc = vld4_u8((const uint8_t *) C), r;
         const uint8x8_t w0 = vsub_u8(vsub_u8(vdup_n_u8(128), s8), t8);
-        for (int k = 0; k < 4; k++)
-            r.val[k] = vrshrn_n_u16(vmlal_u8(vmlal_u8(vmull_u8(a.val[k], w0), b.val[k], s8), cc.val[k], t8), 7);
+        NV_BLEND3(r, a, b, cc, w0, s8, t8);
         vst4_u8((uint8_t *) (out + o), r);
     }
 }
