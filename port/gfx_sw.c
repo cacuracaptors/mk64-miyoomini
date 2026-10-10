@@ -66,9 +66,19 @@ struct SwTex {
     uint16_t w, h;
     uint8_t filter;        /* 1 = bilinear requested (point sampled for now) */
     uint8_t clampu, clampv, mirru, mirrv;
+    uint8_t opaque;        /* every texel has alpha 255 */
 };
 
 static struct SwTex sTex[TEX_MAX];
+
+/* called after the texels change */
+#define GFX_SW_TEX_OPAQUE 1
+static void tex_update_opaque(struct SwTex *t) {
+    uint32_t n = (uint32_t) t->w * t->h, a = 0xFF000000u;
+    for (uint32_t i = 0; i < n; i++)
+        a &= t->px[i];
+    t->opaque = a == 0xFF000000u;
+}
 static uint32_t sTexCount;
 static uint32_t sBound[2];
 static uint32_t sCurBound;
@@ -271,7 +281,15 @@ static inline float tc_fold(float u, int n, int mode) {
     float period = (mode == WR_MIRROR2 || mode == WR_MIRRORN) ? 2.0f * n : (float) n;
     if (u >= 0.0f && u < 16384.0f && (mode == WR_REPEAT2 || mode == WR_MIRROR2))
         return u;   /* pow2 wrap only looks at the low bits: no folding needed */
-    return u - floorf(u / period) * period;
+    float q = u / period;
+    float fq;
+    if (q > -8388608.0f && q < 8388608.0f) {   /* floorf without the library call */
+        int i = (int) q;
+        fq = (float) ((float) i > q ? i - 1 : i);
+    } else {
+        fq = floorf(q);
+    }
+    return u - fq * period;
 }
 
 /* ---- the pixel pipeline, shared by all span loops (inlined, constants fold away) ---- */
@@ -538,7 +556,8 @@ static const SpanFn sSpanFns[3][2][3] = { SPAN_REF(0), SPAN_REF(1), SPAN_REF(2) 
  * blend other than SRCALPHA / INVSRCALPHA stay on span_body.
  *   OUT: KIND_OP, KIND_PT, KIND_TR (standard blend)
  *   TEX: -1 untextured, else the texenv
- *   COL: 0 flat, 1 gouraud, 2 gouraud + offset, 3 gouraud + offset + fog        */
+ *   COL: 0 flat, 1 gouraud, 2 gouraud + offset, 3 gouraud + offset + fog,
+ *        4 gouraud that only changes from row to row (flat along each span: the sky) */
 /* ------------------------------------------------------------------------- */
 
 /* exact DIV255 of a product (<= 255 * 255) */
@@ -576,7 +595,7 @@ typedef struct {
 /* one group of (up to) 8 pixels; cp / zp point at 8 writable pixels */
 static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_t *zp, uint32_t zi, const NvSteps *s,
                                                            const int32_t *X, const uint32_t *tex, const TriCtx *c,
-                                                           const int OUT, const int TEX, const int COL) {
+                                                           const uint8x8_t *flatc, const int OUT, const int TEX, const int COL) {
     /* depth */
     uint32x4_t z0 = vaddq_u32(vdupq_n_u32(zi), s->zo0), z1 = vaddq_u32(vdupq_n_u32(zi), s->zo1);
     uint32x4_t d0 = vld1q_u32(zp), d1 = vld1q_u32(zp + 4);
@@ -589,12 +608,12 @@ static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_
     }
     uint16x8_t m = vcombine_u16(vmovn_u32(m0), vmovn_u32(m1));
     if (vget_lane_u64(vreinterpret_u64_u16(vorr_u16(vget_low_u16(m), vget_high_u16(m))), 0) == 0)
-        return;
+        return;   /* all 8 hidden */
 
     /* vertex colour */
     uint8x8_t r, g, b, al;
-    if (COL == 0) {
-        r = vdup_n_u8((uint8_t) c->r); g = vdup_n_u8((uint8_t) c->g); b = vdup_n_u8((uint8_t) c->b); al = vdup_n_u8((uint8_t) c->a);
+    if (COL == 0 || COL == 4) {
+        r = flatc[0]; g = flatc[1]; b = flatc[2]; al = flatc[3];
     } else {
         r = nv_lane8(X[0], s->o0[0], s->o1[0]);
         g = nv_lane8(X[1], s->o0[1], s->o1[1]);
@@ -619,7 +638,7 @@ static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_
             r = nv_div255(vmull_u8(r, t.val[2])); g = nv_div255(vmull_u8(g, t.val[1])); b = nv_div255(vmull_u8(b, t.val[0]));
             al = nv_div255(vmull_u8(al, t.val[3]));
         }
-        if (COL >= 2) {
+        if (COL == 2 || COL == 3) {
             r = vqadd_u8(r, nv_lane8(X[4], s->o0[4], s->o1[4]));
             g = vqadd_u8(g, nv_lane8(X[5], s->o0[5], s->o1[5]));
             b = vqadd_u8(b, nv_lane8(X[6], s->o0[6], s->o1[6]));
@@ -674,7 +693,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     NvSteps s;
     int32_t X[8], dX[8];
     static const int kAttr[8] = { A_R, A_G, A_B, A_A, A_OR, A_OG, A_OB, A_F };
-    const int nch = COL == 0 ? 0 : (COL == 1 ? 4 : 8);
+    const int nch = COL == 0 ? 0 : (COL == 1 || COL == 4 ? 4 : 8);
     int32_t lo[4], hi[4];
     for (int k = 0; k < nch; k++) {
         X[k] = (int32_t) (a[kAttr[k]] * 65536.0f);
@@ -685,6 +704,14 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
         }
         s.o0[k] = vld1q_s32(lo);
         s.o1[k] = vld1q_s32(hi);
+    }
+    uint8x8_t flatc[4];
+    if (COL == 0) {
+        flatc[0] = vdup_n_u8((uint8_t) c->r); flatc[1] = vdup_n_u8((uint8_t) c->g);
+        flatc[2] = vdup_n_u8((uint8_t) c->b); flatc[3] = vdup_n_u8((uint8_t) c->a);
+    } else if (COL == 4) {
+        for (int k = 0; k < 4; k++)
+            flatc[k] = vdup_n_u8((uint8_t) clamp8(X[k] >> 16));
     }
     {
         uint32_t zl[4], zh[4];
@@ -713,16 +740,29 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
         }
     }
 
+    /* perspective: the end of one run is the start of the next (same float operations),
+       so its reciprocal and texel coordinates are kept instead of recomputed */
+    float pu0 = 0, pv0 = 0, pz = -1.0f;
     for (int px = xs; px < xe; px += 16) {
         const int len = xe - px < 16 ? xe - px : 16;
         uint32_t zi = zfix(zf);
+        /* the depth and colour rows do not fit in the cache: ask for them ahead */
+        __builtin_prefetch(zp + 64);
+        __builtin_prefetch(cp + 64);
+        __builtin_prefetch(cp + 96);
         if (TEX >= 0) {
             if (persp) {
-                float iz0 = 1.0f / zf;
-                float u0 = uz * iz0 * c->ftw + c->bias, v0 = vz * iz0 * c->fth + c->bias;
+                float u0, v0;
+                if (pz == zf) {
+                    u0 = pu0; v0 = pv0;
+                } else {
+                    float iz0 = 1.0f / zf;
+                    u0 = uz * iz0 * c->ftw + c->bias; v0 = vz * iz0 * c->fth + c->bias;
+                }
                 float zz1 = zf + dz * len;
                 float iz1 = 1.0f / zz1;
                 float u1 = (uz + duz * len) * iz1 * c->ftw + c->bias, v1 = (vz + dvz * len) * iz1 * c->fth + c->bias;
+                pu0 = u1; pv0 = v1; pz = zz1;
                 float fu = tc_fold(u0, tw, c->uwrap), fv = tc_fold(v0, th, c->vwrap);
                 u1 += fu - u0;
                 v1 += fv - v0;
@@ -733,7 +773,18 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
             }
             uint32_t um, vm;
             if (axis_mask(U, dU, len, tw, c->uwrap, &um) && axis_mask(V, dV, len, th, c->vwrap, &vm)) {
-                for (int i = 0; i < len; i++) {
+                /* two texels per pass: the second load does not wait for the first */
+                int i = 0;
+                for (; i + 1 < len; i += 2) {
+                    int32_t U1 = (int32_t) ((uint32_t) U + (uint32_t) dU), V1 = (int32_t) ((uint32_t) V + (uint32_t) dV);
+                    uint32_t a0 = ((uint32_t) (V >> 16) & vm) * tw + ((uint32_t) (U >> 16) & um);
+                    uint32_t a1 = ((uint32_t) (V1 >> 16) & vm) * tw + ((uint32_t) (U1 >> 16) & um);
+                    uint32_t t0 = tpx[a0], t1 = tpx[a1];
+                    tex[i] = t0;
+                    tex[i + 1] = t1;
+                    U = (int32_t) ((uint32_t) U1 + (uint32_t) dU); V = (int32_t) ((uint32_t) V1 + (uint32_t) dV);
+                }
+                if (i < len) {
                     tex[i] = tpx[((uint32_t) (V >> 16) & vm) * tw + ((uint32_t) (U >> 16) & um)];
                     U += dU; V += dV;
                 }
@@ -749,14 +800,14 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
         for (int o = 0; o < len; o += 8) {
             const int n = len - o < 8 ? len - o : 8;
             if (n == 8) {
-                nv_group(cp + o, zp + o, zi, &s, X, tex + o, c, OUT, TEX, COL);
+                nv_group(cp + o, zp + o, zi, &s, X, tex + o, c, flatc, OUT, TEX, COL);
             } else {
                 /* last pixels of the span: work on a copy so nothing past xe is written */
                 uint16_t ct[8];
                 uint32_t zt[8];
                 memcpy(ct, cp + o, (size_t) n * 2);
                 memcpy(zt, zp + o, (size_t) n * 4);
-                nv_group(ct, zt, zi, &s, X, tex + o, c, OUT, TEX, COL);
+                nv_group(ct, zt, zi, &s, X, tex + o, c, flatc, OUT, TEX, COL);
                 memcpy(cp + o, ct, (size_t) n * 2);
                 memcpy(zp + o, zt, (size_t) n * 4);
             }
@@ -775,15 +826,15 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     static uint32_t nv_##O##_##T##_##C(const TriCtx *c, int py, int xs, int xe, const float *a, const float *d) { \
         return nv_span(c, py, xs, xe, a, d, O, T - 1, C); \
     }
-#define NV_DEF_T(O, T) NV_DEF(O, T, 0) NV_DEF(O, T, 1) NV_DEF(O, T, 2) NV_DEF(O, T, 3)
+#define NV_DEF_T(O, T) NV_DEF(O, T, 0) NV_DEF(O, T, 1) NV_DEF(O, T, 2) NV_DEF(O, T, 3) NV_DEF(O, T, 4)
 #define NV_DEF_O(O) NV_DEF_T(O, 0) NV_DEF_T(O, 1) NV_DEF_T(O, 2) NV_DEF_T(O, 3) NV_DEF_T(O, 4)
 NV_DEF_O(0)
 NV_DEF_O(1)
 NV_DEF_O(2)
-#define NV_REF_T(O, T) { nv_##O##_##T##_0, nv_##O##_##T##_1, nv_##O##_##T##_2, nv_##O##_##T##_3 }
+#define NV_REF_T(O, T) { nv_##O##_##T##_0, nv_##O##_##T##_1, nv_##O##_##T##_2, nv_##O##_##T##_3, nv_##O##_##T##_4 }
 #define NV_REF_O(O) { NV_REF_T(O, 0), NV_REF_T(O, 1), NV_REF_T(O, 2), NV_REF_T(O, 3), NV_REF_T(O, 4) }
 /* [list kind][texenv + 1 (0 = untextured)][colour mode] */
-static const SpanFn sNvFns[3][5][4] = { NV_REF_O(0), NV_REF_O(1), NV_REF_O(2) };
+static const SpanFn sNvFns[3][5][5] = { NV_REF_O(0), NV_REF_O(1), NV_REF_O(2) };
 static int sUseNeon = 1;
 
 static int wrap_mode(int n, int clamp, int mirror) {
@@ -871,11 +922,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         c.texenv = GFX_TEXENV_REPLACE;
     c.persp = persp;
     SpanFn span = sSpanFns[kind][textured ? 1 : 0][extras ? 2 : (flat ? 0 : 1)];
-    if (sUseNeon && (kind != KIND_TR || (c.bs == GFX_BLENDF_SRCALPHA && c.bd == GFX_BLENDF_INVSRCALPHA))) {
-        /* colour mode: offset only matters when textured, fog only when enabled */
-        const int col = extras ? (c.fog ? 3 : 2) : (flat ? 0 : 1);
-        span = sNvFns[kind][textured ? c.texenv + 1 : 0][col];
-    }
+    int nv_pending = sUseNeon && (kind != KIND_TR || (c.bs == GFX_BLENDF_SRCALPHA && c.bd == GFX_BLENDF_INVSRCALPHA));
 
     /* attribute gradients */
     const float inv = 1.0f / area;
@@ -885,6 +932,37 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         float a1 = at[1][k] - at[0][k], a2 = at[2][k] - at[0][k];
         ddx[k] = (a1 * dy2 - a2 * dy1) * inv;
         ddy[k] = (a2 * dx1 - a1 * dx2) * inv;
+    }
+
+    if (nv_pending) {
+        /* colour mode: offset only matters when textured, fog only when enabled; a gouraud
+           triangle whose colour does not change along x (the sky) is flat on every span */
+        int col = extras ? (c.fog ? 3 : 2) : (flat ? 0 : 1);
+        if (col == 1 && (int32_t) (ddx[A_R] * 65536.0f) == 0 && (int32_t) (ddx[A_G] * 65536.0f) == 0 &&
+            (int32_t) (ddx[A_B] * 65536.0f) == 0 && (int32_t) (ddx[A_A] * 65536.0f) == 0)
+            col = 4;
+        /* every pixel opaque: the translucent blend gives the source colour back and the
+           punch-through test always passes, so both draw like opaque polygons (TR still
+           tested against depth and never writing it) */
+        const int va255 = (v0->color.packed >> 24) == 255 && (v1->color.packed >> 24) == 255 && (v2->color.packed >> 24) == 255;
+        int opaque;
+        if (!textured)
+            opaque = va255;
+        else if (c.texenv == GFX_TEXENV_DECAL)
+            opaque = va255;
+        else if (c.texenv == GFX_TEXENV_MODULATEALPHA)
+            opaque = va255 && tx->opaque;
+        else
+            opaque = tx->opaque;
+        int out = kind;
+        if (opaque && kind == KIND_TR) {
+            out = KIND_OP;
+            c.dtest = 1;
+            c.dwrite = 0;
+        } else if (opaque && kind == KIND_PT) {
+            out = KIND_OP;
+        }
+        span = sNvFns[out][textured ? c.texenv + 1 : 0][col];
     }
 
     /* sort by y for the span walk */
@@ -1256,6 +1334,7 @@ static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsig
     }
     t->w = (uint16_t) width;
     t->h = (uint16_t) height;
+    tex_update_opaque(t);
     stTexUp++;
     mark_dirty();
 }
