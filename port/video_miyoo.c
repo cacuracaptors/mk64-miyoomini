@@ -222,6 +222,13 @@ void port_video_present(void) {
     port_color = cbuf[cur_idx];
 }
 
+int port_video_wait_vsync(void) {
+    uint32_t arg = 0;
+    if (fb_fd < 0)
+        return -1;
+    return ioctl(fb_fd, FBIO_WAITFORVSYNC, &arg) == 0 ? 0 : -1;
+}
+
 void port_video_shutdown(void) {
     /* back to page 0, where OnionOS draws */
     if (fb_fd >= 0 && fb_pages == 2 && fb_var.yoffset != 0) {

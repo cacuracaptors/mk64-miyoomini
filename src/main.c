@@ -1900,6 +1900,9 @@ void game_init_clear_framebuffer(void) {
     clear_framebuffer(0);
 }
 extern int force_30fps;
+#ifdef TARGET_MIYOO
+extern int port_opt_60fps;
+#endif
 void race_logic_loop(void) {
     s16 i;
     u16 rotY;
@@ -1932,8 +1935,19 @@ void race_logic_loop(void) {
             // the fullscreen RANKING screen while gamestate is still RACING — that pseudo-1P
             // must stay capped, or its flashing text (per-frame counters) runs at whatever
             // rate frames arrive (HW 2026-08-19). gPlayerCountSelection1 survives the switch.
+#ifdef TARGET_MIYOO
+            /* -60fps (experimental): the DC's uncapped true-1P mode, one tick per vblank */
+            if (port_opt_60fps && gPlayerCountSelection1 == 1) {
+                force_30fps = 0;
+                gTickSpeed = sNumVBlanks < 1 ? 1 : (sNumVBlanks > 4 ? 4 : sNumVBlanks);
+            } else {
+                force_30fps = 1;
+                gTickSpeed = 2;
+            }
+#else
             force_30fps = 1;//(gPlayerCountSelection1 == 1) ? 0 : 1;
             gTickSpeed = 2;//sNumVBlanks;
+#endif
 
             // 60fps 30Hz gate (gRun30hz, see game_loop_one_iteration): ghost replay is a
             // frame-count-addressed input stream (2x at 60fps would desync).

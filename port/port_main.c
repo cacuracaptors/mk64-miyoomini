@@ -4,6 +4,8 @@
  * Options (command line):
  *   -hires   render at 640x480 instead of 320x240 (slower)
  *   -perf    print timing lines to stderr every 2 s
+ *   -60fps   single-player races run uncapped (up to 60 fps; experimental)
+ *   -timer   game clock from a 60 Hz timer instead of the panel's vsync (comparison)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +19,8 @@
 #include "port_miyoo.h"
 
 int port_opt_perf = 0;
+int port_opt_60fps = 0;
+static int opt_timer = 0;   /* -timer: old free-running 60 Hz clock, for comparison */
 
 double port_now_ms(void) {
     struct timespec ts;
@@ -60,6 +64,10 @@ void port_init(int argc, char **argv) {
             hires = 1;
         else if (!strcmp(argv[i], "-perf"))
             port_opt_perf = 1;
+        else if (!strcmp(argv[i], "-60fps"))
+            port_opt_60fps = 1;
+        else if (!strcmp(argv[i], "-timer"))
+            opt_timer = 1;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);
@@ -79,11 +87,33 @@ void port_init(int argc, char **argv) {
 /* ---- 60 Hz "vblank" ---------------------------------------------------------
  * The game's timing (gVBlankTimer, sNumVBlanks, the 30 fps pacer, the audio
  * frame clock) runs off this tick, as it ran off the real vblank IRQ on the DC.
- * The picture itself is shown at the panel's real vsync by the flip thread. */
+ * It follows the panel's own vsync (FBIO_WAITFORVSYNC, ~16.75 ms on the Miyoo):
+ * a separate 60 Hz timer slowly drifts against the panel, and every few seconds
+ * a frame would then stay on screen for 1 or 3 refreshes instead of 2 (a hitch).
+ * If the panel can't be waited on, a 60 Hz timer is used instead. */
 static void (*s_vbl_fn)(uint32_t, void *);
+
+static int vsync_usable(void) {
+    double t0 = port_now_ms();
+    for (int i = 0; i < 6; i++)
+        if (port_video_wait_vsync() != 0)
+            return 0;
+    double per = (port_now_ms() - t0) / 6.0;
+    printf("vblank: vsync do painel a cada %.2f ms\n", per);
+    return per > 12.0 && per < 25.0;
+}
 
 static void *vbl_proc(void *arg) {
     (void) arg;
+    if (!opt_timer && vsync_usable()) {
+        printf("vblank: seguindo o vsync do painel\n");
+        for (;;) {
+            if (port_video_wait_vsync() != 0)
+                break;
+            s_vbl_fn(0, NULL);
+        }
+    }
+    printf("vblank: relogio de 60 Hz\n");
     const long period = 16666667L; /* ns */
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);

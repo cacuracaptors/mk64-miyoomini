@@ -12,6 +12,7 @@ void port_poll_quit(void);
 void port_quit(int code);
 double port_now_ms(void);
 extern int port_opt_perf;
+extern int port_opt_60fps;   /* -60fps: 1P races not capped at 30 (experimental) */
 
 /* src/main.c (TARGET_MIYOO) */
 void port_audio_pump(void);
@@ -23,6 +24,7 @@ extern float *port_depth;      /* 1/w, larger = nearer, cleared to 0 */
 void port_video_init(int hires);
 void port_video_present(void);
 void port_video_shutdown(void);
+int port_video_wait_vsync(void);   /* 0 = waited for the panel's vsync; -1 = not available */
 uint16_t port_fb_pixel565(int x, int y);   /* last presented frame, N64 320x240 coords */
 
 /* port/input_miyoo.c */

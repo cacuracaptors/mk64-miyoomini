@@ -1089,7 +1089,6 @@ static void raster_frame(void) {
         pthread_mutex_unlock(&sWMutex);
     }
     stPixels += tlPixels;
-    stTris += tlTris;
 }
 
 /* replay tool only: append a captured batch with its recorded state */
@@ -1120,6 +1119,7 @@ static void sw_end_frame(void) {
     count_list(&sOP, &stOpTris, KIND_OP);
     count_list(&sPT, &stPtTris, KIND_PT);
     count_list(&sTR, &stTrTris, KIND_TR);
+    stTris += (uint32_t) ((sOP.nverts + sPT.nverts + sTR.nverts) / 3);
     sort_tr();
     raster_frame();
     stRasterMs += port_now_ms() - t0;
