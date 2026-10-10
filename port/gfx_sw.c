@@ -1073,16 +1073,54 @@ static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, 
         const uint16x8_t U0v = vreinterpretq_u16_s16(u0), U1v = vreinterpretq_u16_s16(u1);
         /* far side of the diagonal (s + t > 1): the opposite corner and 1 - s, 1 - t */
         const uint16x8_t far = vcgtq_s16(vaddq_s16(fs, ft), k128);
-        vst1q_u16(ia, vbslq_u16(far, vaddq_u16(r1, U1v), vaddq_u16(r0, U0v)));
-        vst1q_u16(ib, vbslq_u16(far, vaddq_u16(r1, U0v), vaddq_u16(r0, U1v)));
-        vst1q_u16(ic, vbslq_u16(far, vaddq_u16(r0, U1v), vaddq_u16(r1, U0v)));
         const uint8x8_t s8 = vmovn_u16(vbslq_u16(far, vreinterpretq_u16_s16(vsubq_s16(k128, fs)), vreinterpretq_u16_s16(fs)));
         const uint8x8_t t8 = vmovn_u16(vbslq_u16(far, vreinterpretq_u16_s16(vsubq_s16(k128, ft)), vreinterpretq_u16_s16(ft)));
-        for (int i = 0; i < 8; i++) {
-            const uint32_t a = tpx[ia[i]], b = tpx[ib[i]], cc = tpx[ic[i]];
-            A[i] = a; B[i] = b; C[i] = cc;
+        uint8x8x4_t a, b, cc, r;
+        /* the 8 pixels inside one texel square (the road near the camera is magnified many
+           times): decided on the integer side from the first and last pixel (the coordinates
+           are linear in a run), its 4 corners are loaded once with each channel spread over
+           the lanes, and each lane takes its side of the diagonal: the same texels as below */
+        const int32_t Ul = (int32_t) ((uint32_t) U0 + (uint32_t) dU * 7u), Vl = (int32_t) ((uint32_t) V0 + (uint32_t) dV * 7u);
+        const int iu0 = (int16_t) (U0 >> 16), iv0 = (int16_t) (V0 >> 16);
+        if (iu0 == (int16_t) (Ul >> 16) && iv0 == (int16_t) (Vl >> 16)) {
+            int cu0, cu1, cv0, cv1;
+            if (ur) {
+                cu0 = iu0 & (tw - 1);
+                cu1 = (iu0 + 1) & (tw - 1);
+            } else {
+                cu0 = iu0 < 0 ? 0 : (iu0 > tw - 1 ? tw - 1 : iu0);
+                cu1 = iu0 + 1 < 0 ? 0 : (iu0 + 1 > tw - 1 ? tw - 1 : iu0 + 1);
+            }
+            if (vr) {
+                cv0 = iv0 & (th - 1);
+                cv1 = (iv0 + 1) & (th - 1);
+            } else {
+                cv0 = iv0 < 0 ? 0 : (iv0 > th - 1 ? th - 1 : iv0);
+                cv1 = iv0 + 1 < 0 ? 0 : (iv0 + 1 > th - 1 ? th - 1 : iv0 + 1);
+            }
+            const uint32_t *row0 = tpx + cv0 * tw, *row1 = tpx + cv1 * tw;
+            const uint8x8x4_t t00 = vld4_dup_u8((const uint8_t *) (row0 + cu0)), t10 = vld4_dup_u8((const uint8_t *) (row0 + cu1));
+            const uint8x8x4_t t01 = vld4_dup_u8((const uint8_t *) (row1 + cu0)), t11 = vld4_dup_u8((const uint8_t *) (row1 + cu1));
+            const uint8x8_t f8 = vmovn_u16(far);
+            /* near side: A = (u0,v0), B = (u1,v0), C = (u0,v1); far side: A = (u1,v1), B = (u0,v1), C = (u1,v0) */
+            a.val[0] = vbsl_u8(f8, t11.val[0], t00.val[0]); a.val[1] = vbsl_u8(f8, t11.val[1], t00.val[1]);
+            a.val[2] = vbsl_u8(f8, t11.val[2], t00.val[2]); a.val[3] = vbsl_u8(f8, t11.val[3], t00.val[3]);
+            b.val[0] = vbsl_u8(f8, t01.val[0], t10.val[0]); b.val[1] = vbsl_u8(f8, t01.val[1], t10.val[1]);
+            b.val[2] = vbsl_u8(f8, t01.val[2], t10.val[2]); b.val[3] = vbsl_u8(f8, t01.val[3], t10.val[3]);
+            cc.val[0] = vbsl_u8(f8, t10.val[0], t01.val[0]); cc.val[1] = vbsl_u8(f8, t10.val[1], t01.val[1]);
+            cc.val[2] = vbsl_u8(f8, t10.val[2], t01.val[2]); cc.val[3] = vbsl_u8(f8, t10.val[3], t01.val[3]);
+        } else {
+            vst1q_u16(ia, vbslq_u16(far, vaddq_u16(r1, U1v), vaddq_u16(r0, U0v)));
+            vst1q_u16(ib, vbslq_u16(far, vaddq_u16(r1, U0v), vaddq_u16(r0, U1v)));
+            vst1q_u16(ic, vbslq_u16(far, vaddq_u16(r0, U1v), vaddq_u16(r1, U0v)));
+            for (int i = 0; i < 8; i++) {
+                const uint32_t ta = tpx[ia[i]], tb = tpx[ib[i]], tc = tpx[ic[i]];
+                A[i] = ta; B[i] = tb; C[i] = tc;
+            }
+            a = vld4_u8((const uint8_t *) A);
+            b = vld4_u8((const uint8_t *) B);
+            cc = vld4_u8((const uint8_t *) C);
         }
-        uint8x8x4_t a = vld4_u8((const uint8_t *) A), b = vld4_u8((const uint8_t *) B), cc = vld4_u8((const uint8_t *) C), r;
         const uint8x8_t w0 = vsub_u8(vsub_u8(vdup_n_u8(128), s8), t8);
         NV_BLEND3(r, a, b, cc, w0, s8, t8);
         vst4_u8((uint8_t *) (out + o), r);
