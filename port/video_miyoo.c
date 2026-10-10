@@ -23,6 +23,12 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <linux/fb.h>
+#include <dlfcn.h>
+#if defined(TARGET_MIYOO) && __has_include(<mi_gfx.h>)
+#include <mi_sys.h>
+#include <mi_gfx.h>
+#define HAVE_MI_GFX 1
+#endif
 
 #include "port_miyoo.h"
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -47,6 +53,7 @@ static struct fb_var_screeninfo fb_var;
 static uint8_t *fb_mem;
 static size_t fb_len;
 static int fb_pages;         /* 2 = page flipping, 1 = draw straight into the shown page */
+static unsigned long fb_phys;  /* physical address of the screen pages (for the 2D engine) */
 static int fb_page;
 
 static pthread_t flip_thread;
@@ -136,6 +143,192 @@ static void convert_frame(const uint16_t *src, int w, int h, uint32_t *dst) {
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* The SigmaStar 2D engine (MI_GFX) does the RGB565 -> XRGB8888 conversion, the 180    */
+/* degree turn and (at 320x240) the 2x scale into the screen page by itself, so the    */
+/* CPU does not spend ~3 ms per frame on it. The colour buffers are then physically     */
+/* contiguous (MMA) memory, mapped cached: drawing into them is as fast as before.     */
+/* The libraries are opened at run time; any failure, or a wrong result in the test    */
+/* blit at startup, keeps the NEON copy (convert_frame). -semgfx turns it off.         */
+/* ------------------------------------------------------------------------- */
+int port_opt_nogfx = 0;
+static int hw_ok;
+#ifdef HAVE_MI_GFX
+static struct {
+    MI_S32 (*SysInit)(void);
+    MI_S32 (*MmaAlloc)(MI_U8 *, MI_U32, MI_PHY *);
+    MI_S32 (*MmaFree)(MI_PHY);
+    MI_S32 (*Mmap)(MI_U64, MI_U32, void **, MI_BOOL);
+    MI_S32 (*Munmap)(void *, MI_U32);
+    MI_S32 (*Flush)(void *, MI_U32);
+    MI_S32 (*GfxOpen)(void);
+    MI_S32 (*GfxClose)(void);
+    MI_S32 (*Blit)(MI_GFX_Surface_t *, MI_GFX_Rect_t *, MI_GFX_Surface_t *, MI_GFX_Rect_t *, MI_GFX_Opt_t *, MI_U16 *);
+    MI_S32 (*Wait)(MI_BOOL, MI_U16);
+} mi;
+static MI_PHY hw_phys[3];
+static size_t hw_size;
+static int hw_rotate = E_MI_GFX_ROTATE_180, hw_mirror = E_MI_GFX_MIRROR_NONE;
+
+static void *open_lib(const char *name) {
+    static const char *dirs[] = { "", "/customer/lib/", "/config/lib/", "/lib/", "/usr/lib/" };
+    char path[96];
+    for (unsigned i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+        snprintf(path, sizeof path, "%s%s", dirs[i], name);
+        void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        if (h)
+            return h;
+    }
+    return NULL;
+}
+
+static int hw_blit(MI_PHY src, int sw, int sh, MI_PHY dst, int dw, int dh, int rotate, int mirror) {
+    MI_GFX_Surface_t s = { src, E_MI_GFX_FMT_RGB565, (MI_U32) sw, (MI_U32) sh, (MI_U32) sw * 2 };
+    MI_GFX_Surface_t d = { dst, E_MI_GFX_FMT_ARGB8888, (MI_U32) dw, (MI_U32) dh, (MI_U32) dw * 4 };
+    MI_GFX_Rect_t sr = { 0, 0, (MI_U32) sw, (MI_U32) sh }, dr = { 0, 0, (MI_U32) dw, (MI_U32) dh };
+    MI_GFX_Opt_t opt;
+    memset(&opt, 0, sizeof opt);
+    opt.stClipRect = dr;
+    opt.eSrcDfbBldOp = E_MI_GFX_DFB_BLD_ONE;
+    opt.eDstDfbBldOp = E_MI_GFX_DFB_BLD_ZERO;
+    opt.eMirror = (MI_GFX_Mirror_e) mirror;
+    opt.eRotate = (MI_GFX_Rotate_e) rotate;
+    opt.eDFBBlendFlag = E_MI_GFX_DFB_BLEND_NOFX;
+    MI_U16 fence = 0;
+    if (mi.Blit(&s, &sr, &d, &dr, &opt, &fence) != 0)
+        return -1;
+    mi.Wait(TRUE, fence);
+    return 0;
+}
+
+/* test blit (scaled like the real one) into a scratch buffer: right orientation and
+   colours (within the rounding of the expansion), or no hardware blit */
+static int hw_selftest(int w, int h) {
+    const int sw = 16, sh = 8, dw = w * 2 == PANEL_W ? 32 : 16, dh = w * 2 == PANEL_W ? 16 : 8;
+    MI_PHY ps = 0, pd = 0;
+    void *vs = NULL, *vd = NULL;
+    int ok = 0;
+    if (mi.MmaAlloc(NULL, 4096, &ps) || mi.MmaAlloc(NULL, 4096, &pd))
+        goto out;
+    if (mi.Mmap(ps, 4096, &vs, TRUE) || mi.Mmap(pd, 4096, &vd, TRUE))
+        goto out;
+    uint16_t *src = vs;
+    for (int i = 0; i < sw * sh; i++)
+        src[i] = (uint16_t) (((i * 7) & 31) << 11 | ((i * 13) & 63) << 5 | ((i * 3 + 5) & 31));
+    const int tries[2][2] = { { E_MI_GFX_ROTATE_180, E_MI_GFX_MIRROR_NONE }, { E_MI_GFX_ROTATE_0, E_MI_GFX_MIRROR_BOTH } };
+    for (int t = 0; t < 2 && !ok; t++) {
+        memset(vd, 0, 4096);
+        mi.Flush(vs, 4096);
+        mi.Flush(vd, 4096);
+        if (hw_blit(ps, sw, sh, pd, dw, dh, tries[t][0], tries[t][1]))
+            continue;
+        mi.Flush(vd, 4096);
+        const uint32_t *dst = vd;
+        int bad = 0;
+        for (int y = 0; y < dh && !bad; y++)
+            for (int x = 0; x < dw; x++) {
+                /* screen pixel (x, y) shows source pixel (sw-1-x/sx, sh-1-y/sy) */
+                int sx = sw - 1 - x * sw / dw, sy = sh - 1 - y * sh / dh;
+                uint32_t want = rgb565_to_x8888(src[sy * sw + sx]), got = dst[y * dw + x];
+                for (int k = 0; k < 24; k += 8) {
+                    int a = (int) ((want >> k) & 255), b = (int) ((got >> k) & 255);
+                    if (a - b > 8 || b - a > 8)
+                        bad = 1;
+                }
+            }
+        if (!bad) {
+            hw_rotate = tries[t][0];
+            hw_mirror = tries[t][1];
+            ok = 1;
+        }
+    }
+out:
+    if (vs) mi.Munmap(vs, 4096);
+    if (vd) mi.Munmap(vd, 4096);
+    if (ps) mi.MmaFree(ps);
+    if (pd) mi.MmaFree(pd);
+    return ok;
+}
+#endif
+
+/* colour buffers in MMA memory when the 2D engine works; 0 = keep the malloc ones */
+static int hw_init(size_t bytes) {
+#ifdef HAVE_MI_GFX
+    if (port_opt_nogfx || !fb_phys || fb_pages != 2)
+        return 0;
+    void *hs = open_lib("libmi_sys.so"), *hg = open_lib("libmi_gfx.so");
+    if (!hs || !hg) {
+        printf("video: sem libmi_sys/libmi_gfx, copia pela CPU\n");
+        return 0;
+    }
+    mi.SysInit = dlsym(hs, "MI_SYS_Init");
+    mi.MmaAlloc = dlsym(hs, "MI_SYS_MMA_Alloc");
+    mi.MmaFree = dlsym(hs, "MI_SYS_MMA_Free");
+    mi.Mmap = dlsym(hs, "MI_SYS_Mmap");
+    mi.Munmap = dlsym(hs, "MI_SYS_Munmap");
+    mi.Flush = dlsym(hs, "MI_SYS_FlushInvCache");
+    mi.GfxOpen = dlsym(hg, "MI_GFX_Open");
+    mi.GfxClose = dlsym(hg, "MI_GFX_Close");
+    mi.Blit = dlsym(hg, "MI_GFX_BitBlit");
+    mi.Wait = dlsym(hg, "MI_GFX_WaitAllDone");
+    if (!mi.SysInit || !mi.MmaAlloc || !mi.MmaFree || !mi.Mmap || !mi.Munmap || !mi.Flush || !mi.GfxOpen ||
+        !mi.GfxClose || !mi.Blit || !mi.Wait) {
+        printf("video: MI_GFX incompleto, copia pela CPU\n");
+        return 0;
+    }
+    if (mi.SysInit() != 0 || mi.GfxOpen() != 0) {
+        printf("video: MI_GFX nao abriu, copia pela CPU\n");
+        return 0;
+    }
+    if (!hw_selftest(port_render_w, port_render_h)) {
+        printf("video: teste do MI_GFX falhou, copia pela CPU\n");
+        mi.GfxClose();
+        return 0;
+    }
+    hw_size = (bytes + 4095) & ~(size_t) 4095;
+    for (int i = 0; i < 3; i++) {
+        void *v = NULL;
+        if (mi.MmaAlloc(NULL, (MI_U32) hw_size, &hw_phys[i]) || mi.Mmap(hw_phys[i], (MI_U32) hw_size, &v, TRUE)) {
+            printf("video: sem memoria MMA, copia pela CPU\n");
+            for (int k = 0; k <= i; k++)
+                if (hw_phys[k]) mi.MmaFree(hw_phys[k]);
+            mi.GfxClose();
+            return 0;
+        }
+        memset(v, 0, hw_size);
+        free(cbuf[i]);
+        cbuf[i] = v;
+    }
+    hw_ok = 1;
+    printf("video: copia para a tela pelo MI_GFX (%s)\n", hw_rotate == E_MI_GFX_ROTATE_180 ? "giro 180" : "espelho");
+    return 1;
+#else
+    (void) bytes;
+    return 0;
+#endif
+}
+
+/* frame index -> show it in screen page `back` with the 2D engine; 0 = done */
+static int hw_present(const uint16_t *src, int back) {
+#ifdef HAVE_MI_GFX
+    int idx = src == cbuf[0] ? 0 : (src == cbuf[1] ? 1 : (src == cbuf[2] ? 2 : -1));
+    if (!hw_ok || idx < 0)
+        return -1;
+    const size_t bytes = (size_t) port_render_w * port_render_h * 2;
+    mi.Flush((void *) src, (MI_U32) bytes);   /* the drawing is in the CPU cache */
+    MI_PHY dst = (MI_PHY) fb_phys + (MI_PHY) back * PANEL_W * PANEL_H * 4;
+    if (hw_blit(hw_phys[idx], port_render_w, port_render_h, dst, PANEL_W, PANEL_H, hw_rotate, hw_mirror)) {
+        printf("video: MI_GFX falhou no jogo, voltando para a copia pela CPU\n");
+        hw_ok = 0;
+        return -1;
+    }
+    return 0;
+#else
+    (void) src; (void) back;
+    return -1;
+#endif
+}
+
 static void pin_cpu(int cpu) {
     unsigned long mask = 1UL << cpu;
     syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask);
@@ -179,7 +372,8 @@ static void *flip_proc(void *arg) {
         if (fb_pages == 2) {
             if (job) {
                 int back = fb_page ^ 1;
-                convert_frame(src, port_render_w, port_render_h, (uint32_t *) (fb_mem + (size_t) back * PANEL_W * PANEL_H * 4));
+                if (hw_present(src, back))
+                    convert_frame(src, port_render_w, port_render_h, (uint32_t *) (fb_mem + (size_t) back * PANEL_W * PANEL_H * 4));
                 release_snap();   /* copied: the game may queue the next frame during the vsync wait */
                 double t1 = port_now_ms();
                 t_conv += t1 - t0;
@@ -271,6 +465,7 @@ static void fb_init(void) {
         return;
     }
     fb_len = fix.smem_len;
+    fb_phys = fix.smem_start;
     fb_mem = mmap(NULL, fb_len, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
     if (fb_mem == MAP_FAILED) {
         printf("video: mmap falhou\n");
@@ -312,6 +507,8 @@ void port_video_init(int hires) {
     printf("video: renderizando em %dx%d\n", port_render_w, port_render_h);
 
     fb_init();
+    if (hw_init(n * sizeof(uint16_t)))
+        port_color = cbuf[0];
     if (pthread_create(&flip_thread, NULL, flip_proc, NULL) == 0) {
         pthread_detach(flip_thread);
         flip_started = 1;
@@ -363,6 +560,17 @@ void port_video_membench(void) {
 }
 
 void port_video_shutdown(void) {
+#ifdef HAVE_MI_GFX
+    /* MMA memory is the kernel's: give it back */
+    if (hw_ok) {
+        hw_ok = 0;
+        mi.Wait(TRUE, 0);
+        /* the mappings stay until the process ends (another thread may still look at them) */
+        for (int i = 0; i < 3; i++)
+            mi.MmaFree(hw_phys[i]);
+        mi.GfxClose();
+    }
+#endif
     /* back to page 0, where OnionOS draws */
     if (fb_fd >= 0 && fb_pages == 2 && fb_var.yoffset != 0) {
         fb_var.yoffset = 0;

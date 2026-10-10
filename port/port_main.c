@@ -7,6 +7,7 @@
  *   -60fps   single-player races run uncapped (up to 60 fps; experimental)
  *   -timer   game clock from a 60 Hz timer instead of the panel's vsync (comparison)
  *   -filtro  N64-style 3-point texture filter on magnified 3D opaque surfaces (the road)
+ *   -semgfx  copy frames to the screen with the CPU instead of the 2D engine (MI_GFX)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +73,8 @@ void port_init(int argc, char **argv) {
             opt_timer = 1;
         else if (!strcmp(argv[i], "-filtro"))
             port_opt_filter = 1;
+        else if (!strcmp(argv[i], "-semgfx"))
+            port_opt_nogfx = 1;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);
