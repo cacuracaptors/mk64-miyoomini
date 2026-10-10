@@ -100,6 +100,13 @@ static void pin_cpu(int cpu) {
 static void (*vsync_cb)(void);
 static void (*vsync_fallback)(void);
 
+static void release_snap(void) {
+    pthread_mutex_lock(&flip_mutex);
+    snap_free = 1;
+    pthread_cond_broadcast(&flip_cond);
+    pthread_mutex_unlock(&flip_mutex);
+}
+
 static void *flip_proc(void *arg) {
     (void) arg;
     double t_conv = 0, t_show = 0, last_print = 0, last_tick = 0, tmin = 1e9, tmax = 0;
@@ -122,6 +129,7 @@ static void *flip_proc(void *arg) {
                 convert_frame(src, port_render_w, port_render_h, outbuf);
                 int back = fb_page ^ 1;
                 memcpy(fb_mem + (size_t) back * PANEL_W * PANEL_H * 4, outbuf, (size_t) PANEL_W * PANEL_H * 4);
+                release_snap();   /* copied: the game may queue the next frame during the vsync wait */
                 double t1 = port_now_ms();
                 t_conv += t1 - t0;
                 fb_var.yoffset = back * PANEL_H;
@@ -134,16 +142,13 @@ static void *flip_proc(void *arg) {
             }
         } else if (fb_pages == 1 && job) {
             convert_frame(src, port_render_w, port_render_h, (uint32_t *) fb_mem);
+            release_snap();
             t_conv += port_now_ms() - t0;
+        } else if (job) {
+            release_snap();   /* no screen: nothing to show */
         }
-
-        if (job) {
-            pthread_mutex_lock(&flip_mutex);
-            snap_free = 1;
-            pthread_cond_broadcast(&flip_cond);
-            pthread_mutex_unlock(&flip_mutex);
+        if (job)
             frames++;
-        }
 
         if (vsync_cb && fb_pages == 2) {
             double now = port_now_ms();
