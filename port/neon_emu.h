@@ -63,6 +63,26 @@ NE_STATIC int32x4_t vmlaq_n_s32(int32x4_t acc, int32x4_t a, int32_t b) { for (in
 NE_STATIC uint32x4_t vcgtq_s32(int32x4_t a, int32x4_t b) { uint32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] > b.v[i] ? 0xFFFFFFFFu : 0; return r; }
 NE_STATIC int32x4_t vbslq_s32(uint32x4_t m, int32x4_t a, int32x4_t b) { int32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = (int32_t) ((m.v[i] & (uint32_t) a.v[i]) | (~m.v[i] & (uint32_t) b.v[i])); return r; }
 NE_STATIC void vst1q_s32(int32_t *p, int32x4_t a) { memcpy(p, a.v, 16); }
+typedef struct { float v[4]; } float32x4_t;
+typedef struct { float v[2]; } float32x2_t;
+typedef struct { int32_t v[2]; } int32x2_t;
+typedef struct { uint32_t v[2]; } uint32x2_t;
+NE_STATIC float32x4_t vdupq_n_f32(float x) { float32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = x; return r; }
+/* VFP/NEON conversion: round towards zero, saturating, NaN -> 0 */
+NE_STATIC uint32_t ne_f2u(float f) { if (!(f > 0.0f)) return 0; if (f >= 4294967296.0f) return 0xFFFFFFFFu; return (uint32_t) f; }
+NE_STATIC int32_t ne_f2s(float f) { if (f != f) return 0; if (f >= 2147483648.0f) return 0x7FFFFFFF; if (f < -2147483648.0f) return (int32_t) 0x80000000u; return (int32_t) f; }
+NE_STATIC uint32x4_t vcvtq_u32_f32(float32x4_t a) { uint32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = ne_f2u(a.v[i]); return r; }
+NE_STATIC uint32x4_t vminq_u32(uint32x4_t a, uint32x4_t b) { for (int i = 0; i < 4; i++) a.v[i] = a.v[i] < b.v[i] ? a.v[i] : b.v[i]; return a; }
+NE_STATIC float32x2_t vdup_n_f32(float x) { float32x2_t r; r.v[0] = r.v[1] = x; return r; }
+NE_STATIC float32x2_t vset_lane_f32(float x, float32x2_t a, int n) { a.v[n] = x; return a; }
+NE_STATIC int32x2_t vcvt_s32_f32(float32x2_t a) { int32x2_t r; for (int i = 0; i < 2; i++) r.v[i] = ne_f2s(a.v[i]); return r; }
+NE_STATIC float32x2_t vcvt_f32_s32(int32x2_t a) { float32x2_t r; for (int i = 0; i < 2; i++) r.v[i] = (float) a.v[i]; return r; }
+NE_STATIC uint32x2_t vcgt_f32(float32x2_t a, float32x2_t b) { uint32x2_t r; for (int i = 0; i < 2; i++) r.v[i] = a.v[i] > b.v[i] ? 0xFFFFFFFFu : 0; return r; }
+NE_STATIC int32x2_t vsub_s32(int32x2_t a, int32x2_t b) { for (int i = 0; i < 2; i++) a.v[i] = (int32_t) ((uint32_t) a.v[i] - (uint32_t) b.v[i]); return a; }
+NE_STATIC int32x2_t vreinterpret_s32_u32(uint32x2_t a) { int32x2_t r; memcpy(r.v, a.v, 8); return r; }
+NE_STATIC int32x2_t vpmin_s32(int32x2_t a, int32x2_t b) { int32x2_t r; r.v[0] = a.v[0] < a.v[1] ? a.v[0] : a.v[1]; r.v[1] = b.v[0] < b.v[1] ? b.v[0] : b.v[1]; return r; }
+NE_STATIC int32x2_t vpmax_s32(int32x2_t a, int32x2_t b) { int32x2_t r; r.v[0] = a.v[0] > a.v[1] ? a.v[0] : a.v[1]; r.v[1] = b.v[0] > b.v[1] ? b.v[0] : b.v[1]; return r; }
+NE_STATIC int32_t vget_lane_s32(int32x2_t a, int n) { return a.v[n]; }
 NE_STATIC uint16x8_t vorrq_u16(uint16x8_t a, uint16x8_t b) { for (int i = 0; i < 8; i++) a.v[i] |= b.v[i]; return a; }
 NE_STATIC uint32x4_t vcgeq_u32(uint32x4_t a, uint32x4_t b) { uint32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] >= b.v[i] ? 0xFFFFFFFFu : 0; return r; }
 NE_STATIC uint32x4_t vbslq_u32(uint32x4_t m, uint32x4_t a, uint32x4_t b) { uint32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = (m.v[i] & a.v[i]) | (~m.v[i] & b.v[i]); return r; }

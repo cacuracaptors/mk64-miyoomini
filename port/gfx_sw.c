@@ -232,6 +232,18 @@ static inline int32_t rnd_i(float f) {
 #endif
 }
 
+/* ceil_i of two values, returned as (smaller, larger), with one move from NEON to the
+   integer registers instead of two float compares */
+static inline void ceil2_minmax(float a, float b, int *lo, int *hi) {
+    const float32x2_t x = vset_lane_f32(b, vdup_n_f32(a), 1);
+    const int32x2_t t = vcvt_s32_f32(x);
+    const uint32x2_t up = vcgt_f32(x, vcvt_f32_s32(t));
+    const int32x2_t c = vsub_s32(t, vreinterpret_s32_u32(up));
+    const int32x2_t mm = vpmax_s32(vpmin_s32(c, c), c);   /* lane 0 = min, lane 1 = max */
+    *lo = vget_lane_s32(mm, 0);
+    *hi = vget_lane_s32(mm, 1);
+}
+
 /* (int) ceilf(f) for |f| < 2^24, without the library call */
 static inline int ceil_i(float f) {
     int i = (int) f;
@@ -624,6 +636,7 @@ typedef struct {
     int32_t dX[8], dX8[8];    /* 1 and 8 steps of each channel */
     int32_t dzi;              /* depth step */
     uint32_t dz8;             /* 8 depth steps */
+    uint32x4_t dz8v;          /* the same in all lanes */
 } NvSteps;
 
 static const int kNvAttr[8] = { A_R, A_G, A_B, A_A, A_OR, A_OG, A_OB, A_F };
@@ -646,6 +659,7 @@ static void nv_prepare(NvSteps *s, const float *ddx, int col) {
     const int32_t dzi = rnd_i(ddx[A_Z] * ZSCALE);
     s->dzi = dzi;
     s->dz8 = (uint32_t) dzi * 8;
+    s->dz8v = vdupq_n_u32(s->dz8);
     uint32_t zl[4], zh[4];
     for (int i = 0; i < 4; i++) {
         zl[i] = (uint32_t) i * (uint32_t) dzi;
@@ -663,10 +677,10 @@ typedef struct {
     uint16x8_t m;
 } NvDepth;
 
-static inline __attribute__((always_inline)) void nv_depth(NvDepth *D, const uint32_t *zp, uint32_t zi, const NvSteps *s,
+static inline __attribute__((always_inline)) void nv_depth(NvDepth *D, const uint32_t *zp, uint32x4_t zv, const NvSteps *s,
                                                            const TriCtx *c, int n, const int OUT) {
-    D->z0 = vaddq_u32(vdupq_n_u32(zi), s->zo0);
-    D->z1 = vaddq_u32(vdupq_n_u32(zi), s->zo1);
+    D->z0 = vaddq_u32(zv, s->zo0);
+    D->z1 = vaddq_u32(zv, s->zo1);
     D->d0 = vld1q_u32(zp);
     D->d1 = vld1q_u32(zp + 4);
     if (OUT == KIND_TR || c->dtest) {
@@ -782,7 +796,7 @@ static inline __attribute__((always_inline)) int nv_none(uint16x8_t m) {
 }
 
 /* one group of 8 pixels; cp / zp point at 8 writable pixels */
-static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_t *zp, uint32_t zi, const NvSteps *s,
+static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_t *zp, uint32x4_t zi, const NvSteps *s,
                                                            const int32_t *X, const uint32_t *tex, const TriCtx *c,
                                                            const uint8x8_t *flatc, int n, const int OUT, const int TEX, const int COL) {
     NvDepth D;
@@ -796,7 +810,7 @@ static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_
 }
 
 /* two groups of 8 (16 pixels), written side by side */
-static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32_t *zp, uint32_t zi, const NvSteps *s,
+static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32_t *zp, uint32x4_t zi, const NvSteps *s,
                                                             const int32_t *X, const uint32_t *tex, const TriCtx *c,
                                                             const uint8x8_t *flatc, int n, const int OUT, const int TEX, const int COL) {
     /* n = pixels to draw of these 16 (9..16) */
@@ -805,7 +819,7 @@ static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32
        same values back), one half after the other to keep the registers free */
     nv_depth(&A, zp, zi, s, c, 8, OUT);
     nv_zstore(zp, &A, c, OUT);
-    nv_depth(&B, zp + 8, zi + s->dz8, s, c, n - 8, OUT);
+    nv_depth(&B, zp + 8, vaddq_u32(zi, s->dz8v), s, c, n - 8, OUT);
     nv_zstore(zp + 8, &B, c, OUT);
     if (nv_none(vorrq_u16(A.m, B.m)))
         return;   /* all 16 hidden */
@@ -981,7 +995,9 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     int prun_end = xs;
     for (int px = xs; px < xe; px += 16) {
         const int len = xe - px < 16 ? xe - px : 16;
-        uint32_t zi = zfix(zf);
+        /* depth of the run's first pixel, made and kept in NEON (zfix's result without a
+           move to the integer registers) */
+        const uint32x4_t zi = vminq_u32(vcvtq_u32_f32(vdupq_n_f32(zf * ZSCALE)), vdupq_n_u32(0xFFFFFFF0u));
         /* the depth and colour rows do not fit in the cache: ask for them ahead */
         __builtin_prefetch(zp + 64);
         __builtin_prefetch(cp + 64);
@@ -1058,7 +1074,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 int32_t XO[8];
                 for (int k = 0; k < nch; k++)
                     XO[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX8[k] * (uint32_t) (o >> 3));
-                const uint32_t zo = zi + s->dz8 * (uint32_t) (o >> 3);
+                const uint32x4_t zo = o ? vaddq_u32(zi, s->dz8v) : zi;
                 if (n == 8) {
                     nv_group(cp + o, zp + o, zo, s, XO, tex + o, c, flatc, 8, OUT, TEX, COL);
                 } else {
@@ -1269,22 +1285,26 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     uint32_t pixels = 0;
     /* attributes the span reads: depth and texture, + colour (gouraud), + offset and fog */
     const int natt = extras ? NATTR : (flat ? A_R : A_OR);
+    /* first row whose centre is not above vertex b (fy >= yb), found once so the row loop
+       compares integers: on the Cortex-A7 every float compare waits for the VFP to drain */
+    int rb = ceil_i(yb - 0.5f);
+    while ((float) (rb - 1) + 0.5f >= yb)
+        rb--;
+    while ((float) rb + 0.5f < yb)
+        rb++;
 
     for (int py = ystart; py < yend; py++) {
         if (BAND_SKIP(py))
             continue;
         const float fy = (float) py + 0.5f;
         float xl = xa + (fy - ya) * slope_ac, xr;
-        if (fy < yb)
+        if (py < rb)
             xr = xa + (fy - ya) * slope_ab;
         else
             xr = xb + (fy - yb) * slope_bc;
-        if (xl > xr) {
-            float tmp = xl;
-            xl = xr;
-            xr = tmp;
-        }
-        int xs = ceil_i(xl - 0.5f), xe = ceil_i(xr - 0.5f);
+        /* ceil of both ends at once in NEON (same result as ceil_i); the smaller is the start */
+        int xs, xe;
+        ceil2_minmax(xl - 0.5f, xr - 0.5f, &xs, &xe);
         if (xs < 0) xs = 0;
         if (xe > W) xe = W;
         if (xs >= xe)
