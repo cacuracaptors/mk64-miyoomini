@@ -285,11 +285,11 @@ void create_thread(UNUSED OSThread* thread, UNUSED OSId id, void (*entry)(void*)
 #endif
 
 // mio0encode
-s32 func_80040174(UNUSED void*, UNUSED s32, UNUSED s32) {
+s32 func_80040174(UNUSED void* arg0, UNUSED s32 arg1, UNUSED s32 arg2) {
 	return -1;
 }
 
-s32 mio0encode(UNUSED s32, UNUSED s32, UNUSED s32) {
+s32 mio0encode(UNUSED s32 arg0, UNUSED s32 arg1, UNUSED s32 arg2) {
 	return -1;
 }
 

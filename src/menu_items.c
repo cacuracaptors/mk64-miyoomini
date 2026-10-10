@@ -5496,7 +5496,7 @@ void add_menu_item(s32 type, s32 column, s32 row, s8 priority) {
             break;
         case MAIN_MENU_BACKGROUND:
         case CHARACTER_SELECT_BACKGROUND:
-        case COURSE_SELECT_BACKGROUND:
+        case COURSE_SELECT_BACKGROUND:; /* ';': older GCCs reject a declaration right after a label */
             u16 cur_r, cur_g, cur_b;
             cur_r = D_800E74E8[type - MAIN_MENU_BACKGROUND].red;
             cur_g = D_800E74E8[type - MAIN_MENU_BACKGROUND].green;
