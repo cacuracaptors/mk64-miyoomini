@@ -6,6 +6,7 @@
  *   -perf    print timing lines to stderr every 2 s
  *   -60fps   single-player races run uncapped (up to 60 fps; experimental)
  *   -timer   game clock from a 60 Hz timer instead of the panel's vsync (comparison)
+ *   -filtro  N64-style 3-point texture filter on magnified 3D opaque surfaces (the road)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@
 
 int port_opt_perf = 0;
 int port_opt_60fps = 0;
+int port_opt_filter = 0;
 static int opt_timer = 0;   /* -timer: old free-running 60 Hz clock, for comparison */
 
 double port_now_ms(void) {
@@ -68,6 +70,8 @@ void port_init(int argc, char **argv) {
             port_opt_60fps = 1;
         else if (!strcmp(argv[i], "-timer"))
             opt_timer = 1;
+        else if (!strcmp(argv[i], "-filtro"))
+            port_opt_filter = 1;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);

@@ -255,6 +255,7 @@ typedef struct {
     int fr, fg, fb, bs, bd;
     int r, g, b, a;          /* flat colour (GOUR == 0) */
     const void *nvs;         /* NvSteps of the NEON spans (per triangle) */
+    int filt;                /* 3-point filter where the texture is magnified (-filtro) */
 } TriCtx;
 
 static uint8_t sExp5[32], sExp6[64];   /* 565 -> 8 bit, same rounding as before (v*255/max) */
@@ -786,6 +787,59 @@ static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32
     nv_out(cp + 8, zp + 8, &B, rb, gb, bb, ab, c, OUT);
 }
 
+/* N64-style 3-point texture filter for a run of up to 16 pixels (-filtro). Each pixel
+   blends the texel at its corner with its two neighbours along s and t, on the side of
+   the texel square's diagonal it falls on, as the N64 RDP does. Weights in 1/128.
+   Used only where the texture is magnified (less than one texel per pixel step), with
+   repeat (power-of-two) or clamp wrapping on both axes. */
+static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, int32_t dV, const TriCtx *c) {
+    uint32_t A[16] __attribute__((aligned(16))), B[16] __attribute__((aligned(16))), C[16] __attribute__((aligned(16)));
+    uint8_t ws[16] __attribute__((aligned(8))), wt[16] __attribute__((aligned(8)));
+    const uint32_t *tpx = c->tpx;
+    const int tw = c->tw, th = c->th;
+    const int ur = c->uwrap == WR_REPEAT2, vr = c->vwrap == WR_REPEAT2;
+    U -= 32768 + 256;   /* texel centres (and without the 1/256 nudge of the point sampler) */
+    V -= 32768 + 256;
+    for (int i = 0; i < len; i++) {
+        int iu = U >> 16, iv = V >> 16;
+        int fs = (U >> 9) & 127, ft = (V >> 9) & 127;
+        int u0, u1, v0, v1;
+        if (ur) {
+            u0 = iu & (tw - 1);
+            u1 = (iu + 1) & (tw - 1);
+        } else {
+            u0 = iu < 0 ? 0 : (iu >= tw ? tw - 1 : iu);
+            u1 = iu + 1 < 0 ? 0 : (iu + 1 >= tw ? tw - 1 : iu + 1);
+        }
+        if (vr) {
+            v0 = iv & (th - 1);
+            v1 = (iv + 1) & (th - 1);
+        } else {
+            v0 = iv < 0 ? 0 : (iv >= th ? th - 1 : iv);
+            v1 = iv + 1 < 0 ? 0 : (iv + 1 >= th ? th - 1 : iv + 1);
+        }
+        const uint32_t *r0 = tpx + v0 * tw, *r1 = tpx + v1 * tw;
+        if (fs + ft <= 128) {
+            A[i] = r0[u0]; B[i] = r0[u1]; C[i] = r1[u0];
+            ws[i] = (uint8_t) fs; wt[i] = (uint8_t) ft;
+        } else {
+            A[i] = r1[u1]; B[i] = r1[u0]; C[i] = r0[u1];
+            ws[i] = (uint8_t) (128 - fs); wt[i] = (uint8_t) (128 - ft);
+        }
+        U = (int32_t) ((uint32_t) U + (uint32_t) dU);
+        V = (int32_t) ((uint32_t) V + (uint32_t) dV);
+    }
+    for (int o = 0; o < len; o += 8) {
+        uint8x8x4_t a = vld4_u8((const uint8_t *) (A + o)), b = vld4_u8((const uint8_t *) (B + o)),
+                    cc = vld4_u8((const uint8_t *) (C + o)), r;
+        uint8x8_t s8 = vld1_u8(ws + o), t8 = vld1_u8(wt + o);
+        uint8x8_t w0 = vsub_u8(vsub_u8(vdup_n_u8(128), s8), t8);
+        for (int k = 0; k < 4; k++)
+            r.val[k] = vrshrn_n_u16(vmlal_u8(vmlal_u8(vmull_u8(a.val[k], w0), b.val[k], s8), cc.val[k], t8), 7);
+        vst4_u8((uint8_t *) (out + o), r);
+    }
+}
+
 static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, int py, int xs, int xe, const float *a,
                                                                const float *ddx, const int OUT, const int TEX, const int COL) {
     const int W = port_render_w;
@@ -870,7 +924,11 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 prun_end = px + plen;
             }
             uint32_t um, vm;
-            if (axis_mask(U, dU, len, tw, c->uwrap, &um) && axis_mask(V, dV, len, th, c->vwrap, &vm)) {
+            if (OUT == KIND_OP && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536) {
+                nv_fetch3(tex, len, U, dU, V, dV, c);
+                U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
+                V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
+            } else if (axis_mask(U, dU, len, tw, c->uwrap, &um) && axis_mask(V, dV, len, th, c->vwrap, &vm)) {
                 /* two texels per pass: the second load does not wait for the first */
                 int i = 0;
                 for (; i + 1 < len; i += 2) {
@@ -1049,6 +1107,10 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     if (flat && textured && c0 == 0xFFFFFFFFu && c.texenv != GFX_TEXENV_DECAL)
         c.texenv = GFX_TEXENV_REPLACE;
     c.persp = persp;
+    /* -filtro: 3D opaque surfaces in perspective (the track: karts, trees and items are
+       sprites in the other lists, the HUD has no perspective) */
+    c.filt = port_opt_filter && kind == KIND_OP && persp &&
+             (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
     SpanFn span = sSpanFns[kind][textured ? 1 : 0][extras ? 2 : (flat ? 0 : 1)];
     int nv_pending = sUseNeon && (kind != KIND_TR || (c.bs == GFX_BLENDF_SRCALPHA && c.bd == GFX_BLENDF_INVSRCALPHA));
 

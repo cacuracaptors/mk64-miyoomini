@@ -13,6 +13,7 @@ void port_quit(int code);
 double port_now_ms(void);
 extern int port_opt_perf;
 extern int port_opt_60fps;   /* -60fps: 1P races not capped at 30 (experimental) */
+extern int port_opt_filter;  /* -filtro: 3-point filter on magnified 3D opaque surfaces */
 
 /* src/main.c (TARGET_MIYOO) */
 void port_audio_pump(void);
