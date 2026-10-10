@@ -352,8 +352,16 @@ static void release_snap(void) {
     pthread_mutex_unlock(&flip_mutex);
 }
 
+/* CPU time this thread really used (the 2D engine works while the thread sleeps) */
+static double thread_cpu_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
 static void *flip_proc(void *arg) {
     (void) arg;
+    double t_cpu = 0;
     double t_conv = 0, t_show = 0, last_print = 0, last_tick = 0, tmin = 1e9, tmax = 0;
     int frames = 0, ticks = 0, fast = 0;
     pin_cpu(1);
@@ -372,9 +380,12 @@ static void *flip_proc(void *arg) {
         if (fb_pages == 2) {
             if (job) {
                 int back = fb_page ^ 1;
+                const double c0 = port_opt_perf ? thread_cpu_ms() : 0;
                 if (hw_present(src, back))
                     convert_frame(src, port_render_w, port_render_h, (uint32_t *) (fb_mem + (size_t) back * PANEL_W * PANEL_H * 4));
                 release_snap();   /* copied: the game may queue the next frame during the vsync wait */
+                if (port_opt_perf)
+                    t_cpu += thread_cpu_ms() - c0;
                 double t1 = port_now_ms();
                 t_conv += t1 - t0;
                 fb_var.yoffset = back * PANEL_H;
@@ -424,9 +435,10 @@ static void *flip_proc(void *arg) {
             if (last_print == 0)
                 last_print = now;
             else if (now - last_print >= 2000.0) {
-                fprintf(stderr, "perf flip: convert+copy %.2f  pan(vsync) %.2f  ms/frame (%d frames) | vsync %d ticks, %.2f..%.2f ms\n",
-                        frames ? t_conv / frames : 0, frames ? t_show / frames : 0, frames, ticks, ticks ? tmin : 0, tmax);
-                t_conv = t_show = 0;
+                fprintf(stderr, "perf flip: convert+copy %.2f (cpu %.2f)  pan(vsync) %.2f  ms/frame (%d frames) | vsync %d ticks, %.2f..%.2f ms\n",
+                        frames ? t_conv / frames : 0, frames ? t_cpu / frames : 0, frames ? t_show / frames : 0, frames, ticks,
+                        ticks ? tmin : 0, tmax);
+                t_conv = t_show = t_cpu = 0;
                 frames = ticks = 0;
                 tmin = 1e9; tmax = 0;
                 last_print = now;

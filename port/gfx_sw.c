@@ -169,8 +169,8 @@ static void current_state(RState *s) {
 static uint32_t stTris, stPixels, stTexUp, stOpTris, stPtTris, stTrTris;
 static __thread uint32_t tlPixels, tlTris;   /* per raster thread, summed after each frame */
 static double stRasterMs, stWalkMs, stCore0Ms, stCore1Ms;
-/* per core, per phase (clear, OP, PT, TR) -- measurement */
-static double stPhase[2][4];
+/* per core, per phase (clear, sky, OP, PT, TR, TR in screen space = HUD) -- measurement */
+static double stPhase[2][6];
 static float sCore0Share;   /* defined with the band split below */
 
 void gfx_sw_perf_report(int frames, double ms) {
@@ -181,10 +181,11 @@ void gfx_sw_perf_report(int frames, double ms) {
             stTris / frames, stOpTris / frames, stPtTris / frames, stTrTris / frames, stPixels / frames,
             stTexUp / frames, stWalkMs / frames, stRasterMs / frames, stCore0Ms / frames, stCore1Ms / frames,
             port_render_w, port_render_h);
-    fprintf(stderr, "perf fases (ms/quadro): core0 limpa %.2f op %.2f pt %.2f tr %.2f | core1 limpa %.2f op %.2f pt %.2f tr %.2f | linhas do core0 %.0f%%\n",
-            stPhase[0][0] / frames, stPhase[0][1] / frames, stPhase[0][2] / frames, stPhase[0][3] / frames,
-            stPhase[1][0] / frames, stPhase[1][1] / frames, stPhase[1][2] / frames, stPhase[1][3] / frames,
-            sCore0Share * 100.0);
+    for (int k = 0; k < 2; k++)
+        fprintf(stderr, "perf fases core%d (ms/quadro): limpa %.2f ceu %.2f op %.2f pt %.2f tr %.2f hud %.2f%s",
+                k, stPhase[k][0] / frames, stPhase[k][1] / frames, stPhase[k][2] / frames, stPhase[k][3] / frames,
+                stPhase[k][4] / frames, stPhase[k][5] / frames, k ? "" : " | ");
+    fprintf(stderr, " | linhas do core0 %.0f%%\n", sCore0Share * 100.0);
     memset(stPhase, 0, sizeof(stPhase));
     stTris = stPixels = stTexUp = stOpTris = stPtTris = stTrTris = 0;
     stRasterMs = stWalkMs = stCore0Ms = stCore1Ms = 0;
@@ -1213,6 +1214,64 @@ static void build_band_owners(void) {
 }
 #define BAND_SKIP(py) (sBandMask && sBandOwner[(py) >> 3] != sBandVal)
 
+/* ---- the sky, drawn first ----
+ * The sky (untextured, opaque, farther than every opaque and punch-through vertex) comes
+ * in the translucent list, so it was depth-tested over the whole screen after the scene.
+ * Drawn first with no depth test it gives the same picture (where the scene drew, the
+ * test hid it anyway), costs a plain fill, and stands in for the colour clear of the
+ * pixels it covers. sort_tr picks these triangles; raster_tri switches spans by mode. */
+#define GFX_SW_SKY_FIRST 1   /* (for the bench tools) */
+static __thread int tlSkyMode;   /* 0 normal, 1 record each row's covered span, 2 draw */
+#define SKY_ROWS 1024
+static int16_t sCovLo[SKY_ROWS], sCovHi[SKY_ROWS];   /* -1 nothing, -2 more than one span */
+
+static uint32_t sky_cover_span(const TriCtx *c, int py, int xs, int xe, const float *a, const float *d) {
+    (void) c; (void) a; (void) d;
+    const int lo = sCovLo[py], hi = sCovHi[py];
+    if (lo == -1) {
+        sCovLo[py] = (int16_t) xs;
+        sCovHi[py] = (int16_t) xe;
+    } else if (lo >= 0) {
+        if (xs <= hi && xe >= lo) {   /* touching or overlapping: one span */
+            if (xs < lo) sCovLo[py] = (int16_t) xs;
+            if (xe > hi) sCovHi[py] = (int16_t) xe;
+        } else {
+            sCovLo[py] = -2;
+        }
+    }
+    return 0;
+}
+
+static inline uint16_t sky_565(int r, int g, int b) {   /* same bits as nv_pack565 */
+    return (uint16_t) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+static void sky_fill(uint16_t *p, int n, uint16_t v) {
+    const uint16x8_t vv = vdupq_n_u16(v);
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        vst1q_u16(p + i, vv);
+    for (; i < n; i++)
+        p[i] = v;
+}
+
+/* flat colour (the opaque span's COL 0) */
+static uint32_t sky_fill_flat(const TriCtx *c, int py, int xs, int xe, const float *a, const float *d) {
+    (void) a; (void) d;
+    sky_fill(port_color + py * port_render_w + xs, xe - xs, sky_565(c->r, c->g, c->b));
+    return (uint32_t) (xe - xs);
+}
+
+/* one colour per row (the opaque span's COL 4: same rounding) */
+static uint32_t sky_fill_row(const TriCtx *c, int py, int xs, int xe, const float *a, const float *d) {
+    (void) c; (void) d;
+    const int r = clamp8((int32_t) (a[A_R] * 65536.0f) >> 16);
+    const int g = clamp8((int32_t) (a[A_G] * 65536.0f) >> 16);
+    const int b = clamp8((int32_t) (a[A_B] * 65536.0f) >> 16);
+    sky_fill(port_color + py * port_render_w + xs, xe - xs, sky_565(r, g, b));
+    return (uint32_t) (xe - xs);
+}
+
 /* draw one triangle with state st and list kind */
 static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t *v2, const RState *st, int kind) {
     const int W = port_render_w, H = port_render_h;
@@ -1345,6 +1404,19 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
             out = KIND_OP;
         }
         span = sNvFns[out][env][col];
+        if (tlSkyMode) {
+            if (tlSkyMode == 1) {
+                span = sky_cover_span;
+            } else if (!textured && col == 0) {
+                span = sky_fill_flat;
+            } else if (!textured && col == 4) {
+                span = sky_fill_row;
+            } else {   /* colour changes along the row: the opaque span, without depth */
+                span = sNvFns[KIND_OP][env][col];
+                c.dtest = 0;
+                c.dwrite = 0;
+            }
+        }
         nv_prepare(&nvs, ddx, col);
         c.nvs = &nvs;
     }
@@ -1830,7 +1902,39 @@ typedef struct {
 } TrSort;
 
 static TrSort sTrSort[BUCKET_VERTS / 3];
-static uint32_t sTrSortN;
+static uint32_t sTrSortN, sTrHud;   /* sTrHud: first one in screen space (z >= 1), measurement */
+#define SKY_MAX 64
+static TrSort sSky[SKY_MAX];        /* the sky triangles, taken out of the sorted list */
+static int sSkyN;
+
+/* can this translucent triangle be drawn before everything (see "the sky, drawn first")?
+   box: what the triangles left in the list before it cover, which it must not touch */
+static int sky_candidate(const dc_fast_t *v, const RState *st, float zfar, const float *box) {
+    if ((st->tex && sTex[st->tex].px) || st->fog ||
+        st->blend_src != GFX_BLENDF_SRCALPHA || st->blend_dst != GFX_BLENDF_INVSRCALPHA)
+        return 0;
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (int i = 0; i < 3; i++) {
+        const float x = v[i].vert.x, y = v[i].vert.y, z = v[i].vert.z;
+        if ((v[i].color.packed >> 24) != 255 || !(x == x) || !(y == y) || !(z < zfar))
+            return 0;
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+    }
+    return x1 < box[0] - 2.0f || x0 > box[2] + 2.0f || y1 < box[1] - 2.0f || y0 > box[3] + 2.0f;
+}
+
+static void box_add(float *box, const dc_fast_t *v) {
+    for (int i = 0; i < 3; i++) {
+        const float x = v[i].vert.x, y = v[i].vert.y;
+        if (x < box[0]) box[0] = x;
+        if (y < box[1]) box[1] = y;
+        if (x > box[2]) box[2] = x;
+        if (y > box[3]) box[3] = y;
+    }
+}
 
 static int tr_cmp(const void *a, const void *b) {
     const TrSort *x = a, *y = b;
@@ -1857,14 +1961,61 @@ static void sort_tr(void) {
         }
     }
     qsort(sTrSort, nt, sizeof(sTrSort[0]), tr_cmp);
+
+    /* the sky: below every opaque / punch-through vertex (with a margin for the depth
+       interpolation), and not overlapping a translucent triangle drawn before it. Only
+       when all of those write depth: where one did not, the sky used to paint over it. */
+    sSkyN = 0;
+    int zok = sUseNeon && nt;
+    float zmin = 1e30f;
+    const Bucket *ob[2] = { &sOP, &sPT };
+    for (int k = 0; k < 2 && zok; k++) {
+        for (int i = 0; i < ob[k]->nbatch; i++)
+            if (ob[k]->batch[i].count && !ob[k]->batch[i].st.depth_write)
+                zok = 0;
+        for (uint32_t i = 0; i < ob[k]->nverts; i++)
+            if (ob[k]->verts[i].vert.z < zmin)
+                zmin = ob[k]->verts[i].vert.z;
+    }
+    if (zok && zmin > 1e-5f) {
+        /* (depth saturates at z = 16: keep well below it) */
+        const float zfar = zmin * 0.99f < 15.0f ? zmin * 0.99f : 15.0f;
+        float box[4] = { 1e30f, 1e30f, -1e30f, -1e30f };
+        uint32_t keep = 0;
+        for (uint32_t i = 0; i < nt; i++) {
+            const TrSort e = sTrSort[i];
+            const dc_fast_t *v = &b->verts[e.seq];
+            if (sSkyN < SKY_MAX && e.key < 3.0f * zfar && sky_candidate(v, &b->batch[e.batch].st, zfar, box)) {
+                sSky[sSkyN++] = e;
+                continue;
+            }
+            box_add(box, v);
+            sTrSort[keep++] = e;
+        }
+        nt = keep;
+    }
     sTrSortN = nt;
+    sTrHud = nt;
+    for (uint32_t i = 0; i < nt; i++)
+        if (sTrSort[i].key >= 3.0f) {
+            sTrHud = i;
+            break;
+        }
 }
 
-static void raster_tr_sorted(void) {
+static void raster_tr_sorted(uint32_t from, uint32_t to) {
     Bucket *b = &sTR;
-    for (uint32_t i = 0; i < sTrSortN; i++) {
+    for (uint32_t i = from; i < to; i++) {
         const dc_fast_t *v = &b->verts[sTrSort[i].seq];
         raster_tri(&v[0], &v[1], &v[2], &b->batch[sTrSort[i].batch].st, KIND_TR);
+    }
+}
+
+static void raster_sky(void) {
+    const Bucket *b = &sTR;
+    for (int i = 0; i < sSkyN; i++) {
+        const dc_fast_t *v = &b->verts[sSky[i].seq];
+        raster_tri(&v[0], &v[1], &v[2], &b->batch[sSky[i].batch].st, KIND_TR);
     }
 }
 
@@ -1874,29 +2025,66 @@ static void raster_frame_band(int mask, int val) {
     double t0 = port_now_ms();
     sBandMask = mask;
     sBandVal = val;
+    const int sky = sSkyN && H <= SKY_ROWS;
+    if (sky) {
+        /* what the sky will cover in each row: the colour clear can leave that out */
+        for (int y = 0; y < H; y++)
+            if (!BAND_SKIP(y))
+                sCovLo[y] = sCovHi[y] = -1;
+        const uint32_t p = tlPixels, t = tlTris;
+        tlSkyMode = 1;
+        raster_sky();
+        tlSkyMode = 0;
+        tlPixels = p;
+        tlTris = t;
+    }
     for (int y0 = 0; y0 < H; y0 += 8) {
         if (BAND_SKIP(y0))
             continue;
         int rows = H - y0 < 8 ? H - y0 : 8;
-        memset(port_color + y0 * W, 0, (size_t) rows * W * sizeof(uint16_t));
         memset(port_depth + y0 * W, 0, (size_t) rows * W * sizeof(uint32_t));
+        if (!sky) {
+            memset(port_color + y0 * W, 0, (size_t) rows * W * sizeof(uint16_t));
+            continue;
+        }
+        for (int y = y0; y < y0 + rows; y++) {
+            uint16_t *row = port_color + y * W;
+            const int lo = sCovLo[y], hi = sCovHi[y];
+            if (lo >= 0) {
+                memset(row, 0, (size_t) lo * sizeof(uint16_t));
+                memset(row + hi, 0, (size_t) (W - hi) * sizeof(uint16_t));
+            } else {
+                memset(row, 0, (size_t) W * sizeof(uint16_t));
+            }
+        }
     }
     double t1 = port_now_ms();
-    flush_bucket(&sOP, KIND_OP);
+    if (sky) {
+        tlSkyMode = 2;
+        raster_sky();
+        tlSkyMode = 0;
+    } else {
+        raster_sky();   /* (more rows than the coverage table: in place, as before) */
+    }
     double t2 = port_now_ms();
-    flush_bucket(&sPT, KIND_PT);
+    flush_bucket(&sOP, KIND_OP);
     double t3 = port_now_ms();
-    raster_tr_sorted();
+    flush_bucket(&sPT, KIND_PT);
     double t4 = port_now_ms();
+    raster_tr_sorted(0, sTrHud);
+    double t5 = port_now_ms();
+    raster_tr_sorted(sTrHud, sTrSortN);
+    double t6 = port_now_ms();
     double *ph = stPhase[val & 1];   /* each core writes only its own row */
-    ph[0] += t1 - t0; ph[1] += t2 - t1; ph[2] += t3 - t2; ph[3] += t4 - t3;
+    ph[0] += t1 - t0; ph[1] += t2 - t1; ph[2] += t3 - t2; ph[3] += t4 - t3; ph[4] += t5 - t4; ph[5] += t6 - t5;
 }
 
 static void flush_tr_sorted(void) {   /* replay tool: single thread, whole frame */
     sort_tr();
     sBandMask = 0;
     sBandVal = 0;
-    raster_tr_sorted();
+    raster_sky();   /* first of the translucent list, depth-tested as before */
+    raster_tr_sorted(0, sTrSortN);
 }
 
 /* ---- second core ---- */
