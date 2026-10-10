@@ -25,6 +25,11 @@
 #include <linux/fb.h>
 
 #include "port_miyoo.h"
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#else
+#include "neon_emu.h"
+#endif
 
 #define PANEL_W 640
 #define PANEL_H 480
@@ -62,29 +67,63 @@ static inline uint32_t rgb565_to_x8888(uint32_t c) {
  * dst is the hidden screen page itself: each row is built in a small cached line buffer
  * and written to the page in one forward copy. The screen memory is fast to write
  * (write-combined) but ~30x slower to read, so it is never read back. */
-static uint32_t line_buf[PANEL_W];
+static uint32_t line_buf[PANEL_W] __attribute__((aligned(16)));
+
+/* 8 RGB565 pixels -> b g r planes, expanded by bit replication (same as rgb565_to_x8888) */
+static inline void conv8(uint16x8_t v, uint8x8_t *r, uint8x8_t *g, uint8x8_t *b) {
+    uint8x8_t tr = vshrn_n_u16(v, 8), tg = vshrn_n_u16(v, 3), tb = vmovn_u16(vshlq_n_u16(v, 3));
+    *r = vsri_n_u8(tr, tr, 5);
+    *g = vsri_n_u8(tg, tg, 6);
+    *b = vsri_n_u8(tb, tb, 5);
+}
+/* 8 pixels ending at s[7], in reverse order (the panel is upside down) */
+static inline uint16x8_t load8_rev(const uint16_t *s) {
+    uint16x8_t v = vrev64q_u16(vld1q_u16(s));
+    return vcombine_u16(vget_high_u16(v), vget_low_u16(v));
+}
+
+/* one source row (w pixels) -> line_buf, mirrored; doubled horizontally when twice = 1 */
+static void conv_row(const uint16_t *s, int w, int twice) {
+    if (w % 8) {
+        uint32_t *d = line_buf;
+        for (int x = w - 1; x >= 0; x--) {
+            uint32_t c = rgb565_to_x8888(s[x]);
+            *d++ = c;
+            if (twice)
+                *d++ = c;
+        }
+        return;
+    }
+    uint8_t *d = (uint8_t *) line_buf;
+    const uint8x8_t zero = vdup_n_u8(0);
+    for (int x = w - 8; x >= 0; x -= 8) {
+        uint8x8x4_t o;
+        conv8(load8_rev(s + x), &o.val[2], &o.val[1], &o.val[0]);
+        o.val[3] = zero;
+        if (!twice) {
+            vst4_u8(d, o);
+            d += 32;
+        } else {
+            uint8x8x2_t zb = vzip_u8(o.val[0], o.val[0]), zg = vzip_u8(o.val[1], o.val[1]), zr = vzip_u8(o.val[2], o.val[2]);
+            uint8x8x4_t a = { { zb.val[0], zg.val[0], zr.val[0], zero } }, b = { { zb.val[1], zg.val[1], zr.val[1], zero } };
+            vst4_u8(d, a);
+            vst4_u8(d + 32, b);
+            d += 64;
+        }
+    }
+}
 
 static void convert_frame(const uint16_t *src, int w, int h, uint32_t *dst) {
     if (w * 2 == PANEL_W && h * 2 == PANEL_H) {
         for (int y = 0; y < h; y++) {
-            const uint16_t *s = src + y * w;
-            uint32_t *d = line_buf;
-            for (int x = w - 1; x >= 0; x--) {
-                uint32_t c = rgb565_to_x8888(s[x]);
-                d[0] = c;
-                d[1] = c;
-                d += 2;
-            }
+            conv_row(src + y * w, w, 1);
             uint32_t *row = dst + (PANEL_H - 1 - 2 * y) * PANEL_W;
             memcpy(row, line_buf, PANEL_W * 4);
             memcpy(row - PANEL_W, line_buf, PANEL_W * 4);
         }
     } else if (w == PANEL_W && h == PANEL_H) {
         for (int y = 0; y < h; y++) {
-            const uint16_t *s = src + y * w;
-            uint32_t *d = line_buf;
-            for (int x = w - 1; x >= 0; x--)
-                *d++ = rgb565_to_x8888(s[x]);
+            conv_row(src + y * w, w, 0);
             memcpy(dst + (PANEL_H - 1 - y) * PANEL_W, line_buf, PANEL_W * 4);
         }
     } else {

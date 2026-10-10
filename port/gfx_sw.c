@@ -33,6 +33,11 @@
 #include "macros.h"
 #include "gfx/gl_fast_vert.h"
 #include "port_miyoo.h"
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#else
+#include "neon_emu.h"   /* PC builds of the replay / benchmark tools */
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* shaders (only the combiner feature flags matter here)                      */
@@ -202,6 +207,25 @@ static inline int wrap_coord(int i, int n, int clamp, int mirror) {
     return m < 0 ? m + n : m;
 }
 
+/* lrintf (round to nearest even, the default FPSCR mode) without the library call */
+static inline int32_t rnd_i(float f) {
+#if defined(__arm__) && defined(__ARM_FP)
+    float t;
+    int32_t r;
+    __asm__("vcvtr.s32.f32 %0, %1" : "=t"(t) : "t"(f));
+    memcpy(&r, &t, 4);
+    return r;
+#else
+    return (int32_t) lrintf(f);
+#endif
+}
+
+/* (int) ceilf(f) for |f| < 2^24, without the library call */
+static inline int ceil_i(float f) {
+    int i = (int) f;
+    return (float) i < f ? i + 1 : i;
+}
+
 static inline int ifloor(float f) {
     int i = (int) f;
     return (f < (float) i) ? i - 1 : i;
@@ -357,7 +381,7 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
     uint32_t *restrict zp = port_depth + py * W + xs;
     float zf = a[A_Z];
     const float dz = ddx[A_Z];
-    const int32_t dzi = (int32_t) lrintf(dz * ZSCALE);
+    const int32_t dzi = rnd_i(dz * ZSCALE);
     const int dtest = c->dtest, dwrite = c->dwrite;
     int32_t R = 0, G = 0, B = 0, A = 0, OR = 0, OG = 0, OB = 0, F = 0;
     int32_t dR = 0, dG = 0, dB = 0, dA = 0, dOR = 0, dOG = 0, dOB = 0, dF = 0;
@@ -421,8 +445,8 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
         float u = tc_fold(a[A_U] * c->ftw + c->bias, tw, c->uwrap), v = tc_fold(a[A_V] * c->fth + c->bias, th, c->vwrap);
         /* 1:1 2D images land exactly on texel edges: round the step and start a hair (1/256
            texel) above the edge so every pixel picks the same texel, with no drift */
-        U = (int32_t) lrintf(u * 65536.0f) + 256; dU = (int32_t) lrintf(ddx[A_U] * c->ftw * 65536.0f);
-        V = (int32_t) lrintf(v * 65536.0f) + 256; dV = (int32_t) lrintf(ddx[A_V] * c->fth * 65536.0f);
+        U = rnd_i(u * 65536.0f) + 256; dU = rnd_i(ddx[A_U] * c->ftw * 65536.0f);
+        V = rnd_i(v * 65536.0f) + 256; dV = rnd_i(ddx[A_V] * c->fth * 65536.0f);
     } else {
         uz = a[A_U]; vz = a[A_V];
         duz = ddx[A_U]; dvz = ddx[A_V];
@@ -440,8 +464,8 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
             u1 += fu - u0;
             v1 += fv - v0;
             float il = 1.0f / (float) len;
-            U = (int32_t) lrintf(fu * 65536.0f) + 256; dU = (int32_t) lrintf((u1 - fu) * il * 65536.0f);
-            V = (int32_t) lrintf(fv * 65536.0f) + 256; dV = (int32_t) lrintf((v1 - fv) * il * 65536.0f);
+            U = rnd_i(fu * 65536.0f) + 256; dU = rnd_i((u1 - fu) * il * 65536.0f);
+            V = rnd_i(fv * 65536.0f) + 256; dV = rnd_i((v1 - fv) * il * 65536.0f);
             uz += duz * len; vz += dvz * len;
         }
         uint32_t um, vm;
@@ -504,6 +528,263 @@ SPAN_DEF_K(2)
 #define SPAN_REF(K) { SPAN_REF_T(K, 0), SPAN_REF_T(K, 1) }
 /* [list kind][0 untextured, 1 textured][0 flat colour, 1 gouraud, 2 gouraud + offset/fog] */
 static const SpanFn sSpanFns[3][2][3] = { SPAN_REF(0), SPAN_REF(1), SPAN_REF(2) };
+
+/* ------------------------------------------------------------------------- */
+/* NEON pixel pipeline: 8 pixels at a time, same result as span_body bit for bit.
+ * Per run of 16 pixels the texels are fetched first (scalar, into a small array),
+ * then each group of 8 goes through depth test, colour, texture combine, offset,
+ * fog and the list's output step (store / alpha test / standard alpha blend) in
+ * NEON registers. Used for every list and texenv; only translucent polygons with a
+ * blend other than SRCALPHA / INVSRCALPHA stay on span_body.
+ *   OUT: KIND_OP, KIND_PT, KIND_TR (standard blend)
+ *   TEX: -1 untextured, else the texenv
+ *   COL: 0 flat, 1 gouraud, 2 gouraud + offset, 3 gouraud + offset + fog        */
+/* ------------------------------------------------------------------------- */
+
+/* exact DIV255 of a product (<= 255 * 255) */
+static inline __attribute__((always_inline)) uint8x8_t nv_div255(uint16x8_t x) {
+    return vrshrn_n_u16(vaddq_u16(x, vrshrq_n_u16(x, 8)), 8);
+}
+/* floor(x / 255), x <= 255 * 255 */
+static inline __attribute__((always_inline)) uint8x8_t nv_floor255(uint16x8_t x) {
+    const uint16x4_t k = vdup_n_u16(0x8081);
+    uint16x4_t lo = vshrn_n_u32(vmull_u16(vget_low_u16(x), k), 16);
+    uint16x4_t hi = vshrn_n_u32(vmull_u16(vget_high_u16(x), k), 16);
+    return vshrn_n_u16(vcombine_u16(lo, hi), 7);
+}
+/* clamp8(X >> 16) for 8 lanes X + i * dX (o0 = {0..3} * dX, o1 = {4..7} * dX) */
+static inline __attribute__((always_inline)) uint8x8_t nv_lane8(int32_t X, int32x4_t o0, int32x4_t o1) {
+    int32x4_t v = vdupq_n_s32(X);
+    return vqmovn_u16(vcombine_u16(vqshrun_n_s32(vaddq_s32(v, o0), 16), vqshrun_n_s32(vaddq_s32(v, o1), 16)));
+}
+static inline __attribute__((always_inline)) uint16x8_t nv_pack565(uint8x8_t r, uint8x8_t g, uint8x8_t b) {
+    return vsriq_n_u16(vsriq_n_u16(vshll_n_u8(r, 8), vshll_n_u8(g, 8), 5), vshll_n_u8(b, 8), 11);
+}
+/* 0x00 / 0xFF bytes -> 0x0000 / 0xFFFF halfwords */
+static inline __attribute__((always_inline)) uint16x8_t nv_wide_mask(uint8x8_t m) {
+    return vreinterpretq_u16_s16(vmovl_s8(vreinterpret_s8_u8(m)));
+}
+static inline __attribute__((always_inline)) uint32x4_t nv_wide_mask32(uint16x4_t m) {
+    return vreinterpretq_u32_s32(vmovl_s16(vreinterpret_s16_u16(m)));
+}
+
+typedef struct {
+    int32x4_t o0[8], o1[8];   /* per-lane steps of R G B A OR OG OB F */
+    uint32x4_t zo0, zo1;      /* per-lane depth steps */
+} NvSteps;
+
+/* one group of (up to) 8 pixels; cp / zp point at 8 writable pixels */
+static inline __attribute__((always_inline)) void nv_group(uint16_t *cp, uint32_t *zp, uint32_t zi, const NvSteps *s,
+                                                           const int32_t *X, const uint32_t *tex, const TriCtx *c,
+                                                           const int OUT, const int TEX, const int COL) {
+    /* depth */
+    uint32x4_t z0 = vaddq_u32(vdupq_n_u32(zi), s->zo0), z1 = vaddq_u32(vdupq_n_u32(zi), s->zo1);
+    uint32x4_t d0 = vld1q_u32(zp), d1 = vld1q_u32(zp + 4);
+    uint32x4_t m0, m1;
+    if (OUT == KIND_TR || c->dtest) {
+        m0 = vcgeq_u32(z0, d0);
+        m1 = vcgeq_u32(z1, d1);
+    } else {
+        m0 = m1 = vdupq_n_u32(0xFFFFFFFFu);
+    }
+    uint16x8_t m = vcombine_u16(vmovn_u32(m0), vmovn_u32(m1));
+    if (vget_lane_u64(vreinterpret_u64_u16(vorr_u16(vget_low_u16(m), vget_high_u16(m))), 0) == 0)
+        return;
+
+    /* vertex colour */
+    uint8x8_t r, g, b, al;
+    if (COL == 0) {
+        r = vdup_n_u8((uint8_t) c->r); g = vdup_n_u8((uint8_t) c->g); b = vdup_n_u8((uint8_t) c->b); al = vdup_n_u8((uint8_t) c->a);
+    } else {
+        r = nv_lane8(X[0], s->o0[0], s->o1[0]);
+        g = nv_lane8(X[1], s->o0[1], s->o1[1]);
+        b = nv_lane8(X[2], s->o0[2], s->o1[2]);
+        al = nv_lane8(X[3], s->o0[3], s->o1[3]);
+    }
+
+    /* texture */
+    if (TEX >= 0) {
+        uint8x8x4_t t = vld4_u8((const uint8_t *) tex);   /* b g r a */
+        if (TEX == GFX_TEXENV_REPLACE) {
+            b = t.val[0]; g = t.val[1]; r = t.val[2]; al = t.val[3];
+        } else if (TEX == GFX_TEXENV_MODULATE) {
+            r = nv_div255(vmull_u8(r, t.val[2])); g = nv_div255(vmull_u8(g, t.val[1])); b = nv_div255(vmull_u8(b, t.val[0]));
+            al = t.val[3];
+        } else if (TEX == GFX_TEXENV_DECAL) {
+            uint8x8_t ia = vmvn_u8(t.val[3]);
+            r = nv_div255(vmlal_u8(vmull_u8(r, ia), t.val[2], t.val[3]));
+            g = nv_div255(vmlal_u8(vmull_u8(g, ia), t.val[1], t.val[3]));
+            b = nv_div255(vmlal_u8(vmull_u8(b, ia), t.val[0], t.val[3]));
+        } else {
+            r = nv_div255(vmull_u8(r, t.val[2])); g = nv_div255(vmull_u8(g, t.val[1])); b = nv_div255(vmull_u8(b, t.val[0]));
+            al = nv_div255(vmull_u8(al, t.val[3]));
+        }
+        if (COL >= 2) {
+            r = vqadd_u8(r, nv_lane8(X[4], s->o0[4], s->o1[4]));
+            g = vqadd_u8(g, nv_lane8(X[5], s->o0[5], s->o1[5]));
+            b = vqadd_u8(b, nv_lane8(X[6], s->o0[6], s->o1[6]));
+        }
+    }
+
+    /* fog: c += (fogc - c) * f / 255, rounded towards zero */
+    if (COL == 3) {
+        uint8x8_t f = nv_lane8(X[7], s->o0[7], s->o1[7]);
+        uint8x8_t fr = vdup_n_u8((uint8_t) c->fr), fg = vdup_n_u8((uint8_t) c->fg), fb = vdup_n_u8((uint8_t) c->fb);
+        r = vsub_u8(vadd_u8(r, nv_floor255(vmull_u8(vqsub_u8(fr, r), f))), nv_floor255(vmull_u8(vqsub_u8(r, fr), f)));
+        g = vsub_u8(vadd_u8(g, nv_floor255(vmull_u8(vqsub_u8(fg, g), f))), nv_floor255(vmull_u8(vqsub_u8(g, fg), f)));
+        b = vsub_u8(vadd_u8(b, nv_floor255(vmull_u8(vqsub_u8(fb, b), f))), nv_floor255(vmull_u8(vqsub_u8(b, fb), f)));
+    }
+
+    uint16x8_t dst = vld1q_u16(cp);
+    if (OUT == KIND_PT) {
+        uint16x8_t am = nv_wide_mask(vcgt_u8(al, vdup_n_u8(0xC0)));
+        m = vandq_u16(m, am);
+        m0 = nv_wide_mask32(vget_low_u16(m));
+        m1 = nv_wide_mask32(vget_high_u16(m));
+    }
+    if (OUT == KIND_TR) {
+        /* standard alpha blend with the 565 pixel expanded as v * 255 / max */
+        uint8x8_t d5r = vmovn_u16(vshrq_n_u16(dst, 11));
+        uint8x8_t d6g = vmovn_u16(vandq_u16(vshrq_n_u16(dst, 5), vdupq_n_u16(0x3F)));
+        uint8x8_t d5b = vmovn_u16(vandq_u16(dst, vdupq_n_u16(0x1F)));
+        const uint8x8_t k58 = vdup_n_u8(58), k49 = vdup_n_u8(49);
+        uint8x8_t dr = vadd_u8(vshl_n_u8(d5r, 3), vshrn_n_u16(vmull_u8(d5r, k58), 8));
+        uint8x8_t db = vadd_u8(vshl_n_u8(d5b, 3), vshrn_n_u16(vmull_u8(d5b, k58), 8));
+        uint8x8_t dg = vadd_u8(vshl_n_u8(d6g, 2), vshr_n_u8(vshrn_n_u16(vmull_u8(d6g, k49), 8), 2));
+        uint8x8_t ia = vmvn_u8(al);
+        r = nv_div255(vmlal_u8(vmull_u8(r, al), dr, ia));
+        g = nv_div255(vmlal_u8(vmull_u8(g, al), dg, ia));
+        b = nv_div255(vmlal_u8(vmull_u8(b, al), db, ia));
+    }
+    vst1q_u16(cp, vbslq_u16(m, nv_pack565(r, g, b), dst));
+    if (OUT != KIND_TR && c->dwrite) {
+        vst1q_u32(zp, vbslq_u32(m0, z0, d0));
+        vst1q_u32(zp + 4, vbslq_u32(m1, z1, d1));
+    }
+}
+
+static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, int py, int xs, int xe, const float *a,
+                                                               const float *ddx, const int OUT, const int TEX, const int COL) {
+    const int W = port_render_w;
+    uint16_t *cp = port_color + py * W + xs;
+    uint32_t *zp = port_depth + py * W + xs;
+    float zf = a[A_Z];
+    const float dz = ddx[A_Z];
+    const int32_t dzi = rnd_i(dz * ZSCALE);
+    NvSteps s;
+    int32_t X[8], dX[8];
+    static const int kAttr[8] = { A_R, A_G, A_B, A_A, A_OR, A_OG, A_OB, A_F };
+    const int nch = COL == 0 ? 0 : (COL == 1 ? 4 : 8);
+    int32_t lo[4], hi[4];
+    for (int k = 0; k < nch; k++) {
+        X[k] = (int32_t) (a[kAttr[k]] * 65536.0f);
+        dX[k] = (int32_t) (ddx[kAttr[k]] * 65536.0f);
+        for (int i = 0; i < 4; i++) {
+            lo[i] = (int32_t) ((uint32_t) i * (uint32_t) dX[k]);
+            hi[i] = (int32_t) ((uint32_t) (i + 4) * (uint32_t) dX[k]);
+        }
+        s.o0[k] = vld1q_s32(lo);
+        s.o1[k] = vld1q_s32(hi);
+    }
+    {
+        uint32_t zl[4], zh[4];
+        for (int i = 0; i < 4; i++) {
+            zl[i] = (uint32_t) i * (uint32_t) dzi;
+            zh[i] = (uint32_t) (i + 4) * (uint32_t) dzi;
+        }
+        s.zo0 = vld1q_u32(zl);
+        s.zo1 = vld1q_u32(zh);
+    }
+
+    uint32_t tex[16] __attribute__((aligned(16)));
+    const uint32_t *const tpx = c->tpx;
+    const int tw = c->tw, th = c->th;
+    float uz = 0, vz = 0, duz = 0, dvz = 0;
+    int32_t U = 0, V = 0, dU = 0, dV = 0;
+    const int persp = TEX >= 0 && c->persp;
+    if (TEX >= 0) {
+        if (!persp) {
+            float u = tc_fold(a[A_U] * c->ftw + c->bias, tw, c->uwrap), v = tc_fold(a[A_V] * c->fth + c->bias, th, c->vwrap);
+            U = rnd_i(u * 65536.0f) + 256; dU = rnd_i(ddx[A_U] * c->ftw * 65536.0f);
+            V = rnd_i(v * 65536.0f) + 256; dV = rnd_i(ddx[A_V] * c->fth * 65536.0f);
+        } else {
+            uz = a[A_U]; vz = a[A_V];
+            duz = ddx[A_U]; dvz = ddx[A_V];
+        }
+    }
+
+    for (int px = xs; px < xe; px += 16) {
+        const int len = xe - px < 16 ? xe - px : 16;
+        uint32_t zi = zfix(zf);
+        if (TEX >= 0) {
+            if (persp) {
+                float iz0 = 1.0f / zf;
+                float u0 = uz * iz0 * c->ftw + c->bias, v0 = vz * iz0 * c->fth + c->bias;
+                float zz1 = zf + dz * len;
+                float iz1 = 1.0f / zz1;
+                float u1 = (uz + duz * len) * iz1 * c->ftw + c->bias, v1 = (vz + dvz * len) * iz1 * c->fth + c->bias;
+                float fu = tc_fold(u0, tw, c->uwrap), fv = tc_fold(v0, th, c->vwrap);
+                u1 += fu - u0;
+                v1 += fv - v0;
+                float il = 1.0f / (float) len;
+                U = rnd_i(fu * 65536.0f) + 256; dU = rnd_i((u1 - fu) * il * 65536.0f);
+                V = rnd_i(fv * 65536.0f) + 256; dV = rnd_i((v1 - fv) * il * 65536.0f);
+                uz += duz * len; vz += dvz * len;
+            }
+            uint32_t um, vm;
+            if (axis_mask(U, dU, len, tw, c->uwrap, &um) && axis_mask(V, dV, len, th, c->vwrap, &vm)) {
+                for (int i = 0; i < len; i++) {
+                    tex[i] = tpx[((uint32_t) (V >> 16) & vm) * tw + ((uint32_t) (U >> 16) & um)];
+                    U += dU; V += dV;
+                }
+            } else {
+                for (int i = 0; i < len; i++) {
+                    int iu = tc_wrap(U >> 16, tw, c->umask, c->uwrap);
+                    int iv = tc_wrap(V >> 16, th, c->vmask, c->vwrap);
+                    tex[i] = tpx[iv * tw + iu];
+                    U += dU; V += dV;
+                }
+            }
+        }
+        for (int o = 0; o < len; o += 8) {
+            const int n = len - o < 8 ? len - o : 8;
+            if (n == 8) {
+                nv_group(cp + o, zp + o, zi, &s, X, tex + o, c, OUT, TEX, COL);
+            } else {
+                /* last pixels of the span: work on a copy so nothing past xe is written */
+                uint16_t ct[8];
+                uint32_t zt[8];
+                memcpy(ct, cp + o, (size_t) n * 2);
+                memcpy(zt, zp + o, (size_t) n * 4);
+                nv_group(ct, zt, zi, &s, X, tex + o, c, OUT, TEX, COL);
+                memcpy(cp + o, ct, (size_t) n * 2);
+                memcpy(zp + o, zt, (size_t) n * 4);
+            }
+            zi += (uint32_t) dzi * 8;
+            for (int k = 0; k < nch; k++)
+                X[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) dX[k] * 8);
+        }
+        cp += len;
+        zp += len;
+        zf += dz * len;
+    }
+    return (uint32_t) (xe - xs);
+}
+
+#define NV_DEF(O, T, C) \
+    static uint32_t nv_##O##_##T##_##C(const TriCtx *c, int py, int xs, int xe, const float *a, const float *d) { \
+        return nv_span(c, py, xs, xe, a, d, O, T - 1, C); \
+    }
+#define NV_DEF_T(O, T) NV_DEF(O, T, 0) NV_DEF(O, T, 1) NV_DEF(O, T, 2) NV_DEF(O, T, 3)
+#define NV_DEF_O(O) NV_DEF_T(O, 0) NV_DEF_T(O, 1) NV_DEF_T(O, 2) NV_DEF_T(O, 3) NV_DEF_T(O, 4)
+NV_DEF_O(0)
+NV_DEF_O(1)
+NV_DEF_O(2)
+#define NV_REF_T(O, T) { nv_##O##_##T##_0, nv_##O##_##T##_1, nv_##O##_##T##_2, nv_##O##_##T##_3 }
+#define NV_REF_O(O) { NV_REF_T(O, 0), NV_REF_T(O, 1), NV_REF_T(O, 2), NV_REF_T(O, 3), NV_REF_T(O, 4) }
+/* [list kind][texenv + 1 (0 = untextured)][colour mode] */
+static const SpanFn sNvFns[3][5][4] = { NV_REF_O(0), NV_REF_O(1), NV_REF_O(2) };
+static int sUseNeon = 1;
 
 static int wrap_mode(int n, int clamp, int mirror) {
     int pow2 = (n & (n - 1)) == 0;
@@ -589,7 +870,12 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     if (flat && textured && c0 == 0xFFFFFFFFu && c.texenv != GFX_TEXENV_DECAL)
         c.texenv = GFX_TEXENV_REPLACE;
     c.persp = persp;
-    const SpanFn span = sSpanFns[kind][textured ? 1 : 0][extras ? 2 : (flat ? 0 : 1)];
+    SpanFn span = sSpanFns[kind][textured ? 1 : 0][extras ? 2 : (flat ? 0 : 1)];
+    if (sUseNeon && (kind != KIND_TR || (c.bs == GFX_BLENDF_SRCALPHA && c.bd == GFX_BLENDF_INVSRCALPHA))) {
+        /* colour mode: offset only matters when textured, fog only when enabled */
+        const int col = extras ? (c.fog ? 3 : 2) : (flat ? 0 : 1);
+        span = sNvFns[kind][textured ? c.texenv + 1 : 0][col];
+    }
 
     /* attribute gradients */
     const float inv = 1.0f / area;
@@ -608,7 +894,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     if (Y[i2] < Y[i1]) { t = i1; i1 = i2; i2 = t; }
     const float xa = X[i0], ya = Y[i0], xb = X[i1], yb = Y[i1], xc = X[i2], yc = Y[i2];
 
-    int ystart = (int) ceilf(ya - 0.5f), yend = (int) ceilf(yc - 0.5f);
+    int ystart = ceil_i(ya - 0.5f), yend = ceil_i(yc - 0.5f);
     if (ystart < 0) ystart = 0;
     if (yend > H) yend = H;
     if (ystart >= yend)
@@ -633,7 +919,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
             xl = xr;
             xr = tmp;
         }
-        int xs = (int) ceilf(xl - 0.5f), xe = (int) ceilf(xr - 0.5f);
+        int xs = ceil_i(xl - 0.5f), xe = ceil_i(xr - 0.5f);
         if (xs < 0) xs = 0;
         if (xe > W) xe = W;
         if (xs >= xe)
