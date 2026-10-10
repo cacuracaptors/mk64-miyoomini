@@ -386,7 +386,76 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     stTris++;
 }
 
+/* ------------------------------------------------------------------------- */
+/* frame capture (SELECT + X): every draw of one frame, the textures it uses and */
+/* the finished picture go to capture_NN.bin in the game folder, so the frame   */
+/* can be replayed and inspected off the device.                                */
+/* ------------------------------------------------------------------------- */
+
+static FILE *sCapF;
+static int sCapRequest, sCapCount;
+static uint8_t sCapTexSeen[TEX_MAX];
+
+void gfx_sw_request_capture(void) {
+    sCapRequest = 1;
+}
+
+static void cap_u32(uint32_t v) { fwrite(&v, 4, 1, sCapF); }
+
+static void cap_begin(void) {
+    char name[64];
+    snprintf(name, sizeof(name), "capture_%02d.bin", sCapCount++);
+    sCapF = fopen(name, "wb");
+    if (!sCapF) {
+        printf("captura: nao consegui criar %s\n", name);
+        return;
+    }
+    memset(sCapTexSeen, 0, sizeof(sCapTexSeen));
+    fwrite("MK64CAP1", 8, 1, sCapF);
+    cap_u32((uint32_t) port_render_w);
+    cap_u32((uint32_t) port_render_h);
+    printf("captura: gravando %s\n", name);
+}
+
+static void cap_draw(const dc_fast_t *v, size_t n, const RState *st, int kind) {
+    if (st->tex && !sCapTexSeen[st->tex] && sTex[st->tex].px) {
+        const struct SwTex *t = &sTex[st->tex];
+        sCapTexSeen[st->tex] = 1;
+        fwrite("T", 1, 1, sCapF);
+        cap_u32(st->tex);
+        cap_u32(t->w);
+        cap_u32(t->h);
+        fwrite(t->px, 4, (size_t) t->w * t->h, sCapF);
+    }
+    fwrite("D", 1, 1, sCapF);
+    cap_u32((uint32_t) kind);
+    cap_u32(st->tex);
+    {
+        uint8_t b[12] = { st->texenv, st->depth_test, st->depth_write, st->fog, st->blend_src, st->blend_dst,
+                          st->clampu, st->clampv, st->mirru, st->mirrv, 0, 0 };
+        fwrite(b, 1, sizeof(b), sCapF);
+    }
+    cap_u32(sFogColor);
+    cap_u32(cur_shader ? cur_shader->shader_id : 0xFFFFFFFFu);
+    cap_u32(cur_shader ? cur_shader->texture_used[0] : 0);
+    cap_u32(sBound[0]);
+    cap_u32((uint32_t) n);
+    fwrite(v, sizeof(dc_fast_t), n, sCapF);
+}
+
+static void cap_end(void) {
+    size_t np = (size_t) port_render_w * port_render_h;
+    fwrite("F", 1, 1, sCapF);
+    fwrite(port_color, 2, np, sCapF);
+    fwrite(port_depth, 4, np, sCapF);
+    fclose(sCapF);
+    sCapF = NULL;
+    printf("captura: pronta\n");
+}
+
 static void raster_list(const dc_fast_t *v, size_t n, const RState *st, int kind) {
+    if (sCapF)
+        cap_draw(v, n, st, kind);
     for (size_t i = 0; i + 2 < n; i += 3)
         raster_tri(&v[i], &v[i + 1], &v[i + 2], st, kind);
     if (kind == KIND_OP)
@@ -707,6 +776,10 @@ static double sFrameT0;
 
 static void sw_start_frame(void) {
     sFrameT0 = port_now_ms();
+    if (sCapRequest && !sCapF) {
+        sCapRequest = 0;
+        cap_begin();
+    }
     if (sCacheFlushPending) {
         gfx_pvr_clear_all_textures();
         reset_texcache();
@@ -741,6 +814,8 @@ static void sw_end_frame(void) {
     flush_bucket(&sPT, KIND_PT);
     flush_bucket(&sTR, KIND_TR);
     stRasterMs += port_now_ms() - sFrameT0;
+    if (sCapF)
+        cap_end();
 }
 
 static void sw_finish_render(void) {

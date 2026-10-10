@@ -8,6 +8,7 @@
  *   START   -> START                         SELECT -> L
  *   D-pad   -> analog stick (steering ramps up while held) + D-pad bits
  *   SELECT+START or MENU held 1 s -> quit
+ *   X held, then SELECT -> save a capture of the next frame (capture_NN.bin, for debugging)
  */
 #include <stdio.h>
 #include <string.h>
@@ -143,6 +144,21 @@ void update_controller(s32 index) {
     if (held[K_DOWN]) b |= N64_DD;
     if (held[K_LEFT]) b |= N64_DL;
     if (held[K_RIGHT]) b |= N64_DR;
+
+    /* SELECT+X: frame capture for debugging; X does not reach the game while SELECT is held */
+    {
+        static int cap_was_down;
+        int cap_down = held[K_SELECT] && held[K_X];
+        if (cap_down && !cap_was_down) {
+            extern void gfx_sw_request_capture(void);
+            gfx_sw_request_capture();
+        }
+        cap_was_down = cap_down;
+        if (held[K_SELECT])
+            b &= ~N64_CR;
+        if (cap_down)   /* hold X first, then SELECT: the game never sees L (OPTION in the menu) */
+            b &= ~N64_L;
+    }
 
     /* SELECT+START is the quit combo: don't let it pause the game first */
     if (held[K_SELECT] && held[K_START])
