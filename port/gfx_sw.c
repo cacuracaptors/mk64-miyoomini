@@ -1400,6 +1400,9 @@ static uint32_t sky_fill_row(const TriCtx *c, int py, int xs, int xe, const floa
     return (uint32_t) (xe - xs);
 }
 
+#ifndef GFX_SW_NEXTROW
+#define GFX_SW_NEXTROW 3   /* cache lines of the next row asked for ahead (3 or 5) */
+#endif
 /* draw one triangle with state st and list kind */
 static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t *v2, const RState *st, int kind) {
     const int W = port_render_w, H = port_render_h;
@@ -1596,6 +1599,20 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         if (xs >= xe)
             continue;
 
+        /* the next row's depth and colour, asked for now: a span's first cache lines are
+           otherwise waited for at its start (the in-span prefetch only looks ahead along the
+           row), and on a small triangle that wait is most of the row's cost */
+        if (py + 1 < yend && !BAND_SKIP(py + 1)) {
+            const uint32_t *nz = port_depth + (py + 1) * W + xs;
+            const uint16_t *nc = port_color + (py + 1) * W + xs;
+            __builtin_prefetch(nz);
+            __builtin_prefetch(nz + 16);
+            __builtin_prefetch(nc);
+#if GFX_SW_NEXTROW > 3
+            __builtin_prefetch(nz + 32);
+            __builtin_prefetch(nc + 32);
+#endif
+        }
         const float ox = (float) xs + 0.5f - X[0], oy = fy - Y[0];
         float a[NATTR];
         for (int k = 0; k < natt; k++)
