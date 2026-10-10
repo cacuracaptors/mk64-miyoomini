@@ -67,6 +67,9 @@ struct SwTex {
     uint8_t filter;        /* 1 = bilinear requested (point sampled for now) */
     uint8_t clampu, clampv, mirru, mirrv;
     uint8_t opaque;        /* every texel has alpha 255 */
+    uint8_t margin;        /* some row starts or ends with invisible texels (see ext) */
+    uint16_t exth;         /* rows allocated in ext */
+    int16_t *ext;          /* per row: first and last texel with alpha > 0, then with alpha > 0xC0 */
 };
 
 static struct SwTex sTex[TEX_MAX];
@@ -78,6 +81,43 @@ static void tex_update_opaque(struct SwTex *t) {
     for (uint32_t i = 0; i < n; i++)
         a &= t->px[i];
     t->opaque = a == 0xFF000000u;
+    /* the visible part of each row: translucent and punch-through spans that only cover
+       invisible texels at their ends skip them (alpha 0 blends to the old pixel, alpha
+       <= 0xC0 fails the punch-through test) */
+    t->margin = 0;
+    if (t->opaque)
+        return;
+    if (t->exth < t->h) {
+        int16_t *e = realloc(t->ext, (size_t) t->h * 4 * sizeof(int16_t));
+        if (!e)
+            return;
+        t->ext = e;
+        t->exth = t->h;
+    }
+    for (int y = 0; y < t->h; y++) {
+        const uint32_t *row = t->px + (size_t) y * t->w;
+        int16_t *e = t->ext + 4 * y;
+        e[0] = e[2] = (int16_t) t->w;
+        e[1] = e[3] = -1;
+        for (int x = 0; x < t->w; x++) {
+            const uint32_t al = row[x] >> 24;
+            if (al) {
+                if (e[0] > x) e[0] = (int16_t) x;
+                e[1] = (int16_t) x;
+            }
+            if (al > 0xC0) {
+                if (e[2] > x) e[2] = (int16_t) x;
+                e[3] = (int16_t) x;
+            }
+        }
+        if (e[0] > 0 || e[1] < t->w - 1 || e[2] > 0 || e[3] < t->w - 1)
+            t->margin = 1;
+    }
+}
+static void tex_free(struct SwTex *t) {
+    free(t->px);
+    free(t->ext);
+    memset(t, 0, sizeof(*t));
 }
 static uint32_t sTexCount;
 static uint32_t sBound[2];
@@ -269,6 +309,7 @@ typedef struct {
     int r, g, b, a;          /* flat colour (GOUR == 0) */
     const void *nvs;         /* NvSteps of the NEON spans (per triangle) */
     int filt;                /* 3-point filter where the texture is magnified (-filtro) */
+    const int16_t *ext;      /* the texture's visible extent per row (NULL: draw every texel) */
 } TriCtx;
 
 static uint8_t sExp5[32], sExp6[64];   /* 565 -> 8 bit, same rounding as before (v*255/max) */
@@ -687,13 +728,20 @@ static inline __attribute__((always_inline)) void nv_depth(NvDepth *D, const uin
                                                            const TriCtx *c, int n, const int OUT) {
     D->z0 = vaddq_u32(zv, s->zo0);
     D->z1 = vaddq_u32(zv, s->zo1);
-    D->d0 = vld1q_u32(zp);
-    D->d1 = vld1q_u32(zp + 4);
-    if (OUT == KIND_TR || c->dtest) {
-        D->m0 = vcgeq_u32(D->z0, D->d0);
-        D->m1 = vcgeq_u32(D->z1, D->d1);
-    } else {
+    if (OUT == KIND_TR && !c->dtest) {
+        /* translucent in front of everything: depth is neither tested nor written */
+        D->d0 = D->z0;
+        D->d1 = D->z1;
         D->m0 = D->m1 = vdupq_n_u32(0xFFFFFFFFu);
+    } else {
+        D->d0 = vld1q_u32(zp);
+        D->d1 = vld1q_u32(zp + 4);
+        if (c->dtest) {
+            D->m0 = vcgeq_u32(D->z0, D->d0);
+            D->m1 = vcgeq_u32(D->z1, D->d1);
+        } else {
+            D->m0 = D->m1 = vdupq_n_u32(0xFFFFFFFFu);
+        }
     }
     D->m = vcombine_u16(vmovn_u32(D->m0), vmovn_u32(D->m1));
     if (n < 8) {
@@ -1019,6 +1067,58 @@ static void nv_fetch3(uint32_t *out, int len, int32_t U, int32_t dU, int32_t V, 
     }
 }
 
+/* 16 fetched texels that all leave the picture as it is: alpha 0 (translucent) or
+   alpha <= 0xC0 (punch-through test). The largest texel word has the largest alpha. */
+static inline __attribute__((always_inline)) int nv_invisible16(const uint32_t *tex, int pt) {
+    const uint32x4_t m = vmaxq_u32(vmaxq_u32(vld1q_u32(tex), vld1q_u32(tex + 4)),
+                                   vmaxq_u32(vld1q_u32(tex + 8), vld1q_u32(tex + 12)));
+    uint32x2_t h = vpmax_u32(vget_low_u32(m), vget_high_u32(m));
+    h = vpmax_u32(h, h);
+    return vget_lane_u32(h, 0) < (pt ? 0xC1000000u : 0x01000000u);
+}
+
+/* An affine translucent / punch-through span along one texture row (dV = 0): which of its
+   n pixels can show a visible texel. The texel index (U + i dU) >> 16 is monotonic in i,
+   so the pixels before *first and from *end on only show invisible texels (alpha 0, or
+   failing the punch-through test) and leave the picture as it is.
+   1: [*first, *end) to draw, 0: nothing, -1: unknown (the row wraps or clamps) */
+static int nv_visible(const TriCtx *c, int pt, int32_t U, int32_t dU, int32_t V, int n, int *first, int *end) {
+    const int v = V >> 16;
+    const int64_t u0 = U, u1 = (int64_t) U + (int64_t) dU * (n - 1);
+    if (v < 0 || v >= c->th || u0 < 0 || u1 < 0 || (u0 >> 16) >= c->tw || (u1 >> 16) >= c->tw)
+        return -1;
+    const int16_t *e = c->ext + 4 * v + (pt ? 2 : 0);
+    const int lo = e[0], hi = e[1];
+    if (lo > hi)
+        return 0;
+    int a = 0, b = n;
+    if (dU >= 0) {   /* index going up: first with index >= lo, then first with index > hi */
+        while (a < b) {
+            const int m = (a + b) >> 1;
+            if ((((int64_t) U + (int64_t) dU * m) >> 16) >= lo) b = m; else a = m + 1;
+        }
+        *first = a;
+        b = n;
+        while (a < b) {
+            const int m = (a + b) >> 1;
+            if ((((int64_t) U + (int64_t) dU * m) >> 16) > hi) b = m; else a = m + 1;
+        }
+    } else {         /* going down: first with index <= hi, then first with index < lo */
+        while (a < b) {
+            const int m = (a + b) >> 1;
+            if ((((int64_t) U + (int64_t) dU * m) >> 16) <= hi) b = m; else a = m + 1;
+        }
+        *first = a;
+        b = n;
+        while (a < b) {
+            const int m = (a + b) >> 1;
+            if ((((int64_t) U + (int64_t) dU * m) >> 16) < lo) b = m; else a = m + 1;
+        }
+    }
+    *end = a;
+    return *first < *end;
+}
+
 static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, int py, int xs, int xe, const float *a,
                                                                const float *ddx, const int OUT, const int TEX, const int COL) {
     const int W = port_render_w;
@@ -1058,6 +1158,30 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
         }
     }
 
+    /* translucent / punch-through span along one texture row: the 16-pixel runs at the start
+       and the pixels at the end that only show invisible texels are left out (the runs keep
+       their places, so every drawn pixel gets exactly the values it got before) */
+    const int n0 = xe - xs;
+    int px0 = xs;
+    if ((OUT == KIND_TR || OUT == KIND_PT) && TEX >= 0 && TEX != GFX_TEXENV_DECAL && !persp && dV == 0 && c->ext) {
+        int first = 0, end = n0;
+        const int vis = nv_visible(c, OUT == KIND_PT, U, dU, V, n0, &first, &end);
+        if (vis == 0)
+            return (uint32_t) n0;
+        if (vis > 0) {
+            const int skip = first >> 4;
+            xe = xs + end;
+            for (int r = 0; r < skip; r++)
+                zf += dz * 16;
+            U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) (16 * skip));
+            for (int k = 0; k < nch; k++)
+                X[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX[k] * (uint32_t) (16 * skip));
+            cp += 16 * skip;
+            zp += 16 * skip;
+            px0 = xs + 16 * skip;
+        }
+    }
+
     /* perspective: the end of one run is the start of the next (same float operations),
        so its reciprocal and texel coordinates are kept instead of recomputed */
     float pu0 = 0, pv0 = 0, pz = -1.0f;
@@ -1067,7 +1191,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     const int PSTEP = 16;
 #endif
     int prun_end = xs;
-    for (int px = xs; px < xe; px += 16) {
+    for (int px = px0; px < xe; px += 16) {
         const int len = xe - px < 16 ? xe - px : 16;
         /* depth of the run's first pixel, made and kept in NEON (zfix's result without a
            move to the integer registers) */
@@ -1134,7 +1258,10 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 }
             }
         }
-        if (px + 16 <= W) {
+        if ((OUT == KIND_TR || OUT == KIND_PT) && TEX >= 0 && TEX != GFX_TEXENV_DECAL && len == 16 &&
+            nv_invisible16(tex, OUT == KIND_PT)) {
+            /* nothing of these 16 pixels changes */
+        } else if (px + 16 <= W) {
             /* 16 pixels of the row are there (the ones past xe only get their own values back) */
             if (len > 8)
                 nv_group2(cp, zp, zi, s, X, tex, c, flatc, len, OUT, TEX, COL);
@@ -1168,7 +1295,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
         zp += len;
         zf += dz * len;
     }
-    return (uint32_t) (xe - xs);
+    return (uint32_t) n0;
 }
 
 #define NV_DEF(O, T, C) \
@@ -1222,6 +1349,7 @@ static void build_band_owners(void) {
  * pixels it covers. sort_tr picks these triangles; raster_tri switches spans by mode. */
 #define GFX_SW_SKY_FIRST 1   /* (for the bench tools) */
 static __thread int tlSkyMode;   /* 0 normal, 1 record each row's covered span, 2 draw */
+static __thread int tlTrNoDepth;  /* this translucent triangle is in front of every depth written */
 #define SKY_ROWS 1024
 static int16_t sCovLo[SKY_ROWS], sCovHi[SKY_ROWS];   /* -1 nothing, -2 more than one span */
 
@@ -1320,6 +1448,8 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     /* PVR translucent list (autosort): always depth-tested against the opaque/punch-through
        depth, whatever the poly's compare mode, and never writes depth */
     c.dtest = st->depth_test || kind == KIND_TR;
+    if (kind == KIND_TR && tlTrNoDepth)
+        c.dtest = 0;   /* in front of the whole scene: the test always passes */
     c.dwrite = st->depth_write && kind != KIND_TR;
     c.fog = st->fog;
     c.fr = (sFogColor >> 16) & 0xFF; c.fg = (sFogColor >> 8) & 0xFF; c.fb = sFogColor & 0xFF;
@@ -1346,6 +1476,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     if (flat && textured && c0 == 0xFFFFFFFFu && c.texenv != GFX_TEXENV_DECAL)
         c.texenv = GFX_TEXENV_REPLACE;
     c.persp = persp;
+    c.ext = textured && tx->margin ? tx->ext : NULL;
     /* -filtro: 3D opaque surfaces in perspective (the track: karts, trees and items are
        sprites in the other lists, the HUD has no perspective) */
     c.filt = port_opt_filter && kind == KIND_OP && persp &&
@@ -1398,7 +1529,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         int out = kind;
         if (opaque && kind == KIND_TR) {
             out = KIND_OP;
-            c.dtest = 1;
+            c.dtest = !tlTrNoDepth;
             c.dwrite = 0;
         } else if (opaque && kind == KIND_PT) {
             out = KIND_OP;
@@ -1672,8 +1803,7 @@ float gfx_pvr_get_v_scale(void) {
 
 void gfx_pvr_clear_all_textures(void) {
     for (uint32_t i = 0; i < TEX_MAX; i++) {
-        free(sTex[i].px);
-        memset(&sTex[i], 0, sizeof(sTex[i]));
+        tex_free(&sTex[i]);
     }
     sTexCount = 0;
     sBound[0] = sBound[1] = 0;
@@ -1743,8 +1873,7 @@ static uint32_t sw_new_texture(void) {
             printf("SW_TEXID_CLAMP %u\n", (unsigned) id);
         id = TEX_MAX - 1;
     }
-    free(sTex[id].px);
-    memset(&sTex[id], 0, sizeof(sTex[id]));
+    tex_free(&sTex[id]);
     return id;
 }
 
@@ -1899,6 +2028,7 @@ typedef struct {
     float key;
     uint32_t seq;
     uint16_t batch;
+    uint16_t front;   /* in front of every depth the scene writes: no depth test needed */
 } TrSort;
 
 static TrSort sTrSort[BUCKET_VERTS / 3];
@@ -1967,15 +2097,25 @@ static void sort_tr(void) {
        when all of those write depth: where one did not, the sky used to paint over it. */
     sSkyN = 0;
     int zok = sUseNeon && nt;
-    float zmin = 1e30f;
+    float zmin = 1e30f, zmax = -1e30f;
     const Bucket *ob[2] = { &sOP, &sPT };
-    for (int k = 0; k < 2 && zok; k++) {
+    for (int k = 0; k < 2; k++) {
         for (int i = 0; i < ob[k]->nbatch; i++)
             if (ob[k]->batch[i].count && !ob[k]->batch[i].st.depth_write)
                 zok = 0;
-        for (uint32_t i = 0; i < ob[k]->nverts; i++)
-            if (ob[k]->verts[i].vert.z < zmin)
-                zmin = ob[k]->verts[i].vert.z;
+        for (uint32_t i = 0; i < ob[k]->nverts; i++) {
+            const float z = ob[k]->verts[i].vert.z;
+            if (z < zmin) zmin = z;
+            if (z > zmax) zmax = z;
+        }
+    }
+    /* translucent triangles nearer than every opaque / punch-through vertex (with a margin for
+       the depth interpolation) always pass the depth test (the HUD, for one) */
+    const float zfront = zmax > -1e29f ? zmax + fabsf(zmax) * 0.01f + 1e-6f : -1e30f;
+    for (uint32_t i = 0; i < nt; i++) {
+        const dc_fast_t *v = &b->verts[sTrSort[i].seq];
+        const float z0 = v[0].vert.z, z1 = v[1].vert.z, z2 = v[2].vert.z;
+        sTrSort[i].front = sUseNeon && z0 > zfront && z1 > zfront && z2 > zfront;
     }
     if (zok && zmin > 1e-5f) {
         /* (depth saturates at z = 16: keep well below it) */
@@ -2007,8 +2147,10 @@ static void raster_tr_sorted(uint32_t from, uint32_t to) {
     Bucket *b = &sTR;
     for (uint32_t i = from; i < to; i++) {
         const dc_fast_t *v = &b->verts[sTrSort[i].seq];
+        tlTrNoDepth = sTrSort[i].front;
         raster_tri(&v[0], &v[1], &v[2], &b->batch[sTrSort[i].batch].st, KIND_TR);
     }
+    tlTrNoDepth = 0;
 }
 
 static void raster_sky(void) {
