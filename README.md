@@ -78,8 +78,9 @@ You can edit its `Arguments` line:
 
 ## Known issues
 
-- Only the USA version of the game is supported.
-- There is one controller, so the multiplayer modes can't be played.
+- Ocasionally, the second screen showing your competitors after the race finishes briefly flashes with some random rendering arctifacts.
+- On the Award Cerimony screen, The floor dispears depending on camera angle and placement.
+- Some tracks are lacking filtering on the ground textures.
 - An OnionOS screenshot (Menu+Power) pauses the game for about a second while it is saved.
 - The game's log is in `log.txt`, in `Roms/PORTS/Games/MarioKart64/` - please attach it to your reports.
 
