@@ -5,7 +5,7 @@
  *   A       -> A (accelerate / confirm)      B      -> B (brake / back)
  *   R1, R2  -> R (hop / drift)               L1, L2 -> Z (item)
  *   Y       -> C-up (camera)                 X      -> C-right
- *   START   -> START                         SELECT -> L
+ *   START   -> START                         SELECT -> L (and L1 outside races)
  *   D-pad   -> analog stick (steering ramps up while held) + D-pad bits
  *   SELECT+START or MENU held 1 s -> quit
  *   X held, then SELECT -> save a capture of the next frame (capture_NN.bin, for debugging)
@@ -20,6 +20,7 @@
 #include <macros.h>
 #include <common_structs.h>
 #include "main.h"
+#include <defines.h>
 #include "port_miyoo.h"
 
 #define N64_A      0x8000
@@ -134,7 +135,14 @@ void update_controller(s32 index) {
     u16 b = 0;
     if (held[K_A]) b |= N64_A;
     if (held[K_B]) b |= N64_B;
-    if (held[K_L1] || held[K_L2]) b |= N64_Z;
+    /* L1 is the item (Z) in a race; in the menus it is L as well, as printed on the main
+       menu ("L: OPTION"), besides SELECT */
+    if (gGamestate != RACING) {
+        if (held[K_L1]) b |= N64_L;
+        if (held[K_L2]) b |= N64_Z;
+    } else if (held[K_L1] || held[K_L2]) {
+        b |= N64_Z;
+    }
     if (held[K_R1] || held[K_R2]) b |= N64_R;
     if (held[K_Y]) b |= N64_CU;
     if (held[K_X]) b |= N64_CR;
