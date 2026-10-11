@@ -359,6 +359,10 @@ static double thread_cpu_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
+/* -perf watchdog (gfx_sw.c): where the flip thread is and how many passes it made */
+volatile int port_flip_stage;
+volatile unsigned port_flip_loops;
+
 static void *flip_proc(void *arg) {
     (void) arg;
     double t_cpu = 0;
@@ -366,6 +370,8 @@ static void *flip_proc(void *arg) {
     int frames = 0, ticks = 0, fast = 0;
     pin_cpu(1);
     for (;;) {
+        port_flip_stage = 1;   /* waiting for the lock or a frame */
+        port_flip_loops++;
         pthread_mutex_lock(&flip_mutex);
         /* not the clock: just wait for frames. Once it becomes the clock it must leave this
            wait even with no frame queued: with -paralelo the first frame is only shown after
@@ -383,6 +389,7 @@ static void *flip_proc(void *arg) {
             if (job) {
                 int back = fb_page ^ 1;
                 const double c0 = port_opt_perf ? thread_cpu_ms() : 0;
+                port_flip_stage = 2;   /* copying a frame */
                 if (hw_present(src, back))
                     convert_frame(src, port_render_w, port_render_h, (uint32_t *) (fb_mem + (size_t) back * PANEL_W * PANEL_H * 4));
                 release_snap();   /* copied: the game may queue the next frame during the vsync wait */
@@ -391,11 +398,13 @@ static void *flip_proc(void *arg) {
                 double t1 = port_now_ms();
                 t_conv += t1 - t0;
                 fb_var.yoffset = back * PANEL_H;
+                port_flip_stage = 3;   /* showing it (vsync) */
                 ioctl(fb_fd, FBIOPAN_DISPLAY, &fb_var);
                 fb_page = back;
                 t_show += port_now_ms() - t1;
             } else {
                 fb_var.yoffset = fb_page * PANEL_H;   /* same page: just wait for the vsync */
+                port_flip_stage = 4;   /* no frame: vsync */
                 ioctl(fb_fd, FBIOPAN_DISPLAY, &fb_var);
             }
         } else if (fb_pages == 1 && job) {
@@ -429,7 +438,9 @@ static void *flip_proc(void *arg) {
             }
             last_tick = now;
             ticks++;
+            port_flip_stage = 5;   /* game clock tick */
             vsync_cb();
+            port_flip_stage = 6;
         }
 
         if (port_opt_perf) {

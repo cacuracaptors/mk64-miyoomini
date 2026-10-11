@@ -17,6 +17,8 @@ extern int port_opt_filter;  /* -filtro: 3-point filter on magnified 3D opaque s
 extern int port_opt_nogfx;   /* -semgfx: frame copy by the CPU instead of the 2D engine */
 extern int port_opt_parallel; /* -paralelo: core 1 draws a frame while the game prepares the next (shown 1 frame later) */
 extern int gfx_sw_presents;   /* port/gfx_sw.c: with -paralelo it shows the frames itself */
+extern volatile int port_flip_stage, port_main_pacing;   /* -perf watchdog (port/gfx_sw.c) */
+extern volatile unsigned port_flip_loops;
 
 /* src/main.c (TARGET_MIYOO) */
 void port_audio_pump(void);

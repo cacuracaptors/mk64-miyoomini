@@ -9,6 +9,7 @@
 #include "gfx/gfx_window_manager_api.h"
 #include "port_miyoo.h"
 
+volatile int port_main_pacing;   /* -perf watchdog: waiting for the 30 fps beat */
 int force_30fps = 1;   /* 1 = vblank-locked 30 fps (set by game code per mode), 0 = uncapped */
 
 extern volatile uint64_t vblticker;
@@ -80,8 +81,10 @@ static void wm_swap_buffers_begin(void) {
 static void wm_swap_buffers_end(void) {
     if (force_30fps) {
         const uint64_t target = last_ticker + 2;
+        port_main_pacing = 1;
         while (vblticker < target)
             genwait_wait((void *) &vblticker, NULL, 100, NULL);   /* timeout: never hang on a dead clock */
+        port_main_pacing = 0;
         last_ticker = (vblticker > target) ? vblticker : target;
     }
 }

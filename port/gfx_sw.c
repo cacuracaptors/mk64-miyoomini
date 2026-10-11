@@ -250,6 +250,9 @@ static double stPhase[2][6];
 static float sCore0Share;   /* defined with the band split below */
 static double stLeadMs, stPresentMs, stWaitMs;   /* -paralelo: core 1 alone, showing the frame, core 0 waiting for core 1 */
 static int sPipe;                       /* -paralelo on (see pipe_init) */
+/* -perf watchdog: where the game thread and core 1 are when frames stop coming */
+static volatile int sMainStage, sWorkerStage;
+static volatile unsigned sFramesDone;
 
 void gfx_sw_perf_report(int frames, double ms) {
     (void) ms;
@@ -2455,7 +2458,9 @@ static void *worker_proc(void *arg) {
 
         double t0 = port_now_ms();
         tlPixels = tlTris = 0;
+        sWorkerStage = 1;
         raster_frame_band(1, 1);
+        sWorkerStage = 0;
 
         pthread_mutex_lock(&sWMutex);
         sWorkerPixels = tlPixels;
@@ -2502,7 +2507,41 @@ static void pipe_init(void) {
     gfx_sw_presents = 1;
 }
 
+/* -perf: if no frame is finished for 2 s, says where everyone is (in the log), every 2 s */
+extern volatile uint64_t vblticker;
+static void *watchdog_proc(void *arg) {
+    (void) arg;
+    unsigned last = sFramesDone, said = 0;
+    double since = port_now_ms();
+    for (;;) {
+        usleep(500000);
+        const unsigned f = sFramesDone;
+        const double now = port_now_ms();
+        if (f != last) {
+            last = f;
+            since = now;
+            continue;
+        }
+        if (now - since >= 2000.0 && said < 20) {
+            said++;
+            since = now;
+            fprintf(stderr, "vigia: nenhum quadro ha 2 s | quadros %u  jogo etapa %d%s  paralelo estado %d  pedidos %d feitos %d esperado %d  core1 %s | tela etapa %d voltas %u | vblank %llu\n",
+                    f, sMainStage, port_main_pacing ? " (esperando o ritmo de 30 fps)" : "", sPipeState, sWorkGen, sWorkDone,
+                    sPipeGen, sWorkerStage ? "desenhando" : "parado", port_flip_stage, port_flip_loops,
+                    (unsigned long long) vblticker);
+            fsync(2);
+        }
+    }
+    return NULL;
+}
+
 static void start_worker(void) {
+    if (port_opt_perf) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, watchdog_proc, NULL) == 0)
+            pthread_detach(th);
+        printf("gfx: vigia de travamento ligado (-perf)\n");
+    }
     if (pthread_create(&sWorker, NULL, worker_proc, NULL) == 0) {
         pthread_detach(sWorker);
         sWorkerOk = 1;
@@ -2576,7 +2615,9 @@ static void count_list(Bucket *b, uint32_t *ntris, int kind) {
 static void pipe_finish(int adapt) {
     const double tj = port_now_ms(), lead = tj - sPipeKickT;
     tlPixels = tlTris = 0;
+    sMainStage = 2;
     raster_frame_band(1, 0);
+    sMainStage = 3;
     const double ms0 = port_now_ms() - tj;
     stCore0Ms += ms0;
     stLeadMs += lead;
@@ -2644,16 +2685,21 @@ static void sw_end_frame(void) {
     count_list(&sTR, &stTrTris, KIND_TR);
     stTris += (uint32_t) ((sOP.nverts + sPT.nverts + sTR.nverts) / 3);
     if (sPipe) {
+        sMainStage = 1;
         /* the last frame: finished and shown (the screen gets the next colour buffer) */
         if (sPipeState == 1)
             pipe_finish(1);
         if (sPipeState == 2) {
             const double tp = port_now_ms();
+            sMainStage = 4;
             port_video_present();
             stPresentMs += port_now_ms() - tp;
             sPipeState = 0;
         }
+        sMainStage = 5;
         pipe_handover();
+        sMainStage = 0;
+        sFramesDone++;
         stRasterMs += port_now_ms() - t0;
         if (sCapF) {   /* the capture keeps the finished picture: this frame is drawn now */
             pipe_finish(0);
@@ -2663,6 +2709,7 @@ static void sw_end_frame(void) {
     }
     sort_tr();
     raster_frame();
+    sFramesDone++;
     stRasterMs += port_now_ms() - t0;
     if (sCapF)
         cap_end();
