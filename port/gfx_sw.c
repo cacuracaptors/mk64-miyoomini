@@ -368,6 +368,7 @@ typedef struct {
     int texenv, dtest, dwrite, fog, persp;
     int fr, fg, fb, bs, bd;
     int r, g, b, a;          /* flat colour (GOUR == 0) */
+    int orr, og, ob;         /* flat offset colour (NEON colour mode 5) */
     const void *nvs;         /* NvSteps of the NEON spans (per triangle) */
     int filt;                /* 3-point filter where the texture is magnified (-filtro) */
     const int16_t *ext;      /* the texture's visible extent per row (NULL: draw every texel) */
@@ -751,7 +752,7 @@ static const int kNvAttr[8] = { A_R, A_G, A_B, A_A, A_OR, A_OG, A_OB, A_F };
 
 /* the steps only depend on the triangle's gradients: built once per triangle */
 static void nv_prepare(NvSteps *s, const float *ddx, int col) {
-    const int nch = col == 0 ? 0 : (col == 1 || col == 4 ? 4 : 8);
+    const int nch = col == 0 || col == 5 ? 0 : (col == 1 || col == 4 ? 4 : 8);
     int32_t lo[4], hi[4];
     for (int k = 0; k < nch; k++) {
         int32_t d = (int32_t) (ddx[kNvAttr[k]] * 65536.0f);
@@ -821,7 +822,7 @@ static inline __attribute__((always_inline)) void nv_shade(uint8x8_t *pr, uint8x
                                                            const TriCtx *c, const uint8x8_t *flatc, const int TEX, const int COL) {
     /* vertex colour */
     uint8x8_t r, g, b, al;
-    if (COL == 0 || COL == 4) {
+    if (COL == 0 || COL == 4 || COL == 5) {
         r = flatc[0]; g = flatc[1]; b = flatc[2]; al = flatc[3];
     } else {
         r = nv_lane8(X[0], s->o0[0], s->o1[0]);
@@ -853,6 +854,10 @@ static inline __attribute__((always_inline)) void nv_shade(uint8x8_t *pr, uint8x
             r = vqadd_u8(r, nv_lane8(X[4], s->o0[4], s->o1[4]));
             g = vqadd_u8(g, nv_lane8(X[5], s->o0[5], s->o1[5]));
             b = vqadd_u8(b, nv_lane8(X[6], s->o0[6], s->o1[6]));
+        } else if (COL == 5) {
+            r = vqadd_u8(r, flatc[4]);
+            g = vqadd_u8(g, flatc[5]);
+            b = vqadd_u8(b, flatc[6]);
         }
     }
 
@@ -941,7 +946,7 @@ static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32
     if (nv_none(vorrq_u16(A.m, B.m)))
         return;   /* all 16 hidden */
     int32_t XB[8];
-    const int nch = COL == 0 ? 0 : (COL == 1 || COL == 4 ? 4 : 8);
+    const int nch = COL == 0 || COL == 5 ? 0 : (COL == 1 || COL == 4 ? 4 : 8);
     for (int k = 0; k < nch; k++)
         XB[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX8[k]);
     uint8x8_t ra, ga, ba, aa, rb, gb, bb, ab;
@@ -1303,13 +1308,17 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     const NvSteps *const s = (const NvSteps *) c->nvs;
     const int32_t dzi = s->dzi;
     int32_t X[8];
-    const int nch = COL == 0 ? 0 : (COL == 1 || COL == 4 ? 4 : 8);
+    const int nch = COL == 0 || COL == 5 ? 0 : (COL == 1 || COL == 4 ? 4 : 8);
     for (int k = 0; k < nch; k++)
         X[k] = (int32_t) (a[kNvAttr[k]] * 65536.0f);
-    uint8x8_t flatc[4];
-    if (COL == 0) {
+    uint8x8_t flatc[7];
+    if (COL == 0 || COL == 5) {
         flatc[0] = vdup_n_u8((uint8_t) c->r); flatc[1] = vdup_n_u8((uint8_t) c->g);
         flatc[2] = vdup_n_u8((uint8_t) c->b); flatc[3] = vdup_n_u8((uint8_t) c->a);
+        if (COL == 5) {
+            flatc[4] = vdup_n_u8((uint8_t) c->orr); flatc[5] = vdup_n_u8((uint8_t) c->og);
+            flatc[6] = vdup_n_u8((uint8_t) c->ob);
+        }
     } else if (COL == 4) {
         for (int k = 0; k < 4; k++)
             flatc[k] = vdup_n_u8((uint8_t) clamp8(X[k] >> 16));
@@ -1465,15 +1474,16 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     static uint32_t nv_##O##_##T##_##C(const TriCtx *c, int py, int xs, int xe, const float *a, const float *d) { \
         return nv_span(c, py, xs, xe, a, d, O, T - 1, C); \
     }
-#define NV_DEF_T(O, T) NV_DEF(O, T, 0) NV_DEF(O, T, 1) NV_DEF(O, T, 2) NV_DEF(O, T, 3) NV_DEF(O, T, 4)
+#define NV_DEF_T(O, T) NV_DEF(O, T, 0) NV_DEF(O, T, 1) NV_DEF(O, T, 2) NV_DEF(O, T, 3) NV_DEF(O, T, 4) NV_DEF(O, T, 5)
 #define NV_DEF_O(O) NV_DEF_T(O, 0) NV_DEF_T(O, 1) NV_DEF_T(O, 2) NV_DEF_T(O, 3) NV_DEF_T(O, 4) NV_DEF_T(O, 5)
 NV_DEF_O(0)
 NV_DEF_O(1)
 NV_DEF_O(2)
-#define NV_REF_T(O, T) { nv_##O##_##T##_0, nv_##O##_##T##_1, nv_##O##_##T##_2, nv_##O##_##T##_3, nv_##O##_##T##_4 }
+#define NV_REF_T(O, T) { nv_##O##_##T##_0, nv_##O##_##T##_1, nv_##O##_##T##_2, nv_##O##_##T##_3, nv_##O##_##T##_4, nv_##O##_##T##_5 }
 #define NV_REF_O(O) { NV_REF_T(O, 0), NV_REF_T(O, 1), NV_REF_T(O, 2), NV_REF_T(O, 3), NV_REF_T(O, 4), NV_REF_T(O, 5) }
-/* [list kind][texenv + 1 (0 = untextured)][colour mode] */
-static const SpanFn sNvFns[3][6][5] = { NV_REF_O(0), NV_REF_O(1), NV_REF_O(2) };
+/* [list kind][texenv + 1 (0 = untextured)][colour mode: 0 flat, 1 gouraud, 2 gouraud + offset,
+   3 the same + fog, 4 flat along each row, 5 flat colour and flat offset] */
+static const SpanFn sNvFns[3][6][6] = { NV_REF_O(0), NV_REF_O(1), NV_REF_O(2) };
 static int sUseNeon = 1;
 
 static int wrap_mode(int n, int clamp, int mirror) {
@@ -1667,6 +1677,15 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         /* colour mode: offset only matters when textured, fog only when enabled; a gouraud
            triangle whose colour does not change along x (the sky) is flat on every span */
         int col = extras ? (c.fog ? 3 : 2) : (flat ? 0 : 1);
+        /* textured, colour and offset the same on the three vertices (the smoke puffs): the
+           interpolation would give the vertex values on every pixel (zero gradients) */
+        if (col == 2 && v1->color.packed == c0 && v2->color.packed == c0 &&
+            ((v0->pad0.vertindex ^ v1->pad0.vertindex) & 0x00FFFFFFu) == 0 &&
+            ((v0->pad0.vertindex ^ v2->pad0.vertindex) & 0x00FFFFFFu) == 0) {
+            const uint32_t o = v0->pad0.vertindex;
+            col = 5;
+            c.orr = (o >> 16) & 0xFF; c.og = (o >> 8) & 0xFF; c.ob = o & 0xFF;
+        }
         if (col == 1 && (int32_t) (ddx[A_R] * 65536.0f) == 0 && (int32_t) (ddx[A_G] * 65536.0f) == 0 &&
             (int32_t) (ddx[A_B] * 65536.0f) == 0 && (int32_t) (ddx[A_A] * 65536.0f) == 0)
             col = 4;
