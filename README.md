@@ -37,7 +37,7 @@ own ROM.
 3. On OnionOS, open **Mario Kart 64** from the Ports list (use "Refresh roms" at the bottom of the list if it
    doesn't show up).
 
-The first start builds the game data from the ROM. It takes about a minute, shows a progress screen, and only
+The first start builds the game data from the ROM. It takes about five minutes, shows a progress screen, and only
 happens once: the ROM is removed at the end. It needs about 25 MB of free space on the SD card; if there isn't
 enough, the screen says how much is needed. If the ROM is not the USA version (or was modified), the screen says
 so and nothing is changed.

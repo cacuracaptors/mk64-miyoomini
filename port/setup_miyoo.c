@@ -465,7 +465,7 @@ static void run_setup(const uint8_t *recipe, size_t recipe_size, uint32_t recipe
         if (stat(de->d_name, &st) != 0 || !S_ISREG(st.st_mode) || strlen(de->d_name) >= sizeof(rom_path))
             continue;
         screen_open();
-        draw_screen("Building the game data from your ROM.", "This takes about a minute and only happens once.",
+        draw_screen("Building the game data from your ROM.", "This takes about five minutes and only happens once.",
                     COLOR_TEXT);
         work_base = work_done = 0;
         shown_percent = -1;
