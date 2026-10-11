@@ -80,6 +80,7 @@ export HOME="$FullGamePath"
 # -perf: tempos no log.txt a cada 2 s   -hires: renderiza em 640x480 (mais lento)
 # -filtro: filtro de textura no asfalto   -semparalelo: desliga o desenho em linha de montagem nos 2 nucleos
 # -resdin: baixa a resolucao (ate 448x336) so quando o quadro nao cabe em 60 fps
+# -semprofundidade: desliga a passada de profundidade antes do desenho (so para comparar)
 Arguments="-perf"
 
 cd "$GameFolder"

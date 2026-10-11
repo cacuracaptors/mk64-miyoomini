@@ -1337,6 +1337,19 @@ static int nv_visible(const TriCtx *c, int pt, int32_t U, int32_t dU, int32_t V,
     return *first < *end;
 }
 
+/* all 16 pixels of a run behind what is already drawn (the depth test fails on every one):
+   the run changes nothing, so its texels need not be fetched (water under the terrain,
+   trees behind a hill) */
+static inline __attribute__((always_inline)) int nv_hidden16(const uint32_t *zp, uint32x4_t zi, const NvSteps *s) {
+    const uint32x4_t z0 = vaddq_u32(zi, s->zo0), z1 = vaddq_u32(zi, s->zo1);
+    const uint32x4_t z2 = vaddq_u32(z0, s->dz8v), z3 = vaddq_u32(z1, s->dz8v);
+    const uint32x4_t m = vorrq_u32(vorrq_u32(vcgeq_u32(z0, vld1q_u32(zp)), vcgeq_u32(z1, vld1q_u32(zp + 4))),
+                                   vorrq_u32(vcgeq_u32(z2, vld1q_u32(zp + 8)), vcgeq_u32(z3, vld1q_u32(zp + 12))));
+    uint32x2_t h = vpmax_u32(vget_low_u32(m), vget_high_u32(m));
+    h = vpmax_u32(h, h);
+    return vget_lane_u32(h, 0) == 0;
+}
+
 /* -filtro, strongly magnified: 8 pixels in two groups of 4, blended in a straight line
    from texel colour a towards b, then from b towards c (rounded) */
 static inline __attribute__((always_inline)) void nv_lerp8(uint32_t *out, const uint32_t *a, const uint32_t *b, const uint32_t *c4) {
@@ -1437,6 +1450,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
         __builtin_prefetch(zp + 64);
         __builtin_prefetch(cp + 64);
         __builtin_prefetch(cp + 96);
+        int hidden = 0;
         if (TEX >= 0) {
             if (persp && px == prun_end) {
                 const int plen = xe - px < PSTEP ? xe - px : PSTEP;
@@ -1469,7 +1483,11 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 prun_end = px + plen;
             }
             uint32_t um, vm;
-            if (OUT == KIND_OP && c->filt && !port_opt_exact && dU > -8192 && dU < 8192 && dV > -8192 && dV < 8192) {
+            if (c->dtest && len == 16 && px + 16 <= W && nv_hidden16(zp, zi, s)) {
+                hidden = 1;   /* (the texture walk still moves on) */
+                U = (int32_t) ((uint32_t) U + (uint32_t) dU * 16u);
+                V = (int32_t) ((uint32_t) V + (uint32_t) dV * 16u);
+            } else if (OUT == KIND_OP && c->filt && !port_opt_exact && dU > -8192 && dU < 8192 && dV > -8192 && dV < 8192) {
                 /* 8 or more pixels per texel (the road right in front): the filter changes
                    slowly and linearly along the run, so it is computed exactly every 4 pixels
                    and the pixels between are blended from those (the filter worked out in
@@ -1521,8 +1539,8 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 }
             }
         }
-        if ((OUT == KIND_TR || OUT == KIND_PT) && TEX >= 0 && TEX != GFX_TEXENV_DECAL && len == 16 &&
-            nv_invisible16(tex, OUT == KIND_PT)) {
+        if (hidden || ((OUT == KIND_TR || OUT == KIND_PT) && TEX >= 0 && TEX != GFX_TEXENV_DECAL && len == 16 &&
+                       nv_invisible16(tex, OUT == KIND_PT))) {
             /* nothing of these 16 pixels changes */
         } else if (px + 16 <= W) {
             /* 16 pixels of the row are there (the ones past xe only get their own values back) */
@@ -1614,6 +1632,49 @@ static void build_band_owners(void) {
 #define GFX_SW_SKY_FIRST 1   /* (for the bench tools) */
 static __thread int tlSkyMode;   /* 0 normal, 1 record each row's covered span, 2 draw */
 static __thread int tlTrNoDepth;  /* this translucent triangle is in front of every depth written */
+
+/* ---- depth first ----
+ * Much of the opaque list is drawn and then covered (the rock walls of D.K.'s Jungle
+ * Parkway: four pixels drawn for every one left on screen). So the triangles that test
+ * and write depth and cover every pixel they touch (the opaque list, and punch-through
+ * ones with no see-through texel, like the bridge planks) first go through a pass that only
+ * keeps the nearest depth of each pixel, computed exactly as the drawing computes it; then
+ * the lists are drawn as usual. A pixel now passes its test (>=) only where its depth is
+ * the final one, so the last of the triangles at that depth wins, as before, and the
+ * picture is the same; but the 16-pixel runs that end up covered are left out before
+ * their texels are fetched. */
+static __thread int tlZOnly;
+static int sZPre;   /* this frame's opaque list allows it (see sort_tr) */
+
+static uint32_t z_span(const TriCtx *c, int py, int xs, int xe, const float *a, const float *ddx) {
+    const int W = port_render_w;
+    uint32_t *zp = port_depth + py * W + xs;
+    const NvSteps *const s = (const NvSteps *) c->nvs;
+    float zf = a[A_Z];
+    const float dz = ddx[A_Z];
+    for (int px = xs; px < xe; px += 16) {
+        const int len = xe - px < 16 ? xe - px : 16;
+        const uint32x4_t zi = vminq_u32(vcvtq_u32_f32(vdupq_n_f32(zf * ZSCALE)), vdupq_n_u32(0xFFFFFFF0u));
+        if (len == 16) {
+            const uint32x4_t z0 = vaddq_u32(zi, s->zo0), z1 = vaddq_u32(zi, s->zo1);
+            const uint32x4_t z2 = vaddq_u32(z0, s->dz8v), z3 = vaddq_u32(z1, s->dz8v);
+            vst1q_u32(zp, vmaxq_u32(z0, vld1q_u32(zp)));
+            vst1q_u32(zp + 4, vmaxq_u32(z1, vld1q_u32(zp + 4)));
+            vst1q_u32(zp + 8, vmaxq_u32(z2, vld1q_u32(zp + 8)));
+            vst1q_u32(zp + 12, vmaxq_u32(z3, vld1q_u32(zp + 12)));
+        } else {   /* (the same lanes one at a time: the pixels after the span are not ours) */
+            const uint32_t z = vgetq_lane_u32(zi, 0), d = (uint32_t) s->dzi;
+            for (int i = 0; i < len; i++) {
+                const uint32_t zk = z + (uint32_t) i * d;
+                if (zk > zp[i])
+                    zp[i] = zk;
+            }
+        }
+        zp += len;
+        zf += dz * len;
+    }
+    return 0;
+}
 #define SKY_ROWS 1024
 static int16_t sCovLo[SKY_ROWS], sCovHi[SKY_ROWS];   /* -1 nothing, -2 more than one span */
 
@@ -1787,6 +1848,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
 
     NvSteps nvs;
     c.nvs = NULL;
+    int zonly_ok = 0;   /* depth first: an opaque or punch-through triangle with no see-through pixel */
     if (nv_pending) {
         /* colour mode: offset only matters when textured, fog only when enabled; a gouraud
            triangle whose colour does not change along x (the sky) is flat on every span */
@@ -1827,6 +1889,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
             c.r = (o >> 16) & 0xFF; c.g = (o >> 8) & 0xFF; c.b = o & 0xFF;
         }
         int out = kind;
+        zonly_ok = kind == KIND_OP || (kind == KIND_PT && opaque);
         if (opaque && kind == KIND_TR) {
             out = KIND_OP;
             c.dtest = !tlTrNoDepth;
@@ -1850,6 +1913,11 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         }
         nv_prepare(&nvs, ddx, col);
         c.nvs = &nvs;
+    }
+    if (tlZOnly) {
+        if (!zonly_ok)
+            return;
+        span = z_span;
     }
 
     /* sort by y for the span walk */
@@ -1935,7 +2003,8 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         pixels += span(&c, py, xs, xe, a, ddx);
     }
     tlPixels += pixels;
-    tlTris++;
+    if (!tlZOnly)
+        tlTris++;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2479,6 +2548,15 @@ static void sort_tr(void) {
     if (!sPipe)
         prefilter_prepare();   /* (-paralelo: in pipe_handover, before the textures are copied) */
     Bucket *b = &sRenB[KIND_TR];
+    /* depth first: not when an opaque triangle writes depth without testing it (it could
+       put back a farther depth than the one the first pass found) */
+    sZPre = sUseNeon && !port_opt_nozpre;
+    for (int k = KIND_OP; k <= KIND_PT; k++)
+        for (int i = 0; i < sRenB[k].nbatch && sZPre; i++) {
+            const Batch *bt = &sRenB[k].batch[i];
+            if (bt->count && bt->st.depth_write && !bt->st.depth_test)
+                sZPre = 0;
+        }
 #ifdef HAVE_FETCH_ASM
     if (sFetchAsm < 0) {   /* first frame, before any raster thread runs */
         sFetchAsm = fetch_asm_selftest();
@@ -2619,6 +2697,18 @@ static void raster_frame_band(int mask, int val) {
         raster_sky();   /* (more rows than the coverage table: in place, as before) */
     }
     double t2 = port_now_ms();
+    if (sZPre) {   /* depth first (see z_span) */
+        tlZOnly = 1;
+        for (int k = KIND_OP; k <= KIND_PT; k++) {
+            const Bucket *b = &sRenB[k];
+            for (int i = 0; i < b->nbatch; i++) {
+                const Batch *bt = &b->batch[i];
+                if (bt->count && bt->st.depth_test && bt->st.depth_write)
+                    raster_list(&b->verts[bt->start], bt->count, &bt->st, k);
+            }
+        }
+        tlZOnly = 0;
+    }
     flush_bucket(&sRenB[KIND_OP], KIND_OP);
     double t3 = port_now_ms();
     flush_bucket(&sRenB[KIND_PT], KIND_PT);
