@@ -163,6 +163,41 @@ Acmd* synthesis_execute(Acmd* acmd, s32* writtenCmds, s16* aiBuf, s32 bufLen) {
         synthesis_load_note_subs_eu(gAudioBufferParameters.updatesPerFrame - i);
     }
 
+#ifdef TARGET_MIYOO
+    /* Miyoo: the software render loop of the N64 (the commands run in C, port/mixer_miyoo.c) */
+    aSegment(cmd++, 0, 0);
+    aiBufPtr = (u32*) aiBuf;
+    for (i = gAudioBufferParameters.updatesPerFrame; i > 0; i--) {
+        if (i == 1) {
+            chunkLen = bufLen;
+        } else {
+            if (bufLen / i >= gAudioBufferParameters.samplesPerUpdateMax) {
+                chunkLen = gAudioBufferParameters.samplesPerUpdateMax;
+            } else if (bufLen / i <= gAudioBufferParameters.samplesPerUpdateMin) {
+                chunkLen = gAudioBufferParameters.samplesPerUpdateMin;
+            } else {
+                chunkLen = gAudioBufferParameters.samplesPerUpdate;
+            }
+        }
+        for (j = 0; j < gNumSynthesisReverbs; j++) {
+            if (gSynthesisReverbs[j].useReverb != 0) {
+                prepare_reverb_ring_buffer(chunkLen, gAudioBufferParameters.updatesPerFrame - i, j);
+            }
+        }
+        cmd = synthesis_do_one_audio_update((s16*) aiBufPtr, chunkLen, cmd, gAudioBufferParameters.updatesPerFrame - i);
+        bufLen -= chunkLen;
+        aiBufPtr += chunkLen;
+    }
+
+    for (j = 0; j < gNumSynthesisReverbs; j++) {
+        if (gSynthesisReverbs[j].framesLeftToIgnore != 0) {
+            gSynthesisReverbs[j].framesLeftToIgnore--;
+        }
+        gSynthesisReverbs[j].curFrame ^= 1;
+    }
+    *writtenCmds = 0;
+    return acmd;
+#else
     /* AICA hardware mixing: drive the AICA voices from the finalized NoteSubEu
        set instead of the software DSP render loop. No command list / output
        buffer is produced. */
@@ -171,6 +206,7 @@ Acmd* synthesis_execute(Acmd* acmd, s32* writtenCmds, s16* aiBuf, s32 bufLen) {
 
     *writtenCmds = 0;
     return acmd;
+#endif
 }
 
 Acmd* synthesis_resample_and_mix_reverb(Acmd* acmd, s32 bufLen, s16 reverbIndex, s16 updateIndex) {

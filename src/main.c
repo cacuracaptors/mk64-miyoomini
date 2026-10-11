@@ -2667,6 +2667,8 @@ void _AudioInit(void) {
 }
 
 #ifdef TARGET_MIYOO
+double port_audio_ms;   /* -perf: time spent mixing the sound */
+extern double port_now_ms(void);
 /* Called from the game thread once per frame: run one audio frame per elapsed vblank
    (the DC did this on SPINNING_THREAD; doing it here avoids data races with game code). */
 void port_audio_pump(void) {
@@ -2676,7 +2678,11 @@ void port_audio_pump(void) {
         last_vbltick = now - 1;
     while (last_vbltick < now) {
         last_vbltick++;
+        const double t0 = port_now_ms();
         create_next_audio_buffer(audio_buffer, SAMPLES_HIGH);
+        port_audio_ms += port_now_ms() - t0;
+        if (audio_api)
+            audio_api->play((u8 *) audio_buffer, SAMPLES_HIGH * 2 * 2);
     }
 }
 #endif

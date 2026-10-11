@@ -67,8 +67,10 @@ static void wm_swap_buffers_begin(void) {
             perf_last = now;
         else if (now - perf_last >= 2000.0) {
             gfx_sw_perf_report(perf_frames, now - perf_last);
-            fprintf(stderr, "perf main: %.1f fps  wait-for-flip %.2f ms/frame\n",
-                    perf_frames * 1000.0 / (now - perf_last), perf_work / perf_frames);
+            extern double port_audio_ms;
+            fprintf(stderr, "perf main: %.1f fps  wait-for-flip %.2f ms/frame  som %.2f ms/frame\n",
+                    perf_frames * 1000.0 / (now - perf_last), perf_work / perf_frames, port_audio_ms / perf_frames);
+            port_audio_ms = 0;
             perf_frames = 0;
             perf_work = 0;
             perf_last = now;
