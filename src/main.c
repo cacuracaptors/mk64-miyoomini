@@ -1941,8 +1941,11 @@ void race_logic_loop(void) {
                 force_30fps = 0;
                 gTickSpeed = sNumVBlanks < 1 ? 1 : (sNumVBlanks > 4 ? 4 : sNumVBlanks);
             } else {
+                /* capped at 30 fps: 2 ticks per frame as on the N64, more when a frame took
+                   longer (as the split-screen modes below), so a slow frame does not slow
+                   the race down */
                 force_30fps = 1;
-                gTickSpeed = 2;
+                gTickSpeed = (sNumVBlanks < 2) ? 2 : ((sNumVBlanks > 4) ? 4 : sNumVBlanks);
             }
 #else
             force_30fps = 1;//(gPlayerCountSelection1 == 1) ? 0 : 1;
