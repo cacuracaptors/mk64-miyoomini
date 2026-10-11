@@ -150,30 +150,41 @@ static uint32_t match_len(const uint8_t *t, uint32_t i, uint32_t n, int v, uint3
 }
 
 /* ---- the recipe of one file ---- */
-typedef struct { uint8_t kind; uint32_t a, len; } Op;   /* kind 0 literal (a = offset in the file), 1..3 copy */
-typedef struct { Op *ops; uint32_t n, cap; uint32_t lit; } Plan;
+struct Plan;
+typedef struct {
+    uint8_t kind;          /* 0 literal, 1..3 copy (view + 1), 4 MIO0 of sub, 5 run of one byte */
+    uint32_t a, len;       /* copy: pool offset, length; MIO0: raw length, stream length */
+    const uint8_t *lit;    /* literal bytes */
+    struct Plan *sub;      /* MIO0: the ops making the raw data */
+} Op;
+typedef struct Plan { Op *ops; uint32_t n, cap; uint64_t lit; } Plan;
 
-static void add_op(Plan *pl, uint8_t kind, uint32_t a, uint32_t len) {
+static void add_op(Plan *pl, Op op) {
     if (pl->n) {
         Op *o = &pl->ops[pl->n - 1];
-        if (kind == 0 && o->kind == 0 && o->a + o->len == a) { o->len += len; pl->lit += len; return; }
-        if (kind && o->kind == kind && o->a + o->len == a) { o->len += len; return; }
+        if (op.kind == 0 && o->kind == 0 && o->lit + o->len == op.lit) { o->len += op.len; pl->lit += op.len; return; }
+        if (op.kind >= 1 && op.kind <= 3 && o->kind == op.kind && o->a + o->len == op.a) { o->len += op.len; return; }
     }
     if (pl->n == pl->cap) {
         pl->cap = pl->cap ? pl->cap * 2 : 1024;
         pl->ops = realloc(pl->ops, pl->cap * sizeof(Op));
     }
-    pl->ops[pl->n++] = (Op) { kind, a, len };
-    if (kind == 0)
-        pl->lit += len;
+    pl->ops[pl->n++] = op;
+    if (op.kind == 0)
+        pl->lit += op.len;
+    if (op.kind == 4)
+        pl->lit += op.sub->lit;
 }
 
-static Plan plan_file(const uint8_t *t, uint32_t n) {
-    Plan pl = { 0 };
+static void lit_op(Plan *pl, const uint8_t *p, uint32_t len) { add_op(pl, (Op) { 0, 0, len, p, NULL }); }
+static void copy_op(Plan *pl, int v, uint32_t at, uint32_t len) { add_op(pl, (Op) { (uint8_t) (v + 1), at, len, NULL, NULL }); }
+
+/* t[0..n) from the pool, as long copies as possible; what is not found is literal */
+static void plan_plain(Plan *pl, const uint8_t *t, uint32_t n) {
     uint32_t i = 0, lit_start = 0, lit_len = 0;
-    int have_cur = 0, cur_v = 0;
+    int have_cur = 0;
     uint32_t cur_p = 0;
-#define FLUSH_LIT() do { if (lit_len) add_op(&pl, 0, lit_start, lit_len); lit_len = 0; } while (0)
+#define FLUSH_LIT() do { if (lit_len) lit_op(pl, t + lit_start, lit_len); lit_len = 0; } while (0)
     while (i < n) {
         /* 1. carry on from where the last copy ended (in any view) */
         uint32_t lc = 0;
@@ -204,33 +215,32 @@ static Plan plan_file(const uint8_t *t, uint32_t n) {
         if (lh < WIN && lc < 4 && i + WIN8 <= n) {
             const uint32_t h = hash8(t + i);
             uint32_t best = 0, bp = 0;
-            int bv = 0, tries = 0;
+            int tries = 0;
             for (uint32_t e = head8[h]; e && tries < 48; e = nxt8[e - 1], tries++) {
                 const int v = (int) (ent8[e - 1] >> 30);
                 const uint32_t p = ent8[e - 1] & 0x3FFFFFFFu;
                 if (match_len(t, i, n, v, p) < WIN8)
                     continue;
                 const uint32_t sc = follow_score(t, i, n, p);
-                if (sc > best) { best = sc; bp = p; bv = v; }
+                if (sc > best) { best = sc; bp = p; }
             }
-            if (best >= 48) {   /* a place that keeps reproducing the data: carry on from it */
+            if (best >= 48 && !(have_cur && bp == cur_p)) {   /* a place that keeps reproducing the data */
                 have_cur = 1;
                 cur_p = bp;
-                (void) bv;
                 continue;
             }
         }
         if (lh >= WIN && lh + back > lc) {
             lit_len -= back;
             FLUSH_LIT();
-            add_op(&pl, (uint8_t) (vh + 1), ph - back, lh + back);
+            copy_op(pl, vh, ph - back, lh + back);
             i += lh;
-            have_cur = 1; cur_v = vh; cur_p = ph + lh;
+            have_cur = 1; cur_p = ph + lh;
         } else if (lc) {
             FLUSH_LIT();
-            add_op(&pl, (uint8_t) (vc + 1), cur_p, lc);
+            copy_op(pl, vc, cur_p, lc);
             i += lc;
-            cur_v = vc; cur_p += lc;
+            cur_p += lc;
         } else {
             if (!lit_len) lit_start = i;
             lit_len++;
@@ -239,11 +249,118 @@ static Plan plan_file(const uint8_t *t, uint32_t n) {
         }
     }
     FLUSH_LIT();
-    (void) cur_v;
+#undef FLUSH_LIT
+}
+
+/* the same, but a MIO0 block that the build's compressor makes from data found in the
+   pool is kept as "compress these ops": the compressed bytes themselves are not stored */
+static uint32_t n_mio0, n_mio0_bytes;
+static Plan plan_file(const uint8_t *t, uint32_t n) {
+    Plan pl = { 0 };
+    uint32_t seg = 0;
+    for (uint32_t off = 0; off + 16 <= n; off += 4) {
+        if (memcmp(t + off, "MIO0", 4))
+            continue;
+        uint8_t *raw = NULL;
+        uint32_t rawlen = 0;
+        const uint32_t slen = rk_mio0_decode(t + off, n - off, &raw, &rawlen);
+        if (!slen || off + slen > n) { free(raw); continue; }
+        uint8_t *enc = malloc((size_t) rawlen * 2 + 64);
+        const uint32_t elen = rk_mio0_encode(raw, rawlen, enc);
+        const int same = elen == slen && !memcmp(enc, t + off, slen);
+        free(enc);
+        if (!same) { free(raw); continue; }
+        if (off > seg)
+            plan_plain(&pl, t + seg, off - seg);
+        Plan *sub = calloc(1, sizeof(Plan));
+        plan_plain(sub, raw, rawlen);   /* (raw stays allocated: the literal ops point into it) */
+        add_op(&pl, (Op) { 4, rawlen, slen, NULL, sub });
+        n_mio0++;
+        n_mio0_bytes += slen;
+        seg = off + slen;
+        off = ((seg + 3) & ~3u) - 4;
+    }
+    if (n > seg)
+        plan_plain(&pl, t + seg, n - seg);
     return pl;
 }
 
 static void put32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
+
+/* literal bytes written as runs where one value repeats (fill, padding) */
+static uint64_t fill_bytes;
+static void write_literal(FILE *f, const uint8_t *p, uint32_t len, uint32_t *nops) {
+    uint32_t i = 0, start = 0;
+    while (i < len) {
+        uint32_t r = 1;
+        while (i + r < len && p[i + r] == p[i]) r++;
+        if (r >= 16) {
+            if (i > start) { fputc(0, f); put32(f, i - start); fwrite(p + start, 1, i - start, f); (*nops)++; }
+            fputc(5, f); fputc(p[i], f); put32(f, r); (*nops)++;
+            fill_bytes += r;
+            i += r;
+            start = i;
+        } else {
+            i += r;
+        }
+    }
+    if (len > start) { fputc(0, f); put32(f, len - start); fwrite(p + start, 1, len - start, f); (*nops)++; }
+}
+
+/* writes the ops (the count first, fixed up afterwards); returns the op count */
+static uint32_t write_plan(FILE *f, const Plan *pl) {
+    const long at = ftell(f);
+    put32(f, 0);
+    uint32_t nops = 0;
+    for (uint32_t k = 0; k < pl->n; k++) {
+        const Op *o = &pl->ops[k];
+        if (o->kind == 0) {
+            write_literal(f, o->lit, o->len, &nops);
+        } else if (o->kind == 4) {
+            fputc(4, f);
+            put32(f, o->a);
+            write_plan(f, o->sub);
+            nops++;
+        } else {
+            fputc(o->kind, f);
+            put32(f, o->a);
+            put32(f, o->len);
+            nops++;
+        }
+    }
+    const long end = ftell(f);
+    fseek(f, at, SEEK_SET);
+    put32(f, nops);
+    fseek(f, end, SEEK_SET);
+    return nops;
+}
+
+/* the largest literal pieces (not runs of one value), to see what they are */
+static void show_literals(const Plan *pl, const uint8_t *base) {
+    for (int shown = 0; shown < 3; shown++) {
+        const Op *best = NULL;
+        for (uint32_t k = 0; k < pl->n; k++) {
+            const Op *o = &pl->ops[k];
+            if (o->kind != 0 || o->len < 256)
+                continue;
+            int run = 1;
+            for (uint32_t q = 1; q < o->len && run; q++) run = o->lit[q] == o->lit[0];
+            if (run || (best && o->len <= best->len))
+                continue;
+            best = o;
+        }
+        if (!best)
+            break;
+        printf("      proprio: %u bytes%s:", best->len, base && best->lit >= base ? "" : " (dentro de um bloco MIO0)");
+        if (base && best->lit >= base) printf(" posicao 0x%x:", (unsigned) (best->lit - base));
+        for (uint32_t q = 0; q < 16 && q < best->len; q++)
+            printf(" %02x", best->lit[q]);
+        printf("\n");
+        ((Op *) best)->kind = 6;   /* (shown: the next pass takes the next largest) */
+    }
+    for (uint32_t k = 0; k < pl->n; k++)
+        if (pl->ops[k].kind == 6) pl->ops[k].kind = 0;
+}
 
 static int cmd_make(int argc, char **argv) {
     if (!load_rom(argv[2]))
@@ -257,7 +374,7 @@ static int cmd_make(int argc, char **argv) {
     put32(out, rk_crc32(0, rom, rom_size));
     put32(out, pool_size);
     put32(out, (uint32_t) nf);
-    uint64_t all = 0, all_lit = 0;
+    uint64_t all = 0, all_lit = 0, all_fill = 0;
     for (int a = 4; a < argc; a++) {
         char name[64] = { 0 };
         const char *eq = strchr(argv[a], '=');
@@ -266,46 +383,26 @@ static int cmd_make(int argc, char **argv) {
         size_t n;
         uint8_t *t = read_file(eq + 1, &n);
         if (!t) { fprintf(stderr, "nao li %s\n", eq + 1); return 1; }
+        n_mio0 = n_mio0_bytes = 0;
         Plan pl = plan_file(t, (uint32_t) n);
         fwrite(name, 64, 1, out);
         put32(out, (uint32_t) n);
         put32(out, rk_crc32(0, t, n));
-        put32(out, pl.n);
-        for (uint32_t k = 0; k < pl.n; k++) {
-            const Op *o = &pl.ops[k];
-            fputc(o->kind, out);
-            if (o->kind == 0) {
-                put32(out, o->len);
-                fwrite(t + o->a, 1, o->len, out);
-            } else {
-                put32(out, o->a);
-                put32(out, o->len);
-            }
-        }
-        printf("%-34s %9zu bytes  da ROM %6.2f%%  proprios %8u bytes  (%u trechos)\n", name, n,
-               n ? 100.0 * (double) (n - pl.lit) / (double) n : 100.0, pl.lit, pl.n);
-        /* the largest pieces not found in the ROM, to see what they are */
-        for (int shown = 0; shown < 3; shown++) {
-            uint32_t best = 0, bl = 0;
-            for (uint32_t k = 0; k < pl.n; k++)
-                if (pl.ops[k].kind == 0 && pl.ops[k].len > bl) { bl = pl.ops[k].len; best = k; }
-            if (bl < 256)
-                break;
-            printf("      proprio: %u bytes na posicao 0x%x:", bl, pl.ops[best].a);
-            for (uint32_t q = 0; q < 16 && q < bl; q++)
-                printf(" %02x", t[pl.ops[best].a + q]);
-            printf("\n");
-            pl.ops[best].len = 0;
-        }
+        const uint64_t f0 = fill_bytes;
+        write_plan(out, &pl);
+        const uint64_t fills = fill_bytes - f0, own = pl.lit - fills;
+        printf("%-36s %9zu bytes  da ROM %6.2f%%  proprios %7llu  (+ %llu de preenchimento)%s\n", name, n,
+               n ? 100.0 * (double) (n - pl.lit) / (double) n : 100.0, (unsigned long long) own,
+               (unsigned long long) fills, n_mio0 ? "  [MIO0 recomprimido]" : "");
+        show_literals(&pl, t);
         all += n;
-        all_lit += pl.lit;
-        free(pl.ops);
-        free(t);
+        all_lit += own;
+        all_fill += fills;
     }
     long rsize = ftell(out);
     fclose(out);
-    printf("TOTAL %llu bytes, da ROM %.2f%%, proprios %llu bytes; receita %ld bytes\n", (unsigned long long) all,
-           all ? 100.0 * (double) (all - all_lit) / (double) all : 100.0, (unsigned long long) all_lit, rsize);
+    printf("TOTAL %llu bytes: proprios %llu, preenchimento %llu; receita %ld bytes\n", (unsigned long long) all,
+           (unsigned long long) all_lit, (unsigned long long) all_fill, rsize);
     return 0;
 }
 
@@ -316,6 +413,45 @@ static void mkdirs(const char *path) {
     snprintf(tmp, sizeof tmp, "%s", path);
     for (char *s = tmp + 1; *s; s++)
         if (*s == '/') { *s = 0; mkdir(tmp, 0777); *s = '/'; }
+}
+
+/* runs n ops from *pp into o (room for cap bytes); returns the bytes produced, or -1 */
+static long run_ops(const uint8_t **pp, uint32_t nops, uint8_t *o, uint32_t cap) {
+    const uint8_t *p = *pp;
+    uint32_t at = 0;
+    for (uint32_t k = 0; k < nops; k++) {
+        const uint8_t kind = *p++;
+        if (kind == 0) {
+            const uint32_t len = get32(&p);
+            if (at + len > cap) return -1;
+            memcpy(o + at, p, len); p += len; at += len;
+        } else if (kind <= 3) {
+            const uint32_t src = get32(&p), len = get32(&p);
+            if (at + len > cap || src + len > pool_size) return -1;
+            for (uint32_t q = 0; q < len; q++) o[at + q] = rk_view(pool, src + q, kind - 1);
+            at += len;
+        } else if (kind == 4) {
+            const uint32_t rawlen = get32(&p), sub = get32(&p);
+            uint8_t *raw = malloc(rawlen ? rawlen : 1), *enc = malloc((size_t) rawlen * 2 + 64);
+            if (run_ops(&p, sub, raw, rawlen) != (long) rawlen) return -1;
+            const uint32_t elen = rk_mio0_encode(raw, rawlen, enc);
+            if (at + elen > cap) return -1;
+            memcpy(o + at, enc, elen);
+            at += elen;
+            free(raw);
+            free(enc);
+        } else if (kind == 5) {
+            const uint8_t v = *p++;
+            const uint32_t len = get32(&p);
+            if (at + len > cap) return -1;
+            memset(o + at, v, len);
+            at += len;
+        } else {
+            return -1;
+        }
+    }
+    *pp = p;
+    return (long) at;
 }
 
 static int cmd_apply(char **argv) {
@@ -336,27 +472,17 @@ static int cmd_apply(char **argv) {
         memcpy(name, p, 64); p += 64;
         const uint32_t size = get32(&p), crc = get32(&p), nops = get32(&p);
         uint8_t *o = malloc(size ? size : 1);
-        uint32_t at = 0;
-        for (uint32_t k = 0; k < nops; k++) {
-            const uint8_t kind = *p++;
-            if (kind == 0) {
-                const uint32_t len = get32(&p);
-                memcpy(o + at, p, len); p += len; at += len;
-            } else {
-                const uint32_t src = get32(&p), len = get32(&p);
-                for (uint32_t q = 0; q < len; q++) o[at + q] = rk_view(pool, src + q, kind - 1);
-                at += len;
-            }
-        }
-        const int ok = at == size && rk_crc32(0, o, size) == crc;
+        const long got = run_ops(&p, nops, o, size);
+        const int ok = got == (long) size && rk_crc32(0, o, size) == crc;
         char path[512];
         snprintf(path, sizeof path, "%s/%s", argv[4], name);
         mkdirs(path);
         FILE *w = fopen(path, "wb");
         if (w) { fwrite(o, 1, size, w); fclose(w); }
-        printf("%-34s %s\n", name, ok ? "ok" : "ERRADO");
+        printf("%-36s %s\n", name, ok ? "ok" : "ERRADO");
         bad |= !ok;
         free(o);
+        if (got < 0) break;
     }
     return bad;
 }
@@ -375,7 +501,7 @@ static int cmd_scan(char **argv) {
         memcpy(name, p, nl < 255 ? nl : 255); p += nl;
         const uint32_t size = get32(&p);
         Plan pl = plan_file(p, size);
-        const uint32_t from_rom = size - pl.lit;
+        const uint32_t from_rom = size - (uint32_t) pl.lit;
         if (from_rom >= 512 && from_rom * 4 >= size) {
             printf("%9u bytes, %6.2f%% da ROM: %s\n", size, 100.0 * from_rom / size, name);
             total_rom += from_rom;

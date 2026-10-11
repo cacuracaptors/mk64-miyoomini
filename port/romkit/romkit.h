@@ -17,8 +17,10 @@
  * Recipe file (little-endian):
  *   "MK64RCP1", u32 rom_size, u32 rom_crc (of the .z64 bytes), u32 pool_size,
  *   u32 file count; per file: char name[64], u32 size, u32 crc, u32 op count,
- *   ops: u8 0 + u32 len + bytes (literal), or u8 1..3 + u32 pool offset + u32
- *   len (copy through view 0 = as is, 1 = 2-byte swap, 2 = 4-byte swap).
+ *   ops: u8 0 + u32 len + bytes (literal); u8 1..3 + u32 pool offset + u32 len
+ *   (copy through view 0 = as is, 1 = 2-byte swap, 2 = 4-byte swap); u8 4 + u32
+ *   raw length + u32 op count + those ops (the MIO0 compression, by the build's own
+ *   compressor, of what they produce); u8 5 + u8 value + u32 len (a run of one byte).
  */
 #ifndef ROMKIT_H
 #define ROMKIT_H
@@ -36,6 +38,11 @@ int rk_normalize_rom(uint8_t *rom, size_t size);
 /* the pool for a ROM already in .z64 order (malloc'ed; *size set); NULL on failure.
    progress (optional) gets 0..1000 */
 uint8_t *rk_build_pool(const uint8_t *rom, size_t rom_size, size_t *size, void (*progress)(int));
+
+/* the build's MIO0 compressor (out: at least 2 * length + 64 bytes); returns the size */
+uint32_t rk_mio0_encode(const uint8_t *in, uint32_t length, uint8_t *out);
+/* the MIO0 stream at in: its decompressed bytes (malloc'ed) and the stream's length, 0 if none */
+uint32_t rk_mio0_decode(const uint8_t *in, size_t avail, uint8_t **out, uint32_t *raw_len);
 
 static inline uint8_t rk_view(const uint8_t *pool, uint32_t p, int view) {
     static const uint32_t mask[3] = { 0, 1, 3 };
