@@ -396,8 +396,17 @@ static inline int clamp8(int v) {
 
 /* keeps a texel coordinate (in texels) in a range where 16.16 fixed point can't overflow */
 static inline float tc_fold(float u, int n, int mode) {
-    if (mode == WR_CLAMP)
-        return u < -64.0f ? -64.0f : (u > (float) n + 64.0f ? (float) n + 64.0f : u);
+    if (mode == WR_CLAMP) {
+        /* already in range, decided on the float's bits (each float compare makes the
+           Cortex-A7 wait for the VFP flags): -64 <= u <= n + 64 gives u back */
+        const float hi = (float) n + 64.0f;
+        uint32_t b, hb;
+        memcpy(&b, &u, 4);
+        memcpy(&hb, &hi, 4);
+        if ((b & 0x80000000u) ? (b & 0x7FFFFFFFu) <= 0x42800000u : b <= hb)
+            return u;
+        return u < -64.0f ? -64.0f : (u > hi ? hi : u);
+    }
     float period = (mode == WR_MIRROR2 || mode == WR_MIRRORN) ? 2.0f * n : (float) n;
     if (mode == WR_REPEAT2 || mode == WR_MIRROR2) {
         /* pow2 wrap only looks at the low bits: no folding needed while |u| < 16384
@@ -1387,7 +1396,10 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
             if (persp && px == prun_end) {
                 const int plen = xe - px < PSTEP ? xe - px : PSTEP;
                 float u0, v0;
-                if (pz == zf) {
+                uint32_t pzb, zfb;   /* same bits: the same float, known without a VFP compare */
+                memcpy(&pzb, &pz, 4);
+                memcpy(&zfb, &zf, 4);
+                if (pzb == zfb || pz == zf) {
                     u0 = pu0; v0 = pv0;
                 } else {
                     float iz0 = 1.0f / zf;
