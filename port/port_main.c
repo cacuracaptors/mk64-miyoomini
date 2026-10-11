@@ -8,6 +8,8 @@
  *   -timer   game clock from a 60 Hz timer instead of the panel's vsync (comparison)
  *   -filtro  N64-style 3-point texture filter on magnified 3D opaque surfaces (the road)
  *   -semgfx  copy frames to the screen with the CPU instead of the 2D engine (MI_GFX)
+ *   -semparalelo  draw each frame start to end before the next one (the default draws a
+ *            frame on core 1 while the game prepares the next, shown one frame later)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +25,7 @@
 int port_opt_perf = 0;
 int port_opt_60fps = 0;
 int port_opt_filter = 0;
-int port_opt_parallel = 0;
+int port_opt_parallel = 1;   /* -semparalelo turns it off */
 static int opt_timer = 0;   /* -timer: old free-running 60 Hz clock, for comparison */
 
 double port_now_ms(void) {
@@ -77,7 +79,9 @@ void port_init(int argc, char **argv) {
         else if (!strcmp(argv[i], "-semgfx"))
             port_opt_nogfx = 1;
         else if (!strcmp(argv[i], "-paralelo"))
-            port_opt_parallel = 1;
+            port_opt_parallel = 1;   /* (the default; kept so old shortcuts still work) */
+        else if (!strcmp(argv[i], "-semparalelo"))
+            port_opt_parallel = 0;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);
