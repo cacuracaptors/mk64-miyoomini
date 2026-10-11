@@ -87,7 +87,6 @@ NE_STATIC int32_t vget_lane_s32(int32x2_t a, int n) { return a.v[n]; }
 NE_STATIC uint32x4_t vmaxq_u32(uint32x4_t a, uint32x4_t b) { for (int i = 0; i < 4; i++) a.v[i] = a.v[i] > b.v[i] ? a.v[i] : b.v[i]; return a; }
 NE_STATIC uint32x2_t vpmax_u32(uint32x2_t a, uint32x2_t b) { uint32x2_t r; r.v[0] = a.v[0] > a.v[1] ? a.v[0] : a.v[1]; r.v[1] = b.v[0] > b.v[1] ? b.v[0] : b.v[1]; return r; }
 NE_STATIC uint32_t vget_lane_u32(uint32x2_t a, int n) { return a.v[n]; }
-NE_STATIC uint32_t vgetq_lane_u32(uint32x4_t a, int n) { return a.v[n]; }
 NE_STATIC float32x4_t vfmaq_f32(float32x4_t a, float32x4_t b, float32x4_t c) { for (int i = 0; i < 4; i++) a.v[i] = fmaf(b.v[i], c.v[i], a.v[i]); return a; }
 NE_STATIC void vst1q_f32(float *p, float32x4_t a) { memcpy(p, a.v, 16); }
 NE_STATIC float32x4_t vld1q_f32(const float *p) { float32x4_t r; memcpy(r.v, p, 16); return r; }
@@ -108,7 +107,6 @@ NE_STATIC int16x8_t vmaxq_s16(int16x8_t a, int16x8_t b) { for (int i = 0; i < 8;
 NE_STATIC uint16x8_t vcgtq_s16(int16x8_t a, int16x8_t b) { uint16x8_t r; for (int i = 0; i < 8; i++) r.v[i] = a.v[i] > b.v[i] ? 0xFFFF : 0; return r; }
 NE_STATIC uint16x8_t vmulq_n_u16(uint16x8_t a, uint16_t b) { for (int i = 0; i < 8; i++) a.v[i] = (uint16_t) (a.v[i] * b); return a; }
 NE_STATIC uint16x8_t vorrq_u16(uint16x8_t a, uint16x8_t b) { for (int i = 0; i < 8; i++) a.v[i] |= b.v[i]; return a; }
-NE_STATIC uint32x4_t vorrq_u32(uint32x4_t a, uint32x4_t b) { uint32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] | b.v[i]; return r; }
 NE_STATIC uint32x4_t vcgeq_u32(uint32x4_t a, uint32x4_t b) { uint32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] >= b.v[i] ? 0xFFFFFFFFu : 0; return r; }
 NE_STATIC uint32x4_t vbslq_u32(uint32x4_t m, uint32x4_t a, uint32x4_t b) { uint32x4_t r; for (int i = 0; i < 4; i++) r.v[i] = (m.v[i] & a.v[i]) | (~m.v[i] & b.v[i]); return r; }
 NE_STATIC uint16x4_t vmovn_u32(uint32x4_t a) { uint16x4_t r; for (int i = 0; i < 4; i++) r.v[i] = (uint16_t) a.v[i]; return r; }

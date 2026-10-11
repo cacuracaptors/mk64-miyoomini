@@ -32,7 +32,6 @@ int port_opt_filter = 0;
 int port_opt_parallel = 1;   /* -semparalelo turns it off */
 int port_opt_resdin = 0;     /* -resdin: smaller frames while the drawing does not keep up */
 int port_opt_exact = 0;      /* -exato: no drawing shortcuts that change the picture slightly */
-int port_opt_nozpre = 0;     /* -semprofundidade: no depth-first pass (measurement) */
 static int opt_timer = 0;   /* -timer: old free-running 60 Hz clock, for comparison */
 
 double port_now_ms(void) {
@@ -93,8 +92,6 @@ void port_init(int argc, char **argv) {
             port_opt_exact = 1;
         else if (!strcmp(argv[i], "-resdin"))
             port_opt_resdin = 1;
-        else if (!strcmp(argv[i], "-semprofundidade"))
-            port_opt_nozpre = 1;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);
