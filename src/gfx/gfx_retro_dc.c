@@ -63,6 +63,9 @@ void* segmented_to_virtual(void* addr);
 // custom DL words emitted at each pane's start by set_the_scissor (skybox_and_splitscreen.c).
 #define PANE_ZBIAS 64.0f
 static float pane_zbias = 0.0f;
+#ifdef TARGET_MIYOO
+void gfx_sw_set_pane(int on);   // port/gfx_sw.c: the pane's depths are lifted there instead
+#endif
 
 // Set when a G_MTX_PROJECTION load is an ORTHO matrix (guOrtho: [3][3]==1; guPerspective:
 // [3][3]==0). Ortho geometry is "2D drawn as triangles" (constant _w), so on the PVR
@@ -3748,9 +3751,17 @@ static void  __attribute__((noinline)) GFX_HOT gfx_run_dl(Gfx* cmd) {
 			} else if (cmd->words.w1 == 0xA6A7A8A9) {
 				fix_flash ^= 1;
 			} else if (cmd->words.w1 == 0x50414E31) {
+#ifdef TARGET_MIYOO
+				gfx_sw_set_pane(1);        // (software renderer: fixed-point depth, see gfx_sw.c)
+#else
 				pane_zbias = PANE_ZBIAS;   // "PAN1": winner-pane depth bias ON
+#endif
 			} else if (cmd->words.w1 == 0x50414E30) {
+#ifdef TARGET_MIYOO
+				gfx_sw_set_pane(0);
+#else
 				pane_zbias = 0.0f;         // "PAN0": OFF (every other pane)
+#endif
 			}
 			++cmd;
 			continue;
@@ -4042,6 +4053,9 @@ void gfx_start_frame(void) {
 void gfx_run(Gfx* commands) {
 	gfx_sp_reset();
 	pane_zbias = 0.0f;   // per-frame safety: a pane's PAN1 must never leak across frames
+#ifdef TARGET_MIYOO
+	gfx_sw_set_pane(0);
+#endif
 
 	// DC 4P perf: pulled-in far plane. Depth-tested tris with ALL THREE verts beyond
 	// gCourseFarPersp * scale are dropped before clip/bake (see gfx_sp_tri1_impl).

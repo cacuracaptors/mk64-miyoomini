@@ -173,6 +173,7 @@ typedef struct {
     uint8_t blend_src, blend_dst;
     uint8_t clampu, clampv, mirru, mirrv;
     uint8_t filter;        /* bilinear requested: sampled at the nearest texel centre */
+    uint8_t pane;          /* the winner's pane growing over the others (see gfx_sw_set_pane) */
 } RState;
 
 static uint8_t sDepthTest = 1, sDepthWrite = 1, sFog = 0, sTexEnv = GFX_TEXENV_MODULATE;
@@ -224,6 +225,23 @@ static void mark_dirty(void) {
     gfx_pvr_op_dirty = 1;
 }
 
+/* Battle/VS end and the end of a race: the winner's pane grows over the others. All panes
+   share one depth buffer, so the DC front-end added 64 to every depth that pane emits
+   (fine for the PVR's float depth); here depth is fixed point and saturates at 16, which
+   made that pane's depths all equal and its textures lose their perspective. Instead the
+   front-end leaves the depths alone and says which triangles belong to that pane: their
+   fixed-point depth gets 2^30 added (every other depth stays below 2^29), so the pane is
+   in front of everything else and keeps its own depth order. */
+static uint8_t sPane;
+void gfx_sw_set_pane(int on) {
+    on = on ? 1 : 0;
+    if (sPane != on) {
+        sPane = (uint8_t) on;
+        mark_dirty();
+    }
+}
+#define PANE_ZOFF 0x40000000u
+
 static void current_state(RState *s) {
     uint32_t t = sBound[0];
     int textured = cur_shader && cur_shader->texture_used[0] && t && t < TEX_MAX && sTex[t].px;
@@ -234,6 +252,7 @@ static void current_state(RState *s) {
     s->fog = sFog;
     s->blend_src = sBlendSrc;
     s->blend_dst = sBlendDst;
+    s->pane = sPane;
     if (textured) {
         s->clampu = sTex[t].clampu;
         s->filter = sTex[t].filter;
@@ -395,6 +414,7 @@ typedef struct {
     float ftw, fth;
     float bias;              /* -0.5 texel for filtered textures (see raster_tri) */
     int texenv, dtest, dwrite, fog, persp;
+    uint32_t zoff;   /* added to every fixed-point depth (the winner's pane) */
     int fr, fg, fb, bs, bd;
     int r, g, b, a;          /* flat colour (GOUR == 0) */
     int orr, og, ob;         /* flat offset colour (NEON colour mode 5) */
@@ -617,7 +637,7 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
     if (TEX == 0) {
         for (int px = xs; px < xe; px += 16) {
             int len = xe - px < 16 ? xe - px : 16;
-            uint32_t zi = zfix(zf);
+            uint32_t zi = zfix(zf) + c->zoff;
             for (int n = len; n > 0; n--, cp++, zp++) {
                 if (!dtest || zi >= *zp) {
                     PX_COLOUR();
@@ -649,7 +669,7 @@ static inline __attribute__((always_inline)) uint32_t span_body(const TriCtx *c,
     }
     for (int px = xs; px < xe; px += 16) {
         int len = xe - px < 16 ? xe - px : 16;
-        uint32_t zi = zfix(zf);
+        uint32_t zi = zfix(zf) + c->zoff;
         if (persp) {
             float iz0 = 1.0f / zf;
             float u0 = uz * iz0 * c->ftw + c->bias, v0 = vz * iz0 * c->fth + c->bias;
@@ -1432,7 +1452,8 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
         const int len = xe - px < 16 ? xe - px : 16;
         /* depth of the run's first pixel, made and kept in NEON (zfix's result without a
            move to the integer registers) */
-        const uint32x4_t zi = vminq_u32(vcvtq_u32_f32(vdupq_n_f32(zf * ZSCALE)), vdupq_n_u32(0xFFFFFFF0u));
+        const uint32x4_t zi = vaddq_u32(vminq_u32(vcvtq_u32_f32(vdupq_n_f32(zf * ZSCALE)), vdupq_n_u32(0xFFFFFFF0u)),
+                                        vdupq_n_u32(c->zoff));
         /* the depth and colour rows do not fit in the cache: ask for them ahead */
         __builtin_prefetch(zp + 64);
         __builtin_prefetch(cp + 64);
@@ -1740,6 +1761,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     if (kind == KIND_TR && tlTrNoDepth)
         c.dtest = 0;   /* in front of the whole scene: the test always passes */
     c.dwrite = st->depth_write && kind != KIND_TR;
+    c.zoff = st->pane ? PANE_ZOFF : 0;
     c.fog = st->fog;
     const uint32_t fogc = *sFogRd;
     c.fr = (fogc >> 16) & 0xFF; c.fg = (fogc >> 8) & 0xFF; c.fb = fogc & 0xFF;
@@ -1984,7 +2006,7 @@ static void cap_draw(const dc_fast_t *v, size_t n, const RState *st, int kind) {
     cap_u32(st->tex);
     {
         uint8_t b[12] = { st->texenv, st->depth_test, st->depth_write, st->fog, st->blend_src, st->blend_dst,
-                          st->clampu, st->clampv, st->mirru, st->mirrv, st->filter, 0 };
+                          st->clampu, st->clampv, st->mirru, st->mirrv, st->filter, st->pane };
         fwrite(b, 1, sizeof(b), sCapF);
     }
     cap_u32(sFogColor);
@@ -2494,7 +2516,7 @@ static void sort_tr(void) {
         Batch *bt = &b->batch[i];
         for (uint32_t t = 0; t + 2 < bt->count; t += 3) {
             const dc_fast_t *v = &b->verts[bt->start + t];
-            sTrSort[nt].key = v[0].vert.z + v[1].vert.z + v[2].vert.z;
+            sTrSort[nt].key = v[0].vert.z + v[1].vert.z + v[2].vert.z + (bt->st.pane ? 192.0f : 0.0f);
             sTrSort[nt].seq = bt->start + t;
             sTrSort[nt].batch = (uint16_t) i;
             nt++;
@@ -2506,7 +2528,17 @@ static void sort_tr(void) {
        interpolation), and not overlapping a translucent triangle drawn before it. Only
        when all of those write depth: where one did not, the sky used to paint over it. */
     sSkyN = 0;
-    int zok = sUseNeon && nt;
+    /* a growing pane (see gfx_sw_set_pane): its depths only compare right in fixed point,
+       so neither the sky-first nor the in-front-of-everything shortcut (both work on the
+       float depths) is used in that frame */
+    int panes = 0;
+    for (int k = 0; k < 3 && !panes; k++)
+        for (int i = 0; i < sRenB[k].nbatch; i++)
+            if (sRenB[k].batch[i].count && sRenB[k].batch[i].st.pane) {
+                panes = 1;
+                break;
+            }
+    int zok = sUseNeon && nt && !panes;
     float zmin = 1e30f, zmax = -1e30f;
     const Bucket *ob[2] = { &sRenB[KIND_OP], &sRenB[KIND_PT] };
     for (int k = 0; k < 2; k++) {
@@ -2525,7 +2557,7 @@ static void sort_tr(void) {
     for (uint32_t i = 0; i < nt; i++) {
         const dc_fast_t *v = &b->verts[sTrSort[i].seq];
         const float z0 = v[0].vert.z, z1 = v[1].vert.z, z2 = v[2].vert.z;
-        sTrSort[i].front = sUseNeon && z0 > zfront && z1 > zfront && z2 > zfront;
+        sTrSort[i].front = sUseNeon && !panes && z0 > zfront && z1 > zfront && z2 > zfront;
     }
     if (zok && zmin > 1e-5f) {
         /* (depth saturates at z = 16: keep well below it) */
