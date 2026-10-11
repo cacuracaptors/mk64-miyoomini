@@ -10,6 +10,8 @@
  *   -semgfx  copy frames to the screen with the CPU instead of the 2D engine (MI_GFX)
  *   -semparalelo  draw each frame start to end before the next one (the default draws a
  *            frame on core 1 while the game prepares the next, shown one frame later)
+ *   -exato   texture mapping exactly as before: perspective every 16 pixels, on every
+ *            surface (the default maps nearly flat-on surfaces linearly, every 32 at 640x480)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +28,7 @@ int port_opt_perf = 0;
 int port_opt_60fps = 0;
 int port_opt_filter = 0;
 int port_opt_parallel = 1;   /* -semparalelo turns it off */
+int port_opt_exact = 0;      /* -exato: no drawing shortcuts that change the picture slightly */
 static int opt_timer = 0;   /* -timer: old free-running 60 Hz clock, for comparison */
 
 double port_now_ms(void) {
@@ -82,6 +85,8 @@ void port_init(int argc, char **argv) {
             port_opt_parallel = 1;   /* (the default; kept so old shortcuts still work) */
         else if (!strcmp(argv[i], "-semparalelo"))
             port_opt_parallel = 0;
+        else if (!strcmp(argv[i], "-exato"))
+            port_opt_exact = 1;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);

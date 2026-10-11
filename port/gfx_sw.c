@@ -250,6 +250,7 @@ static double stPhase[2][6];
 static float sCore0Share;   /* defined with the band split below */
 static double stLeadMs, stPresentMs, stWaitMs;   /* -paralelo: core 1 alone, showing the frame, core 0 waiting for core 1 */
 static int sPipe;                       /* -paralelo on (see pipe_init) */
+static volatile int sCpuMhz;            /* -perf: the CPU clock as measured (watchdog thread) */
 /* -perf watchdog: where the game thread and core 1 are when frames stop coming */
 static volatile int sMainStage, sWorkerStage;
 static volatile unsigned sFramesDone;
@@ -267,6 +268,16 @@ void gfx_sw_perf_report(int frames, double ms) {
                 k, stPhase[k][0] / frames, stPhase[k][1] / frames, stPhase[k][2] / frames, stPhase[k][3] / frames,
                 stPhase[k][4] / frames, stPhase[k][5] / frames, k ? "" : " | ");
     fprintf(stderr, " | linhas do core0 %.0f%%\n", sCore0Share * 100.0);
+    {
+        char khz[32] = "?";
+        FILE *f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "r");
+        if (f) {
+            if (fgets(khz, sizeof khz, f))
+                khz[strcspn(khz, "\n")] = 0;
+            fclose(f);
+        }
+        fprintf(stderr, "perf cpu: medido %d MHz (1200 MHz mede ~1040) | o sistema diz %s kHz\n", sCpuMhz, khz);
+    }
     if (sPipe)
         fprintf(stderr, "perf paralelo: core1 sozinho %.2f  core0 esperando core1 %.2f  mostrar %.2f ms/quadro\n",
                 stLeadMs / frames, stWaitMs / frames, stPresentMs / frames);
@@ -1355,7 +1366,9 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
        their places, so every drawn pixel gets exactly the values it got before) */
     const int n0 = xe - xs;
     int px0 = xs;
-    if ((OUT == KIND_TR || OUT == KIND_PT) && TEX >= 0 && TEX != GFX_TEXENV_DECAL && !persp && dV == 0 && c->ext) {
+    /* (the span may also slant a little across the texture, as long as it stays on one texel row) */
+    if ((OUT == KIND_TR || OUT == KIND_PT) && TEX >= 0 && TEX != GFX_TEXENV_DECAL && !persp && c->ext &&
+        (V >> 16) == (int32_t) (((int64_t) V + (int64_t) dV * (n0 - 1)) >> 16)) {
         int first = 0, end = n0;
         const int vis = nv_visible(c, OUT == KIND_PT, U, dU, V, n0, &first, &end);
         if (vis == 0)
@@ -1366,6 +1379,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
             for (int r = 0; r < skip; r++)
                 zf += dz * 16;
             U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) (16 * skip));
+            V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) (16 * skip));
             for (int k = 0; k < nch; k++)
                 X[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX[k] * (uint32_t) (16 * skip));
             cp += 16 * skip;
@@ -1377,11 +1391,9 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
     /* perspective: the end of one run is the start of the next (same float operations),
        so its reciprocal and texel coordinates are kept instead of recomputed */
     float pu0 = 0, pv0 = 0, pz = -1.0f;
-#ifdef NV_PERSP32
-    const int PSTEP = W >= 640 ? 32 : 16;   /* experiment: exact perspective every 32 pixels at 640x480 */
-#else
-    const int PSTEP = 16;
-#endif
+    /* the exact perspective every 16 pixels, or (at 640x480, unless -exato) every 32 like
+       Quake at 320x200: linear in between */
+    const int PSTEP = W >= 640 && !port_opt_exact ? 32 : 16;
     int prun_end = xs;
     for (int px = px0; px < xe; px += 16) {
         const int len = xe - px < 16 ? xe - px : 16;
@@ -1622,8 +1634,30 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
 
     const struct SwTex *tx = st->tex ? &sTexRd[st->tex] : NULL;
     const int textured = tx && tx->px;
-    const int persp = textured && !(at[0][A_Z] == at[1][A_Z] && at[0][A_Z] == at[2][A_Z]) &&
-                      at[0][A_Z] > 0.0f && at[1][A_Z] > 0.0f && at[2][A_Z] > 0.0f;
+    const int persp_geo = textured && !(at[0][A_Z] == at[1][A_Z] && at[0][A_Z] == at[2][A_Z]) &&
+                          at[0][A_Z] > 0.0f && at[1][A_Z] > 0.0f && at[2][A_Z] > 0.0f;
+    int persp = persp_geo;
+    if (persp && !port_opt_exact) {
+        /* almost the same depth on the three corners (the kart sprites, the smoke, far
+           objects): mapped linearly, as on the PS1. The largest difference from the exact
+           mapping is about (zmax - zmin) / zmin * (texels across) / 4; under half a texel
+           nobody can see it, and the spans skip the division every 16 pixels (and can
+           leave out the transparent ends of the sprites) */
+        float zmin = at[0][A_Z], zmax = zmin, u0 = at[0][A_U], u1 = u0, v0 = at[0][A_V], v1 = v0;
+        for (int i = 1; i < 3; i++) {
+            const float z = at[i][A_Z], u = at[i][A_U], v = at[i][A_V];
+            if (z < zmin) zmin = z;
+            if (z > zmax) zmax = z;
+            if (u < u0) u0 = u;
+            if (u > u1) u1 = u;
+            if (v < v0) v0 = v;
+            if (v > v1) v1 = v;
+        }
+        const float du = (u1 - u0) * (float) tx->w, dv = (v1 - v0) * (float) tx->h;
+        const float span = du > dv ? du : dv;
+        if ((zmax - zmin) * span < 2.0f * zmin)   /* (zmax - zmin) / zmin * span / 4 < 0.5 */
+            persp = 0;
+    }
     if (persp) {
         for (int i = 0; i < 3; i++) {
             at[i][A_U] *= at[i][A_Z];
@@ -1668,7 +1702,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     c.ext = textured && tx->margin ? tx->ext : NULL;
     /* -filtro: 3D opaque surfaces in perspective (the track: karts, trees and items are
        sprites in the other lists, the HUD has no perspective) */
-    c.filt = port_opt_filter && kind == KIND_OP && persp &&
+    c.filt = port_opt_filter && kind == KIND_OP && persp_geo &&
              (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
     SpanFn span = sSpanFns[kind][textured ? 1 : 0][extras ? 2 : (flat ? 0 : 1)];
     int nv_pending = sUseNeon && (kind != KIND_TR || (c.bs == GFX_BLENDF_SRCALPHA && c.bd == GFX_BLENDF_INVSRCALPHA));
@@ -2538,14 +2572,39 @@ static void pipe_init(void) {
     gfx_sw_presents = 1;
 }
 
+/* -perf: the CPU's real clock, timed on a chain of dependent adds (OnionOS can change
+   the clock while the game runs: this shows whether it did) */
+static int cpu_mhz_now(void) {
+    const int N = 200000;   /* 8 adds per pass, about 1.5 ms at 1.2 GHz */
+    double best = 1e9;
+    for (int k = 0; k < 3; k++) {
+        const double t0 = port_now_ms();
+#if defined(__arm__)
+        int i = N, x = 0;
+        __asm__ volatile("1:\n\tadd %1, %1, #1\n\tadd %1, %1, #1\n\tadd %1, %1, #1\n\tadd %1, %1, #1\n\t"
+                         "add %1, %1, #1\n\tadd %1, %1, #1\n\tadd %1, %1, #1\n\tadd %1, %1, #1\n\t"
+                         "subs %0, %0, #1\n\tbne 1b\n" : "+r"(i), "+r"(x) :: "cc");
+#else
+        volatile int x = 0;
+        for (int i = 0; i < N; i++) { x++; x++; x++; x++; x++; x++; x++; x++; }
+#endif
+        const double t = port_now_ms() - t0;
+        if (t < best) best = t;
+    }
+    /* (the same loop the bench uses: about 9 cycles per pass, so 1200 MHz reads ~1040) */
+    return best > 0 ? (int) (N * 8.0 / (best * 1000.0)) : 0;
+}
+
 /* -perf: if no frame is finished for 2 s, says where everyone is (in the log), every 2 s */
 extern volatile uint64_t vblticker;
 static void *watchdog_proc(void *arg) {
     (void) arg;
-    unsigned last = sFramesDone, said = 0;
+    unsigned last = sFramesDone, said = 0, tick = 0;
     double since = port_now_ms();
     for (;;) {
         usleep(500000);
+        if ((tick++ & 3) == 0)
+            sCpuMhz = cpu_mhz_now();
         const unsigned f = sFramesDone;
         const double now = port_now_ms();
         if (f != last) {
