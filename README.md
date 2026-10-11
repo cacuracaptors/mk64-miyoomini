@@ -78,9 +78,9 @@ You can edit its `Arguments` line:
 
 ## Known issues
 
-- Ocasionally, the second screen showing your competitors after the race finishes briefly flashes with some random rendering arctifacts.
-- On the Award Cerimony screen, The floor dispears depending on camera angle and placement.
-- Some tracks are lacking filtering on the ground textures.
+- Occasionally, the second screen showing your competitors after the race finishes briefly flashes with random rendering artifacts.
+- On the Award Ceremony screen, the floor disappears depending on the camera angle and position.
+- Some tracks are missing filtering on their ground textures.
 - An OnionOS screenshot (Menu+Power) pauses the game for about a second while it is saved.
 - The game's log is in `log.txt`, in `Roms/PORTS/Games/MarioKart64/` - please attach it to your reports.
 
