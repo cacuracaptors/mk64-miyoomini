@@ -2240,6 +2240,73 @@ static void sw_select_texture(int tile, uint32_t texture_id) {
     sCurBound = texture_id;
 }
 
+/* D.K.'s Jungle Parkway's waterfall: a 32x32 texture stretched over a big area, so its
+   texels show as blocks (the N64 filtered it). Only that texture, recognised by its
+   texels, is replaced on upload by a 4x larger one filtered in advance (bilinear,
+   wrapping as it repeats, colours weighted by alpha so the see-through texels do not
+   darken their neighbours); the coordinates are fractions of the texture, so it is
+   drawn exactly as before, at no cost. -exato keeps the original. */
+static uint32_t crc32_texels(const uint32_t *p, uint32_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    const uint8_t *b = (const uint8_t *) p;
+    for (uint32_t i = 0; i < n * 4; i++) {
+        c ^= b[i];
+        for (int k = 0; k < 8; k++)
+            c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+static void tex_fake_filter(struct SwTex *t) {
+    static const uint32_t kFilterCrc[] = { 0x0558cb6du };   /* the waterfall */
+    if (port_opt_exact || t->w != 32 || t->h != 32)
+        return;
+    const uint32_t crc = crc32_texels(t->px, 32 * 32);
+    int hit = 0;
+    for (unsigned i = 0; i < sizeof kFilterCrc / sizeof kFilterCrc[0]; i++)
+        hit |= crc == kFilterCrc[i];
+    if (!hit)
+        return;
+    enum { S = 32, F = 4, D = S * F };
+    uint32_t *o = malloc(D * D * 4);
+    if (!o)
+        return;
+    for (int y = 0; y < D; y++) {
+        const float sy = (y + 0.5f) / F - 0.5f;
+        const int y0 = (int) floorf(sy);
+        const float fy = sy - (float) y0;
+        for (int x = 0; x < D; x++) {
+            const float sx = (x + 0.5f) / F - 0.5f;
+            const int x0 = (int) floorf(sx);
+            const float fx = sx - (float) x0;
+            float acc[4] = { 0, 0, 0, 0 };
+            for (int k = 0; k < 4; k++) {
+                const int xx = (x0 + (k & 1)) & (S - 1), yy = (y0 + (k >> 1)) & (S - 1);
+                const float w = ((k & 1) ? fx : 1.0f - fx) * ((k >> 1) ? fy : 1.0f - fy);
+                const uint32_t c = t->px[yy * S + xx];
+                const float a = (float) (c >> 24) * w;
+                acc[0] += a;
+                acc[1] += a * (float) ((c >> 16) & 255);
+                acc[2] += a * (float) ((c >> 8) & 255);
+                acc[3] += a * (float) (c & 255);
+            }
+            uint32_t r = 0, g = 0, b = 0;
+            if (acc[0] > 0.0f) {
+                r = (uint32_t) (acc[1] / acc[0] + 0.5f);
+                g = (uint32_t) (acc[2] / acc[0] + 0.5f);
+                b = (uint32_t) (acc[3] / acc[0] + 0.5f);
+            }
+            const uint32_t a = (uint32_t) (acc[0] + 0.5f);
+            o[y * D + x] = (a > 255 ? 255 : a) << 24 | (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 | (b > 255 ? 255 : b);
+        }
+    }
+    free(t->px);
+    t->px = o;
+    t->alloc = D * D;
+    t->w = D;
+    t->h = D;
+}
+
 static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsigned int type) {
     struct SwTex *t = &sTex[sCurBound];
     if (width <= 0 || height <= 0)
@@ -2284,6 +2351,7 @@ static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsig
     }
     t->w = (uint16_t) width;
     t->h = (uint16_t) height;
+    tex_fake_filter(t);
     tex_update_opaque(t);
     stTexUp++;
     mark_dirty();
