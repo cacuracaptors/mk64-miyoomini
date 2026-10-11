@@ -1067,6 +1067,15 @@ void splash_menu_act(struct Controller* controller, u16 controllerIdx) {
                     func_8009E1C0();
                     func_800CA330(0x19);
                     play_sound2(SOUND_INTRO_ENTER_MENU);
+#ifdef TARGET_MIYOO
+                    {
+                        extern int port_opt_ceremony;
+                        if (port_opt_ceremony) {
+                            gDebugMenuSelection = DEBUG_MENU_OPTION_SELECTED;
+                            gDebugGotoScene = DEBUG_GOTO_ENDING;
+                        }
+                    }
+#endif
                     //gDebugMenuSelection = DEBUG_MENU_OPTION_SELECTED;
                     //gDebugGotoScene = DEBUG_GOTO_ENDING;
                     ////     DEBUG_GOTO_CREDITS_SEQUENCE_DEFAULT;

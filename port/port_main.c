@@ -12,6 +12,8 @@
  *            frame on core 1 while the game prepares the next, shown one frame later)
  *   -resdin  dynamic resolution: with -hires, frames drop to 576x432, 512x384 or 448x336
  *            while the drawing does not keep up with 60 fps (the 2D engine scales them)
+ *   -cerimonia  (testing) after the title screen and the menus, the podium ceremony
+ *            instead of the race (the upstream debug path)
  *   -exato   texture mapping exactly as before: perspective every 16 pixels, on every
  *            surface (the default maps nearly flat-on surfaces linearly, every 32 at 640x480)
  */
@@ -23,6 +25,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+#include <ucontext.h>
 
 #include "port_miyoo.h"
 
@@ -32,6 +37,7 @@ int port_opt_filter = 0;
 int port_opt_parallel = 1;   /* -semparalelo turns it off */
 int port_opt_resdin = 0;     /* -resdin: smaller frames while the drawing does not keep up */
 int port_opt_mute = 0;       /* -mudo: no sound */
+int port_opt_ceremony = 0;   /* -cerimonia: A on the title screen leads to the podium ceremony (testing) */
 int port_opt_exact = 0;      /* -exato: no drawing shortcuts that change the picture slightly */
 static int opt_timer = 0;   /* -timer: old free-running 60 Hz clock, for comparison */
 
@@ -50,6 +56,74 @@ void port_quit(int code) {
 }
 
 static void on_signal(int sig) {
+    port_video_shutdown();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* ---- crash report -------------------------------------------------------------
+ * A crash writes crash_log.txt (appended) in the game's folder: the signal, the
+ * thread, the faulting instruction (pc), its caller (lr), the address it touched,
+ * and every word on the stack that points into the code (the callers further up,
+ * plus some stale ones). Resolve them against the unstripped build/mario-kart.elf:
+ *   arm-linux-gnueabihf-addr2line -f -C -e build/mario-kart.elf 0x... 0x...
+ * Async-signal-safe: write() only, no stdio. */
+extern char __executable_start[], etext[];
+
+static void crash_str(int fd, const char *str) {
+    if (write(fd, str, strlen(str)) < 0)
+        return;
+}
+
+static void crash_hex(int fd, const char *label, unsigned long v) {
+    static const char digits[] = "0123456789abcdef";
+    char out[16];
+    int n = 0;
+    out[n++] = '0';
+    out[n++] = 'x';
+    for (int sh = 28; sh >= 0; sh -= 4)
+        out[n++] = digits[(v >> sh) & 15];
+    out[n++] = '\n';
+    crash_str(fd, label);
+    if (write(fd, out, (size_t) n) < 0)
+        return;
+}
+
+static void on_crash(int sig, siginfo_t *info, void *context) {
+    int fd = open("crash_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        const char *name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGABRT ? "SIGABRT"
+                         : sig == SIGFPE ? "SIGFPE" : sig == SIGILL ? "SIGILL" : "signal";
+        crash_str(fd, "\n--- crash: ");
+        crash_str(fd, name);
+        crash_str(fd, " ---\n");
+        crash_hex(fd, "thread: ", (unsigned long) syscall(SYS_gettid));
+        crash_hex(fd, "process: ", (unsigned long) getpid());
+        if (info)
+            crash_hex(fd, "fault addr: ", (unsigned long) info->si_addr);
+#if defined(__arm__)
+        if (context) {
+            const ucontext_t *uc = context;
+            crash_hex(fd, "pc: ", uc->uc_mcontext.arm_pc);
+            crash_hex(fd, "lr: ", uc->uc_mcontext.arm_lr);
+            crash_hex(fd, "sp: ", uc->uc_mcontext.arm_sp);
+            /* code addresses on the stack (the thread's stack is mapped well past this) */
+            const unsigned long lo = (unsigned long) __executable_start, hi = (unsigned long) etext;
+            const unsigned long *sp = (const unsigned long *) uc->uc_mcontext.arm_sp;
+            int found = 0;
+            for (int i = 0; i < 512 && found < 48; i++) {
+                const unsigned long w = sp[i];
+                if (w >= lo && w < hi) {
+                    crash_hex(fd, "stack: ", w);
+                    found++;
+                }
+            }
+        }
+#else
+        (void) context;
+#endif
+        close(fd);
+    }
     port_video_shutdown();
     signal(sig, SIG_DFL);
     raise(sig);
@@ -95,6 +169,8 @@ void port_init(int argc, char **argv) {
             port_opt_resdin = 1;
         else if (!strcmp(argv[i], "-mudo"))
             port_opt_mute = 1;
+        else if (!strcmp(argv[i], "-cerimonia"))
+            port_opt_ceremony = 1;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);
@@ -104,11 +180,14 @@ void port_init(int argc, char **argv) {
         port_video_membench();
     port_input_init();
 
-    signal(SIGSEGV, on_signal);
-    signal(SIGBUS, on_signal);
-    signal(SIGABRT, on_signal);
-    signal(SIGFPE, on_signal);
-    signal(SIGILL, on_signal);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = on_crash;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    static const int crash_signals[] = { SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL };
+    for (int i = 0; i < 5; i++)
+        sigaction(crash_signals[i], &sa, NULL);
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
 }

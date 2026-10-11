@@ -162,7 +162,10 @@ void load_ceremony_data(void) {
 void load_ceremony_cutscene(void) {
     Camera* camera = &cameras[0];
     memset(&D_802874D8, 0, sizeof(D_802874D8));
-    memset(sPodiumActorList, 0, (sizeof(CeremonyActor) * 200));
+    /* the first ceremony finds no list yet (NULL): on the N64 (RDRAM at 0) and the DC
+       (boot ROM at 0, no MMU) clearing "it" did no harm; on Linux it is a crash */
+    if (sPodiumActorList != NULL)
+        memset(sPodiumActorList, 0, (sizeof(CeremonyActor) * 200));
     sPodiumActorList = NULL;
 
     gCurrentCourseId = COURSE_ROYAL_RACEWAY;
