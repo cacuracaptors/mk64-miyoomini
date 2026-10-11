@@ -10,6 +10,8 @@
  *   -semgfx  copy frames to the screen with the CPU instead of the 2D engine (MI_GFX)
  *   -semparalelo  draw each frame start to end before the next one (the default draws a
  *            frame on core 1 while the game prepares the next, shown one frame later)
+ *   -resdin  dynamic resolution: with -hires, frames drop to 576x432, 512x384 or 448x336
+ *            while the drawing does not keep up with 60 fps (the 2D engine scales them)
  *   -exato   texture mapping exactly as before: perspective every 16 pixels, on every
  *            surface (the default maps nearly flat-on surfaces linearly, every 32 at 640x480)
  */
@@ -28,6 +30,7 @@ int port_opt_perf = 0;
 int port_opt_60fps = 0;
 int port_opt_filter = 0;
 int port_opt_parallel = 1;   /* -semparalelo turns it off */
+int port_opt_resdin = 0;     /* -resdin: smaller frames while the drawing does not keep up */
 int port_opt_exact = 0;      /* -exato: no drawing shortcuts that change the picture slightly */
 static int opt_timer = 0;   /* -timer: old free-running 60 Hz clock, for comparison */
 
@@ -87,6 +90,8 @@ void port_init(int argc, char **argv) {
             port_opt_parallel = 0;
         else if (!strcmp(argv[i], "-exato"))
             port_opt_exact = 1;
+        else if (!strcmp(argv[i], "-resdin"))
+            port_opt_resdin = 1;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);

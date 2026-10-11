@@ -63,6 +63,7 @@ static int flip_started;
 static int job_pending;
 static int snap_free = 1;
 static const uint16_t *snap;
+static int snap_w, snap_h;   /* the queued frame's size (it can change from frame to frame: -resdin) */
 
 static inline uint32_t rgb565_to_x8888(uint32_t c) {
     return ((c & 0xF800u) << 8) | ((c & 0xE000u) << 3) |
@@ -309,24 +310,30 @@ static int hw_init(size_t bytes) {
 }
 
 /* frame index -> show it in screen page `back` with the 2D engine; 0 = done */
-static int hw_present(const uint16_t *src, int back) {
+static int hw_present(const uint16_t *src, int back, int w, int h) {
 #ifdef HAVE_MI_GFX
     int idx = src == cbuf[0] ? 0 : (src == cbuf[1] ? 1 : (src == cbuf[2] ? 2 : -1));
     if (!hw_ok || idx < 0)
         return -1;
-    const size_t bytes = (size_t) port_render_w * port_render_h * 2;
+    const size_t bytes = (size_t) w * h * 2;
     mi.Flush((void *) src, (MI_U32) bytes);   /* the drawing is in the CPU cache */
     MI_PHY dst = (MI_PHY) fb_phys + (MI_PHY) back * PANEL_W * PANEL_H * 4;
-    if (hw_blit(hw_phys[idx], port_render_w, port_render_h, dst, PANEL_W, PANEL_H, hw_rotate, hw_mirror)) {
+    if (hw_blit(hw_phys[idx], w, h, dst, PANEL_W, PANEL_H, hw_rotate, hw_mirror)) {
         printf("video: MI_GFX falhou no jogo, voltando para a copia pela CPU\n");
         hw_ok = 0;
         return -1;
     }
     return 0;
 #else
-    (void) src; (void) back;
+    (void) src; (void) back; (void) w; (void) h;
     return -1;
 #endif
+}
+
+/* -resdin: frames smaller than the buffers can only be shown through the 2D engine (it
+   scales any size to the panel; the CPU copy only does 1x and 2x) */
+int port_video_scales(void) {
+    return hw_ok;
 }
 
 static void pin_cpu(int cpu) {
@@ -382,6 +389,7 @@ static void *flip_proc(void *arg) {
         int job = job_pending;
         job_pending = 0;
         const uint16_t *src = snap;
+        const int sw = snap_w, sh = snap_h;
         pthread_mutex_unlock(&flip_mutex);
 
         double t0 = port_now_ms();
@@ -390,8 +398,8 @@ static void *flip_proc(void *arg) {
                 int back = fb_page ^ 1;
                 const double c0 = port_opt_perf ? thread_cpu_ms() : 0;
                 port_flip_stage = 2;   /* copying a frame */
-                if (hw_present(src, back))
-                    convert_frame(src, port_render_w, port_render_h, (uint32_t *) (fb_mem + (size_t) back * PANEL_W * PANEL_H * 4));
+                if (hw_present(src, back, sw, sh))
+                    convert_frame(src, sw, sh, (uint32_t *) (fb_mem + (size_t) back * PANEL_W * PANEL_H * 4));
                 release_snap();   /* copied: the game may queue the next frame during the vsync wait */
                 if (port_opt_perf)
                     t_cpu += thread_cpu_ms() - c0;
@@ -408,7 +416,7 @@ static void *flip_proc(void *arg) {
                 ioctl(fb_fd, FBIOPAN_DISPLAY, &fb_var);
             }
         } else if (fb_pages == 1 && job) {
-            convert_frame(src, port_render_w, port_render_h, (uint32_t *) fb_mem);
+            convert_frame(src, sw, sh, (uint32_t *) fb_mem);
             release_snap();
             t_conv += port_now_ms() - t0;
         } else if (job) {
@@ -547,6 +555,8 @@ void port_video_present(void) {
     while (!snap_free)
         pthread_cond_wait(&flip_cond, &flip_mutex);
     snap = cbuf[cur_idx];
+    snap_w = port_render_w;
+    snap_h = port_render_h;
     snap_free = 0;
     job_pending = 1;
     pthread_cond_broadcast(&flip_cond);

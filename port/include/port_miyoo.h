@@ -20,6 +20,9 @@ extern int port_opt_exact;    /* -exato: no shortcuts that change the picture sl
 extern int gfx_sw_presents;   /* port/gfx_sw.c: with -paralelo it shows the frames itself */
 extern volatile int port_flip_stage, port_main_pacing;   /* -perf watchdog (port/gfx_sw.c) */
 extern volatile unsigned port_flip_loops;
+extern double port_pacing_ms;        /* gfx_wm_miyoo.c: time waited for the 30 fps beat */
+int port_video_scales(void);         /* video_miyoo.c: any frame size can be shown (2D engine) */
+extern int port_opt_resdin;          /* -resdin: dynamic resolution */
 
 /* src/main.c (TARGET_MIYOO) */
 void port_audio_pump(void);

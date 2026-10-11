@@ -259,6 +259,7 @@ static float sCore0Share;   /* defined with the band split below */
 static double stLeadMs, stPresentMs, stWaitMs;   /* -paralelo: core 1 alone, showing the frame, core 0 waiting for core 1 */
 static int sPipe;                       /* -paralelo on (see pipe_init) */
 static volatile int sCpuMhz;            /* -perf: the CPU clock as measured (watchdog thread) */
+static int sResFrames[4];               /* -resdin: frames drawn at each size since the last report */
 /* -perf watchdog: where the game thread and core 1 are when frames stop coming */
 static volatile int sMainStage, sWorkerStage;
 static volatile unsigned sFramesDone;
@@ -290,6 +291,11 @@ void gfx_sw_perf_report(int frames, double ms) {
         fprintf(stderr, "perf paralelo: core1 sozinho %.2f  core0 esperando core1 %.2f  mostrar %.2f ms/quadro\n",
                 stLeadMs / frames, stWaitMs / frames, stPresentMs / frames);
     stLeadMs = stPresentMs = stWaitMs = 0;
+    if (port_opt_resdin) {
+        fprintf(stderr, "perf resdin: quadros em 640x480 %d  576x432 %d  512x384 %d  448x336 %d\n",
+                sResFrames[0], sResFrames[1], sResFrames[2], sResFrames[3]);
+        memset(sResFrames, 0, sizeof(sResFrames));
+    }
     memset(stPhase, 0, sizeof(stPhase));
     stTris = stPixels = stTexUp = stOpTris = stPtTris = stTrTris = 0;
     stRasterMs = stWalkMs = stCore0Ms = stCore1Ms = 0;
@@ -2875,9 +2881,49 @@ static void pipe_finish(int adapt) {
     sPipeState = 2;
 }
 
+/* -resdin: the size of the next frame. The time the game needed for the last frame, apart
+   from waiting for the screen or the 30 fps beat, says whether the drawing keeps up: over
+   16.4 ms the frames get smaller one step; when the estimate one step up (the drawing
+   grows with the pixels, the rest does not) fits in 15 ms they grow back. Changes wait a
+   little for the estimate to settle. */
+static const int kResW[4] = { 640, 576, 512, 448 }, kResH[4] = { 480, 432, 384, 336 };
+static int sResLevel, sResHold;
+static double sResEma, sResLastT, sResLastPacing, sResWait;
+static void resdin_pick(void) {
+    if (!port_opt_resdin || !port_video_scales() || sCapF || port_render_w > 640)
+        return;
+    const double now = port_now_ms();
+    if (sResLastT > 0) {
+        double c = now - sResLastT - sResWait - (port_pacing_ms - sResLastPacing);
+        if (c < 0)
+            c = 0;
+        sResEma = sResEma > 0 ? 0.8 * sResEma + 0.2 * c : c;
+    }
+    sResLastT = now;
+    sResLastPacing = port_pacing_ms;
+    sResWait = 0;
+    if (sResHold > 0) {
+        sResHold--;
+    } else if (sResEma > 16.4 && sResLevel < 3) {
+        sResLevel++;
+        sResHold = 15;
+    } else if (sResLevel > 0) {
+        const double cur = (double) kResW[sResLevel] * kResH[sResLevel], up = (double) kResW[sResLevel - 1] * kResH[sResLevel - 1];
+        const double fixed = 2.5;   /* the game and the display list: they do not shrink with the frame */
+        if ((sResEma - fixed) * (up / cur) + fixed < 15.0) {
+            sResLevel--;
+            sResHold = 30;
+        }
+    }
+    sResFrames[sResLevel]++;
+    port_render_w = kResW[sResLevel];
+    port_render_h = kResH[sResLevel];
+}
+
 /* -paralelo: the lists just filled become the frame to draw; the textures it uses are
    copied (entries only, the texels stay shared until it is done) and core 1 starts */
 static void pipe_handover(void) {
+    resdin_pick();
     Bucket *r = sRecB;
     sRecB = r == sBk[0] ? sBk[1] : sBk[0];   /* the set that was drawn: free again */
     sRenB = r;
@@ -2918,6 +2964,7 @@ static void sw_end_frame(void) {
             sMainStage = 4;
             port_video_present();
             stPresentMs += port_now_ms() - tp;
+            sResWait += port_now_ms() - tp;
             sPipeState = 0;
         }
         sMainStage = 5;
