@@ -357,7 +357,7 @@ static inline void ceil2_minmax(float a, float b, int *lo, int *hi) {
 
 /* the same, with the start clamped to 0 and the end to w, and the start also as a float
    (made in NEON: no trip through the integer registers back to the VFP) */
-static inline void ceil2_clamp(float a, float b, int w, int *lo, int *hi) {
+static inline float ceil2_clamp(float a, float b, int w, int *lo, int *hi) {
     static const int32_t kMin[2] = { 0, -2147483647 - 1 };
     const float32x2_t x = vset_lane_f32(b, vdup_n_f32(a), 1);
     const int32x2_t t = vcvt_s32_f32(x);
@@ -368,6 +368,7 @@ static inline void ceil2_clamp(float a, float b, int w, int *lo, int *hi) {
     mm = vmin_s32(vmax_s32(mm, vld1_s32(kMin)), vld1_s32(kMax));
     *lo = vget_lane_s32(mm, 0);
     *hi = vget_lane_s32(mm, 1);
+    return vget_lane_f32(vcvt_f32_s32(mm), 0);
 }
 
 /* (int) ceilf(f) for |f| < 2^24, without the library call */
@@ -750,15 +751,8 @@ static const float kInvLen[33] = {
    speedometer...) is that offset colour with the texel's alpha */
 #define NV_TEXA 4
 
-/* the small approximations of the colour maths are on (not -exato): see nv_lane8 and
-   nv_div255; set for each frame by sort_tr */
-static int sColApprox;
-
-/* DIV255 of a product (<= 255 * 255): exact, or (approximations on) divided by 256,
-   rounded, at most 1 below (255 * 255 gives 254: the same 565 pixel) */
+/* exact DIV255 of a product (<= 255 * 255) */
 static inline __attribute__((always_inline)) uint8x8_t nv_div255(uint16x8_t x) {
-    if (sColApprox)
-        return vrshrn_n_u16(x, 8);
     return vrshrn_n_u16(vaddq_u16(x, vrshrq_n_u16(x, 8)), 8);
 }
 /* floor(x / 255), x <= 255 * 255 */
@@ -773,15 +767,6 @@ static inline __attribute__((always_inline)) uint8x8_t nv_lane8(int32_t X, int32
     int32x4_t v = vdupq_n_s32(X);
     return vqmovn_u16(vcombine_u16(vqshrun_n_s32(vaddq_s32(v, o0), 16), vqshrun_n_s32(vaddq_s32(v, o1), 16)));
 }
-/* the same in 16-bit lanes with 7 fraction bits (approximations on): X and the 8 steps
-   (o16 = {0..7} * dX, both >> 9) added with saturation, so a value past 255 or below 0
-   still clamps; at most 1 off where the 32-bit sum sits right at a step */
-static inline __attribute__((always_inline)) uint8x8_t nv_lane8q(int32_t X, int16x8_t o16) {
-    int32_t x = X >> 9;
-    x = x > 32767 ? 32767 : (x < -32768 ? -32768 : x);
-    return vqshrun_n_s16(vqaddq_s16(vdupq_n_s16((int16_t) x), o16), 7);
-}
-#define NV_LANE8(k) (sColApprox ? nv_lane8q(X[k], s->o16[k]) : nv_lane8(X[k], s->o0[k], s->o1[k]))
 static inline __attribute__((always_inline)) uint16x8_t nv_pack565(uint8x8_t r, uint8x8_t g, uint8x8_t b) {
     return vsriq_n_u16(vsriq_n_u16(vshll_n_u8(r, 8), vshll_n_u8(g, 8), 5), vshll_n_u8(b, 8), 11);
 }
@@ -795,7 +780,6 @@ static inline __attribute__((always_inline)) uint32x4_t nv_wide_mask32(uint16x4_
 
 typedef struct {
     int32x4_t o0[8], o1[8];   /* per-lane steps of R G B A OR OG OB F */
-    int16x8_t o16[8];         /* the same >> 9, in 8 16-bit lanes (see nv_lane8q) */
     uint32x4_t zo0, zo1;      /* per-lane depth steps */
     int32_t dX[8], dX8[8];    /* 1 and 8 steps of each channel */
     int32_t dzi;              /* depth step */
@@ -819,12 +803,6 @@ static void nv_prepare(NvSteps *s, const float *ddx, int col) {
         }
         s->o0[k] = vld1q_s32(lo);
         s->o1[k] = vld1q_s32(hi);
-        int16_t q[8];
-        for (int i = 0; i < 8; i++) {
-            const int32_t o = ((int32_t) ((uint32_t) i * (uint32_t) d)) >> 9;
-            q[i] = (int16_t) (o > 32767 ? 32767 : (o < -32768 ? -32768 : o));
-        }
-        s->o16[k] = vld1q_s16(q);
     }
     const int32_t dzi = rnd_i(ddx[A_Z] * ZSCALE);
     s->dzi = dzi;
@@ -886,10 +864,10 @@ static inline __attribute__((always_inline)) void nv_shade(uint8x8_t *pr, uint8x
     if (COL == 0 || COL == 4 || COL == 5) {
         r = flatc[0]; g = flatc[1]; b = flatc[2]; al = flatc[3];
     } else {
-        r = NV_LANE8(0);
-        g = NV_LANE8(1);
-        b = NV_LANE8(2);
-        al = NV_LANE8(3);
+        r = nv_lane8(X[0], s->o0[0], s->o1[0]);
+        g = nv_lane8(X[1], s->o0[1], s->o1[1]);
+        b = nv_lane8(X[2], s->o0[2], s->o1[2]);
+        al = nv_lane8(X[3], s->o0[3], s->o1[3]);
     }
 
     /* texture */
@@ -912,9 +890,9 @@ static inline __attribute__((always_inline)) void nv_shade(uint8x8_t *pr, uint8x
             al = nv_div255(vmull_u8(al, t.val[3]));
         }
         if (COL == 2 || COL == 3) {
-            r = vqadd_u8(r, NV_LANE8(4));
-            g = vqadd_u8(g, NV_LANE8(5));
-            b = vqadd_u8(b, NV_LANE8(6));
+            r = vqadd_u8(r, nv_lane8(X[4], s->o0[4], s->o1[4]));
+            g = vqadd_u8(g, nv_lane8(X[5], s->o0[5], s->o1[5]));
+            b = vqadd_u8(b, nv_lane8(X[6], s->o0[6], s->o1[6]));
         } else if (COL == 5) {
             r = vqadd_u8(r, flatc[4]);
             g = vqadd_u8(g, flatc[5]);
@@ -924,7 +902,7 @@ static inline __attribute__((always_inline)) void nv_shade(uint8x8_t *pr, uint8x
 
     /* fog: c += (fogc - c) * f / 255, rounded towards zero */
     if (COL == 3) {
-        uint8x8_t f = NV_LANE8(7);
+        uint8x8_t f = nv_lane8(X[7], s->o0[7], s->o1[7]);
         uint8x8_t fr = vdup_n_u8((uint8_t) c->fr), fg = vdup_n_u8((uint8_t) c->fg), fb = vdup_n_u8((uint8_t) c->fb);
         r = vsub_u8(vadd_u8(r, nv_floor255(vmull_u8(vqsub_u8(fr, r), f))), nv_floor255(vmull_u8(vqsub_u8(r, fr), f)));
         g = vsub_u8(vadd_u8(g, nv_floor255(vmull_u8(vqsub_u8(fg, g), f))), nv_floor255(vmull_u8(vqsub_u8(g, fg), f)));
@@ -1008,7 +986,6 @@ static inline __attribute__((always_inline)) void nv_group2(uint16_t *cp, uint32
         return;   /* all 16 hidden */
     int32_t XB[8];
     const int nch = COL == 0 || COL == 5 ? 0 : (COL == 1 || COL == 4 ? 4 : 8);
-    #pragma GCC unroll 8
     for (int k = 0; k < nch; k++)
         XB[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX8[k]);
     uint8x8_t ra, ga, ba, aa, rb, gb, bb, ab;
@@ -1436,7 +1413,6 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 zf += dz * 16;
             U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) (16 * skip));
             V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) (16 * skip));
-            #pragma GCC unroll 8
             for (int k = 0; k < nch; k++)
                 X[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX[k] * (uint32_t) (16 * skip));
             cp += 16 * skip;
@@ -1560,7 +1536,6 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
             for (int o = 0; o < len; o += 8) {
                 const int n = len - o < 8 ? len - o : 8;
                 int32_t XO[8];
-                #pragma GCC unroll 8
                 for (int k = 0; k < nch; k++)
                     XO[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX8[k] * (uint32_t) (o >> 3));
                 const uint32x4_t zo = o ? vaddq_u32(zi, s->dz8v) : zi;
@@ -1577,7 +1552,6 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 }
             }
         }
-        #pragma GCC unroll 8
         for (int k = 0; k < nch; k++)
             X[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX[k] * 16);
         cp += len;
@@ -1933,10 +1907,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
             xr = xb + (fy - yb) * slope_bc;
         /* ceil of both ends at once in NEON (same result as ceil_i); the smaller is the start */
         int xs, xe;
-        ceil2_clamp(xl - 0.5f, xr - 0.5f, W, &xs, &xe);
-        /* (converted here: taken from the NEON result, the float went through memory and
-           the next VFP load waited for the store) */
-        const float fxs = (float) xs;
+        const float fxs = ceil2_clamp(xl - 0.5f, xr - 0.5f, W, &xs, &xe);
         if (xs >= xe)
             continue;
 
@@ -2508,7 +2479,6 @@ static void sort_tr(void) {
     if (!sPipe)
         prefilter_prepare();   /* (-paralelo: in pipe_handover, before the textures are copied) */
     Bucket *b = &sRenB[KIND_TR];
-    sColApprox = !port_opt_exact;
 #ifdef HAVE_FETCH_ASM
     if (sFetchAsm < 0) {   /* first frame, before any raster thread runs */
         sFetchAsm = fetch_asm_selftest();
