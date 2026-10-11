@@ -70,6 +70,10 @@ struct SwTex {
     uint8_t margin;        /* some row starts or ends with invisible texels (see ext) */
     uint16_t exth;         /* rows allocated in ext */
     int16_t *ext;          /* per row: first and last texel with alpha > 0, then with alpha > 0xC0 */
+    uint32_t *pf;          /* -filtro: the 3-point filter worked out in advance (see prefilter_prepare) */
+    uint8_t pfwrap;        /* the clamp flags it was made with (bit 0 u, bit 1 v) */
+    uint8_t pfnever;       /* changes too often to be worth it */
+    uint16_t ups;          /* uploads into this texture */
 };
 
 static struct SwTex sTex[TEX_MAX];
@@ -124,7 +128,7 @@ static const struct SwTex *sTexRd = sTex;
 static uint8_t sTexShared[TEX_MAX];    /* used by the frame being drawn */
 static uint16_t sSharedIds[TEX_MAX];
 static int sSharedN;
-static void *sDeferred[2 * TEX_MAX];   /* (each texture lets go of px and ext at most once per frame) */
+static void *sDeferred[3 * TEX_MAX];   /* (each texture lets go of px, ext and pf at most once per frame) */
 static int sDeferredN;
 static void tex_detach(struct SwTex *t) {
     const uint32_t id = (uint32_t) (t - sTex);
@@ -135,15 +139,19 @@ static void tex_detach(struct SwTex *t) {
         sDeferred[sDeferredN++] = t->px;
     if (t->ext)
         sDeferred[sDeferredN++] = t->ext;
+    if (t->pf)
+        sDeferred[sDeferredN++] = t->pf;
     t->px = NULL;
     t->alloc = 0;
     t->ext = NULL;
     t->exth = 0;
+    t->pf = NULL;
 }
 static void tex_free(struct SwTex *t) {
     tex_detach(t);
     free(t->px);
     free(t->ext);
+    free(t->pf);
     memset(t, 0, sizeof(*t));
 }
 static uint32_t sTexCount;
@@ -368,6 +376,10 @@ static inline int ifloor(float f) {
     return (f < (float) i) ? i - 1 : i;
 }
 
+/* -filtro worked out in advance: cells per texel side (see tex_build_pf) */
+#define PF_SHIFT 2
+#define PF_SUB (1 << PF_SHIFT)
+
 /* ---- per-triangle constants for the span loops ---- */
 enum { WR_REPEAT2, WR_CLAMP, WR_MIRROR2, WR_REPEATN, WR_MIRRORN };
 
@@ -383,6 +395,7 @@ typedef struct {
     const void *nvs;         /* NvSteps of the NEON spans (per triangle) */
     int filt;                /* 3-point filter where the texture is magnified (-filtro) */
     const int16_t *ext;      /* the texture's visible extent per row (NULL: draw every texel) */
+    const uint32_t *pf;      /* -filtro: the filter worked out in advance (PF_SUB x PF_SUB per texel) */
 } TriCtx;
 
 static uint8_t sExp5[32], sExp6[64];   /* 565 -> 8 bit, same rounding as before (v*255/max) */
@@ -1318,6 +1331,20 @@ static int nv_visible(const TriCtx *c, int pt, int32_t U, int32_t dU, int32_t V,
     return *first < *end;
 }
 
+/* -filtro, strongly magnified: 8 pixels in two groups of 4, blended in a straight line
+   from texel colour a towards b, then from b towards c (rounded) */
+static inline __attribute__((always_inline)) void nv_lerp8(uint32_t *out, const uint32_t *a, const uint32_t *b, const uint32_t *c4) {
+    static const uint8_t kF4[8] = { 0, 1, 2, 3, 0, 1, 2, 3 }, kHi[8] = { 0, 0, 0, 0, 255, 255, 255, 255 };
+    const uint8x8x4_t A = vld4_dup_u8((const uint8_t *) a), B = vld4_dup_u8((const uint8_t *) b), C = vld4_dup_u8((const uint8_t *) c4);
+    const uint8x8_t f = vld1_u8(kF4), w = vsub_u8(vdup_n_u8(4), f), hi = vld1_u8(kHi);
+    uint8x8x4_t R;
+    R.val[0] = vrshrn_n_u16(vmlal_u8(vmull_u8(vbsl_u8(hi, B.val[0], A.val[0]), w), vbsl_u8(hi, C.val[0], B.val[0]), f), 2);
+    R.val[1] = vrshrn_n_u16(vmlal_u8(vmull_u8(vbsl_u8(hi, B.val[1], A.val[1]), w), vbsl_u8(hi, C.val[1], B.val[1]), f), 2);
+    R.val[2] = vrshrn_n_u16(vmlal_u8(vmull_u8(vbsl_u8(hi, B.val[2], A.val[2]), w), vbsl_u8(hi, C.val[2], B.val[2]), f), 2);
+    R.val[3] = vrshrn_n_u16(vmlal_u8(vmull_u8(vbsl_u8(hi, B.val[3], A.val[3]), w), vbsl_u8(hi, C.val[3], B.val[3]), f), 2);
+    vst4_u8((uint8_t *) out, R);
+}
+
 static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, int py, int xs, int xe, const float *a,
                                                                const float *ddx, const int OUT, const int TEX, const int COL) {
     const int W = port_render_w;
@@ -1436,7 +1463,41 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 prun_end = px + plen;
             }
             uint32_t um, vm;
-            if (OUT == KIND_OP && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536) {
+            if (OUT == KIND_OP && c->filt && !port_opt_exact && dU > -8192 && dU < 8192 && dV > -8192 && dV < 8192) {
+                /* 8 or more pixels per texel (the road right in front): the filter changes
+                   slowly and linearly along the run, so it is computed exactly every 4 pixels
+                   and the pixels between are blended from those (the filter worked out in
+                   advance would show its cells as bands here) */
+                uint32_t smp[16] __attribute__((aligned(16)));
+                nv_fetch3(smp, 5, U, (int32_t) ((uint32_t) dU * 4), V, (int32_t) ((uint32_t) dV * 4), c);
+                nv_lerp8(tex, &smp[0], &smp[1], &smp[2]);
+                nv_lerp8(tex + 8, &smp[2], &smp[3], &smp[4]);
+                U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
+                V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
+            } else if (OUT == KIND_OP && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536 && c->pf) {
+                /* the filter worked out in advance: one cell per pixel (positions relative to
+                   the texel centres, as in nv_fetch3; repeat wraps on the cell grid as well) */
+                const int32_t QU = (int32_t) (((uint32_t) U - 33024u) << PF_SHIFT), QV = (int32_t) (((uint32_t) V - 33024u) << PF_SHIFT);
+                const int32_t dQU = (int32_t) ((uint32_t) dU << PF_SHIFT), dQV = (int32_t) ((uint32_t) dV << PF_SHIFT);
+                const int W2 = tw << PF_SHIFT, H2 = th << PF_SHIFT;
+                uint32_t pum, pvm;
+                if (axis_mask(QU, dQU, len, W2, c->uwrap, &pum) && axis_mask(QV, dQV, len, H2, c->vwrap, &pvm)) {
+                    TexWalk w = { QU, QV, dQU, dQV, pum, pvm, W2 };
+                    fetch_texels(tex, c->pf, len, &w);
+                } else {   /* clamped at an edge */
+                    uint32_t qu = (uint32_t) QU, qv = (uint32_t) QV;
+                    for (int i = 0; i < len; i++) {
+                        int iu = (int32_t) qu >> 16, iv = (int32_t) qv >> 16;
+                        iu = c->uwrap == WR_REPEAT2 ? iu & (W2 - 1) : (iu < 0 ? 0 : (iu >= W2 ? W2 - 1 : iu));
+                        iv = c->vwrap == WR_REPEAT2 ? iv & (H2 - 1) : (iv < 0 ? 0 : (iv >= H2 ? H2 - 1 : iv));
+                        tex[i] = c->pf[iv * W2 + iu];
+                        qu += (uint32_t) dQU;
+                        qv += (uint32_t) dQV;
+                    }
+                }
+                U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
+                V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
+            } else if (OUT == KIND_OP && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536) {
                 nv_fetch3(tex, len, U, dU, V, dV, c);
                 U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
                 V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
@@ -1704,6 +1765,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
        sprites in the other lists, the HUD has no perspective) */
     c.filt = port_opt_filter && kind == KIND_OP && persp_geo &&
              (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
+    c.pf = c.filt && !port_opt_exact && tx->pf && tx->pfwrap == (st->clampu | (st->clampv << 1)) ? tx->pf : NULL;
     SpanFn span = sSpanFns[kind][textured ? 1 : 0][extras ? 2 : (flat ? 0 : 1)];
     int nv_pending = sUseNeon && (kind != KIND_TR || (c.bs == GFX_BLENDF_SRCALPHA && c.bd == GFX_BLENDF_INVSRCALPHA));
 
@@ -2155,6 +2217,10 @@ static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsig
     if (width <= 0 || height <= 0)
         return;
     tex_detach(t);   /* (-paralelo: the frame being drawn keeps the old texels) */
+    free(t->pf);     /* (the filter worked out in advance belongs to the old texels) */
+    t->pf = NULL;
+    if (++t->ups > 3)
+        t->pfnever = 1;
     uint32_t n = (uint32_t) width * (uint32_t) height;
     if (!t->px || t->alloc < n) {
         uint32_t *p = realloc(t->px, n * 4);
@@ -2338,7 +2404,74 @@ static int tr_cmp(const void *a, const void *b) {
     return (x->seq > y->seq) - (x->seq < y->seq);
 }
 
+/* -filtro, worked out in advance: where the road is magnified, the 3-point filter only
+   depends on which texel square a pixel falls in and where inside it. Each texel is cut
+   into PF_SUB x PF_SUB cells and the filter is computed once for every cell's centre,
+   into a texture PF_SUB times larger; the spans then read it like an unfiltered texture
+   (one texel per pixel instead of three plus the blend). The filter's position inside a
+   texel is rounded to 1/PF_SUB of a texel: steps far below what the 16-bit screen shows. */
+static void tex_build_pf(struct SwTex *t, int wrap) {
+    const int tw = t->w, th = t->h, W = tw << PF_SHIFT, H = th << PF_SHIFT;
+    const int cu = wrap & 1, cv = (wrap >> 1) & 1;
+    uint32_t *pf = malloc((size_t) W * H * 4);
+    if (!pf) {
+        t->pfnever = 1;
+        return;
+    }
+    for (int y = 0; y < H; y++) {
+        const int iv = y >> PF_SHIFT, ft = (2 * (y & (PF_SUB - 1)) + 1) * 64 / PF_SUB;
+        const int v0 = iv, v1 = cv ? (iv + 1 < th ? iv + 1 : th - 1) : (iv + 1) & (th - 1);
+        const uint32_t *r0 = t->px + v0 * tw, *r1 = t->px + v1 * tw;
+        for (int x = 0; x < W; x++) {
+            const int iu = x >> PF_SHIFT, fs = (2 * (x & (PF_SUB - 1)) + 1) * 64 / PF_SUB;
+            const int u0 = iu, u1 = cu ? (iu + 1 < tw ? iu + 1 : tw - 1) : (iu + 1) & (tw - 1);
+            uint32_t a, b, c;
+            int ws, wt;
+            if (fs + ft <= 128) {
+                a = r0[u0]; b = r0[u1]; c = r1[u0];
+                ws = fs; wt = ft;
+            } else {
+                a = r1[u1]; b = r1[u0]; c = r0[u1];
+                ws = 128 - fs; wt = 128 - ft;
+            }
+            const int w0 = 128 - ws - wt;
+            uint32_t o = 0;
+            for (int k = 0; k < 32; k += 8) {
+                const uint32_t v = (((a >> k) & 255) * w0 + ((b >> k) & 255) * ws + ((c >> k) & 255) * wt + 64) >> 7;
+                o |= v << k;
+            }
+            pf[y * W + x] = o;
+        }
+    }
+    t->pf = pf;
+    t->pfwrap = (uint8_t) wrap;
+}
+
+/* the opaque textures of the frame about to be drawn get their filter worked out (a few
+   per frame, so a new track does not stall: the others use the filter as before) */
+static int sPfPerFrame = 4;
+static void prefilter_prepare(void) {
+    if (!port_opt_filter || port_opt_exact)
+        return;
+    const Bucket *b = &sRenB[KIND_OP];
+    int built = 0;
+    for (int i = 0; i < b->nbatch && built < sPfPerFrame; i++) {
+        const RState *st = &b->batch[i].st;
+        if (!st->tex || !b->batch[i].count || st->mirru || st->mirrv)
+            continue;
+        struct SwTex *t = &sTex[st->tex];
+        if (!t->px || t->pf || t->pfnever || t->w > 64 || t->h > 64)
+            continue;
+        if ((!st->clampu && (t->w & (t->w - 1))) || (!st->clampv && (t->h & (t->h - 1))))
+            continue;   /* (the filter only runs with power-of-two repeat or clamp) */
+        tex_build_pf(t, st->clampu | (st->clampv << 1));
+        built++;
+    }
+}
+
 static void sort_tr(void) {
+    if (!sPipe)
+        prefilter_prepare();   /* (-paralelo: in pipe_handover, before the textures are copied) */
     Bucket *b = &sRenB[KIND_TR];
 #ifdef HAVE_FETCH_ASM
     if (sFetchAsm < 0) {   /* first frame, before any raster thread runs */
@@ -2748,6 +2881,7 @@ static void pipe_handover(void) {
     Bucket *r = sRecB;
     sRecB = r == sBk[0] ? sBk[1] : sBk[0];   /* the set that was drawn: free again */
     sRenB = r;
+    prefilter_prepare();
     for (int k = 0; k < 3; k++)
         for (int i = 0; i < sRenB[k].nbatch; i++) {
             const uint32_t id = sRenB[k].batch[i].st.tex;

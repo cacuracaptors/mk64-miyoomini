@@ -142,6 +142,8 @@ NE_STATIC int16x4_t vreinterpret_s16_u16(uint16x4_t a) { int16x4_t r; memcpy(r.v
 NE_STATIC uint16x8_t vreinterpretq_u16_s16(int16x8_t a) { uint16x8_t r; memcpy(r.v, a.v, 16); return r; }
 NE_STATIC uint32x4_t vreinterpretq_u32_s32(int32x4_t a) { uint32x4_t r; memcpy(r.v, a.v, 16); return r; }
 NE_STATIC uint64x1_t vreinterpret_u64_u16(uint16x4_t a) { uint64x1_t r; memcpy(r.v, a.v, 8); return r; }
+NE_STATIC uint8x8x4_t vld4_dup_u8(const uint8_t *p) { uint8x8x4_t r; for (int k = 0; k < 4; k++) for (int i = 0; i < 8; i++) r.val[k].v[i] = p[k]; return r; }
+NE_STATIC uint8x8_t vbsl_u8(uint8x8_t m, uint8x8_t a, uint8x8_t b) { uint8x8_t r; for (int i = 0; i < 8; i++) r.v[i] = (uint8_t) ((m.v[i] & a.v[i]) | (~m.v[i] & b.v[i])); return r; }
 NE_STATIC uint64_t vget_lane_u64(uint64x1_t a, int n) { (void) n; return a.v[0]; }
 
 /* ---- 8-bit lanes ---- */
