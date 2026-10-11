@@ -7,7 +7,8 @@
  *   Y       -> C-up (camera)                 X      -> C-right
  *   START   -> START                         SELECT -> L (and L1 outside races)
  *   D-pad   -> analog stick (steering ramps up while held) + D-pad bits
- *   SELECT+START or MENU held 1 s -> quit
+ *   MENU pressed and released alone -> quit (MENU with another key, like OnionOS's
+ *   MENU+POWER screenshot, does not); SELECT+START held 1 s -> quit
  *   X held, then SELECT -> save a capture of the next frame (capture_NN.bin, for debugging)
  */
 #include <stdio.h>
@@ -44,6 +45,21 @@ static int ev_fd = -1;
 static unsigned char held[K_COUNT];
 static double quit_since;
 static int quit_flag;
+/* MENU quits on its release, if no other key (mapped or not: POWER, volume...) was down
+   while it was held: MENU+POWER is OnionOS's screenshot */
+static unsigned char down_any[KEY_MAX / 8 + 1];   /* every key code down now */
+static int menu_down, menu_mixed;
+
+static int others_down(void) {
+    for (int i = 0; i < (int) sizeof(down_any); i++) {
+        unsigned char m = down_any[i];
+        if (i == KEY_ESC / 8)
+            m &= (unsigned char) ~(1u << (KEY_ESC % 8));
+        if (m)
+            return 1;
+    }
+    return 0;
+}
 
 static int key_index(int code) {
     switch (code) {
@@ -84,7 +100,22 @@ void port_input_poll(void) {
         for (int i = 0; i < n; i++) {
             if (ev[i].type != EV_KEY)
                 continue;
-            int k = key_index(ev[i].code);
+            const int code = ev[i].code;
+            if (code >= 0 && code < KEY_MAX) {
+                if (ev[i].value) down_any[code / 8] |= (unsigned char) (1u << (code % 8));
+                else down_any[code / 8] &= (unsigned char) ~(1u << (code % 8));
+            }
+            if (code == KEY_ESC && ev[i].value == 1) {          /* MENU pressed */
+                menu_down = 1;
+                menu_mixed = others_down();
+            } else if (code == KEY_ESC && ev[i].value == 0) {   /* MENU released */
+                if (menu_down && !menu_mixed && !others_down())
+                    quit_flag = 1;
+                menu_down = 0;
+            } else if (code != KEY_ESC && ev[i].value == 1 && menu_down) {
+                menu_mixed = 1;                                 /* another key with MENU */
+            }
+            int k = key_index(code);
             if (k < 0)
                 continue;
             held[k] = (ev[i].value != 0); /* 1 = press, 2 = repeat, 0 = release */
@@ -93,7 +124,7 @@ void port_input_poll(void) {
             break;
     }
 
-    int combo = (held[K_SELECT] && held[K_START]) || held[K_MENU];
+    int combo = held[K_SELECT] && held[K_START];
     double now = port_now_ms();
     if (combo) {
         if (quit_since == 0)
