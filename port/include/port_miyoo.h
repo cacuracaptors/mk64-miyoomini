@@ -6,6 +6,8 @@
 
 /* port/port_main.c */
 void port_chdir_to_exe(void);
+/* first run: dc_data/ from the player's ROM (mk64.rcp); every run: the executable's game data */
+void port_setup(void);
 void port_init(int argc, char **argv);
 void port_start_vblank(void (*fn)(uint32_t, void *));
 void port_poll_quit(void);

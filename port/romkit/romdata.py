@@ -8,9 +8,12 @@
       the data sections of these objects: their bytes go to romdata.bin (the game
       fills them back in at start-up, see port/setup_miyoo.c) and out_bin is the
       executable with them zeroed, the one that is published
+  romdata.py apply BIN romdata.bin out_bin
+      puts the bytes back (what the game does at start-up), to check a release
 
 romdata.bin: b"MK64ROMD", u32 region count, then per region u32 address and
-u32 size, then the bytes of every region in that order (little-endian).
+u32 size, then the bytes of every region in that order (little-endian). On the
+device it is dc_data/romdata.bin.
 """
 import re
 import struct
@@ -25,15 +28,15 @@ def load_segments(data):
     phentsize, phnum = struct.unpack_from("<HH", data, 42)
     segs = []
     for i in range(phnum):
-        p_type, p_offset, p_vaddr, _, p_filesz = struct.unpack_from("<IIIII", data, phoff + i * phentsize)
+        p_type, p_offset, p_vaddr, _, p_filesz, _, p_flags = struct.unpack_from("<IIIIIII", data, phoff + i * phentsize)
         if p_type == 1:
-            segs.append((p_vaddr, p_offset, p_filesz))
+            segs.append((p_vaddr, p_offset, p_filesz, p_flags))
     return segs
 
 
-def file_offset(segs, addr, size):
-    for vaddr, off, filesz in segs:
-        if vaddr <= addr and addr + size <= vaddr + filesz:
+def file_offset(segs, addr, size, writable=False):
+    for vaddr, off, filesz, flags in segs:
+        if vaddr <= addr and addr + size <= vaddr + filesz and (flags & 2 or not writable):
             return off + (addr - vaddr)
     return None
 
@@ -96,9 +99,10 @@ def cmd_strip(mapf, binf, outbin, outrom, objs):
     regions = []
     for sec, addr, size, obj in map_sections(mapf):
         if obj in want:
-            off = file_offset(segs, addr, size)
+            # the game writes them back at start-up, so only writable data (.data)
+            off = file_offset(segs, addr, size, writable=True)
             if off is None:
-                sys.exit("%s %s is not in a loaded segment" % (obj, sec))
+                sys.exit("%s %s is not in a writable loaded segment" % (obj, sec))
             regions.append((addr, size, off))
     regions.sort()
     blob = bytearray(b"MK64ROMD" + struct.pack("<I", len(regions)))
@@ -114,10 +118,31 @@ def cmd_strip(mapf, binf, outbin, outrom, objs):
     print("%d trechos, %d bytes de dados do jogo tirados do executavel" % (len(regions), total))
 
 
+def cmd_apply(binf, romf, outf):
+    """what the game does at start-up, on the file: for checking a release"""
+    data = bytearray(open(binf, "rb").read())
+    segs = load_segments(bytes(data))
+    blob = open(romf, "rb").read()
+    if blob[:8] != b"MK64ROMD":
+        sys.exit("%s is not a romdata file" % romf)
+    n = struct.unpack_from("<I", blob, 8)[0]
+    at = 12 + 8 * n
+    for i in range(n):
+        addr, size = struct.unpack_from("<II", blob, 12 + 8 * i)
+        off = file_offset(segs, addr, size, writable=True)
+        if off is None:
+            sys.exit("region %d is not in a writable loaded segment" % i)
+        data[off:off + size] = blob[at:at + size]
+        at += size
+    open(outf, "wb").write(data)
+
+
 if __name__ == "__main__":
     a = sys.argv
     if len(a) == 5 and a[1] == "sections":
         cmd_sections(a[2], a[3], a[4])
+    elif len(a) == 5 and a[1] == "apply":
+        cmd_apply(a[2], a[3], a[4])
     elif len(a) >= 7 and a[1] == "strip":
         cmd_strip(a[2], a[3], a[4], a[5], a[6:])
     else:

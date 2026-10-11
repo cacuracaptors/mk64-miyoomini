@@ -44,6 +44,17 @@ uint32_t rk_mio0_encode(const uint8_t *in, uint32_t length, uint8_t *out);
 /* the MIO0 stream at in: its decompressed bytes (malloc'ed) and the stream's length, 0 if none */
 uint32_t rk_mio0_decode(const uint8_t *in, size_t avail, uint8_t **out, uint32_t *raw_len);
 
+/* reading a recipe: open it, then for each file rk_recipe_next and either
+   rk_recipe_build (its bytes, checked against its CRC) or rk_recipe_skip */
+typedef struct { const uint8_t *p, *end; uint32_t rom_size, rom_crc, pool_size, nfiles; } rk_recipe;
+typedef struct { char name[65]; uint32_t size, crc, nops; } rk_file;
+int rk_recipe_open(rk_recipe *r, const uint8_t *buf, size_t n);
+int rk_recipe_next(rk_recipe *r, rk_file *f);
+int rk_recipe_skip(rk_recipe *r, const rk_file *f);
+/* progress (optional) gets the bytes of this file made so far */
+int rk_recipe_build(rk_recipe *r, const rk_file *f, const uint8_t *pool, uint32_t pool_size, uint8_t *out,
+                    void (*progress)(uint32_t done));
+
 static inline uint8_t rk_view(const uint8_t *pool, uint32_t p, int view) {
     static const uint32_t mask[3] = { 0, 1, 3 };
     return pool[p ^ mask[view]];

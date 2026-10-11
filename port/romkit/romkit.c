@@ -266,3 +266,103 @@ uint32_t rk_mio0_decode(const uint8_t *in, size_t avail, uint8_t **out, uint32_t
     *raw_len = d;
     return unc + ui;
 }
+
+/* ---- recipes ---- */
+static int get32(const uint8_t **p, const uint8_t *end, uint32_t *v) {
+    if (end - *p < 4)
+        return 0;
+    memcpy(v, *p, 4);
+    *p += 4;
+    return 1;
+}
+
+int rk_recipe_open(rk_recipe *r, const uint8_t *buf, size_t n) {
+    if (n < 28 || memcmp(buf, "MK64RCP1", 8))
+        return 0;
+    r->p = buf + 8;
+    r->end = buf + n;
+    return get32(&r->p, r->end, &r->rom_size) && get32(&r->p, r->end, &r->rom_crc) &&
+           get32(&r->p, r->end, &r->pool_size) && get32(&r->p, r->end, &r->nfiles);
+}
+
+int rk_recipe_next(rk_recipe *r, rk_file *f) {
+    if (r->end - r->p < 64)
+        return 0;
+    memcpy(f->name, r->p, 64);
+    f->name[64] = 0;
+    r->p += 64;
+    return get32(&r->p, r->end, &f->size) && get32(&r->p, r->end, &f->crc) && get32(&r->p, r->end, &f->nops);
+}
+
+/* runs nops ops into o (cap bytes; o NULL: only steps over them); the bytes made, or -1 */
+static long run_ops(const uint8_t **pp, const uint8_t *end, uint32_t nops, const uint8_t *pool, uint32_t pool_size,
+                    uint8_t *o, uint32_t cap, uint32_t base, void (*progress)(uint32_t)) {
+    const uint8_t *p = *pp;
+    uint32_t at = 0;
+    static const uint32_t mask[4] = { 0, 0, 1, 3 };
+    for (uint32_t k = 0; k < nops; k++) {
+        if (p >= end)
+            return -1;
+        const uint8_t kind = *p++;
+        uint32_t a, len;
+        if (kind == 0) {
+            if (!get32(&p, end, &len) || (uint32_t) (end - p) < len || at + len > cap)
+                return -1;
+            if (o) memcpy(o + at, p, len);
+            p += len;
+        } else if (kind <= 3) {
+            if (!get32(&p, end, &a) || !get32(&p, end, &len) || at + len > cap || a > pool_size || len > pool_size - a)
+                return -1;
+            if (o) {
+                const uint32_t m = mask[kind];
+                for (uint32_t q = 0; q < len; q++)
+                    o[at + q] = pool[(a + q) ^ m];
+            }
+        } else if (kind == 4) {
+            uint32_t rawlen, sub;
+            if (!get32(&p, end, &rawlen) || !get32(&p, end, &sub) || rawlen > (64u << 20))
+                return -1;
+            if (o) {
+                uint8_t *raw = malloc(rawlen ? rawlen : 1), *enc = malloc((size_t) rawlen * 2 + 64);
+                long got = raw && enc ? run_ops(&p, end, sub, pool, pool_size, raw, rawlen, 0, NULL) : -1;
+                len = got == (long) rawlen ? rk_mio0_encode(raw, rawlen, enc) : 0;
+                if (got != (long) rawlen || at + len > cap) {
+                    free(raw);
+                    free(enc);
+                    return -1;
+                }
+                memcpy(o + at, enc, len);
+                free(raw);
+                free(enc);
+            } else {
+                if (run_ops(&p, end, sub, pool, pool_size, NULL, rawlen, 0, NULL) < 0)
+                    return -1;
+                len = 0;   /* (unknown without compressing: only used to step over) */
+            }
+        } else if (kind == 5) {
+            if (p >= end)
+                return -1;
+            const uint8_t v = *p++;
+            if (!get32(&p, end, &len) || at + len > cap)
+                return -1;
+            if (o) memset(o + at, v, len);
+        } else {
+            return -1;
+        }
+        at += len;
+        if (progress && (k & 255) == 255)
+            progress(base + at);
+    }
+    *pp = p;
+    return (long) at;
+}
+
+int rk_recipe_skip(rk_recipe *r, const rk_file *f) {
+    return run_ops(&r->p, r->end, f->nops, NULL, 0xFFFFFFFFu, NULL, 0xFFFFFFFFu, 0, NULL) >= 0;
+}
+
+int rk_recipe_build(rk_recipe *r, const rk_file *f, const uint8_t *pool, uint32_t pool_size, uint8_t *out,
+                    void (*progress)(uint32_t done)) {
+    const long got = run_ops(&r->p, r->end, f->nops, pool, pool_size, out, f->size, 0, progress);
+    return got == (long) f->size && rk_crc32(0, out, f->size) == f->crc;
+}

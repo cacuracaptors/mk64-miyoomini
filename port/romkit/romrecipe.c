@@ -415,74 +415,31 @@ static void mkdirs(const char *path) {
         if (*s == '/') { *s = 0; mkdir(tmp, 0777); *s = '/'; }
 }
 
-/* runs n ops from *pp into o (room for cap bytes); returns the bytes produced, or -1 */
-static long run_ops(const uint8_t **pp, uint32_t nops, uint8_t *o, uint32_t cap) {
-    const uint8_t *p = *pp;
-    uint32_t at = 0;
-    for (uint32_t k = 0; k < nops; k++) {
-        const uint8_t kind = *p++;
-        if (kind == 0) {
-            const uint32_t len = get32(&p);
-            if (at + len > cap) return -1;
-            memcpy(o + at, p, len); p += len; at += len;
-        } else if (kind <= 3) {
-            const uint32_t src = get32(&p), len = get32(&p);
-            if (at + len > cap || src + len > pool_size) return -1;
-            for (uint32_t q = 0; q < len; q++) o[at + q] = rk_view(pool, src + q, kind - 1);
-            at += len;
-        } else if (kind == 4) {
-            const uint32_t rawlen = get32(&p), sub = get32(&p);
-            uint8_t *raw = malloc(rawlen ? rawlen : 1), *enc = malloc((size_t) rawlen * 2 + 64);
-            if (run_ops(&p, sub, raw, rawlen) != (long) rawlen) return -1;
-            const uint32_t elen = rk_mio0_encode(raw, rawlen, enc);
-            if (at + elen > cap) return -1;
-            memcpy(o + at, enc, elen);
-            at += elen;
-            free(raw);
-            free(enc);
-        } else if (kind == 5) {
-            const uint8_t v = *p++;
-            const uint32_t len = get32(&p);
-            if (at + len > cap) return -1;
-            memset(o + at, v, len);
-            at += len;
-        } else {
-            return -1;
-        }
-    }
-    *pp = p;
-    return (long) at;
-}
-
 static int cmd_apply(char **argv) {
     if (!load_rom(argv[2]))
         return 1;
     size_t rn;
-    const uint8_t *r = read_file(argv[3], &rn), *p = r;
-    if (!r || rn < 28 || memcmp(r, "MK64RCP1", 8)) { fprintf(stderr, "receita invalida\n"); return 1; }
-    p += 8;
-    const uint32_t rsz = get32(&p), rcrc = get32(&p), psz = get32(&p), nf = get32(&p);
-    if (rsz != rom_size || rcrc != rk_crc32(0, rom, rom_size) || psz != pool_size) {
+    const uint8_t *r = read_file(argv[3], &rn);
+    rk_recipe rc;
+    if (!r || !rk_recipe_open(&rc, r, rn)) { fprintf(stderr, "receita invalida\n"); return 1; }
+    if (rc.rom_size != rom_size || rc.rom_crc != rk_crc32(0, rom, rom_size) || rc.pool_size != pool_size) {
         fprintf(stderr, "esta ROM nao e a da receita\n");
         return 1;
     }
     int bad = 0;
-    for (uint32_t f = 0; f < nf; f++) {
-        char name[65] = { 0 };
-        memcpy(name, p, 64); p += 64;
-        const uint32_t size = get32(&p), crc = get32(&p), nops = get32(&p);
-        uint8_t *o = malloc(size ? size : 1);
-        const long got = run_ops(&p, nops, o, size);
-        const int ok = got == (long) size && rk_crc32(0, o, size) == crc;
+    rk_file f;
+    for (uint32_t k = 0; k < rc.nfiles && rk_recipe_next(&rc, &f); k++) {
+        uint8_t *o = malloc(f.size ? f.size : 1);
+        const int ok = rk_recipe_build(&rc, &f, pool, pool_size, o, NULL);
         char path[512];
-        snprintf(path, sizeof path, "%s/%s", argv[4], name);
+        snprintf(path, sizeof path, "%s/%s", argv[4], f.name);
         mkdirs(path);
         FILE *w = fopen(path, "wb");
-        if (w) { fwrite(o, 1, size, w); fclose(w); }
-        printf("%-36s %s\n", name, ok ? "ok" : "ERRADO");
+        if (w) { fwrite(o, 1, f.size, w); fclose(w); }
+        printf("%-36s %s\n", f.name, ok ? "ok" : "ERRADO");
         bad |= !ok;
         free(o);
-        if (got < 0) break;
+        if (!ok) break;
     }
     return bad;
 }

@@ -608,6 +608,7 @@ int main(int argc, char **argv) {
     gPhysicalFramebuffers[2] = fb[2];
 
     port_chdir_to_exe(); /* the data sits next to the executable */
+    port_setup();        /* before anything uses the game data (port/setup_miyoo.c) */
     fnpre = ".";
     FILE* fntest = fopen("./dc_data/common_data.bin", "rb");
     if (NULL == fntest) {

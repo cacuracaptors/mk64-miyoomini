@@ -1,211 +1,151 @@
-## Mario Kart 64 for Dreamcast (updated 2026/08/23)
-
-New and improved MK64-DC with hardware-mixed audio, raw PowerVR Fast3d backend, 30 fps 4 player with music and more.
-
-# You can upload a ROM and download a CDI.
-# Find more details here: https://colab.research.google.com/drive/1IhNVeiFJxnn5oVLLG_Esrb_bZZ5Nl8Rs
-
-Now for business as usual.
-
-This is a Sega Dreamcast port of the Mario Kart 64 decompilation [ https://github.com/n64decomp/mk64 ] .
-
-![Rainbow Road](/media/screenshot3.png)
-![Koopa Troopa Beach](/media/screenshot2.png)
-![DK's Jungle Parkway](/media/screenshot1.png)
-
-Do not ask for a CDI or ISO. Learn how to build it or don't play it.
-
-I am not getting sued by Nintendo to make your lives easy.
-
-Anyway, here's how to build it yourself.
-
-NOTE: This game has been tested and works properly on ***physical hardware***. Emulation is already known to have many issues with this release, so do not open up a ticket unless you've confirmed that it is an actual bug on real hardware.
-
-# Build Guide #
-
-**Pre-requisites**
-
-Whatever the directory you cloned this github repo to is named and wherever it is located, it will be referred to in this document as
-
-`mario-kart-64-dc`
-
-This guide will assume that you cloned it into your home directory. 
-
-If you need to get to the top level of the repo, it will say
-
-    cd ~/mario-kart-64-dc
-
-
-The build is known to work on the following platforms as of the current commit:
-
-    Ubuntu 22.04
-    macOS 15.5
-    Windows 11 (with DreamSDK)
-
-It should work on most other Linux environments.
-
-You will need a host/native GCC install and a full working Dreamcast/KallistiOS compiler toolchain install. You will also need to install the latest `kos-ports`.
-
-See the [Dreamcast Wiki](https://dreamcast.wiki/Getting_Started_with_Dreamcast_development) for instructions. Windows users can get everything needed from installing the latest version of [DreamSDK](https://sizious.emunova.net/dreamsdk/releases/DreamSDK-R4-dev-alpha5-Setup.iso).
-
-Mario Kart 64 DC has only been tested to build and run using `sh-elf-gcc` versions 13 (13.2, 13.3), 14 (14.2) and 15 (15.1). Use any other major version at your own risk. No support will be provided.
-
-*NOTE: WHEN BUILDING KOS, USE THE `environ.sh` FILE PROVIDED IN THE `mario-kart-64-dc` REPO.*
-
-Mario Kart 64 can be built using an unmodified copy of KOS cloned directly from the official repo. Mario Kart 64 requires the use of KallistiOS commit `680d1862` (from `master` branch). 
-There are zero guarantee that it even *builds* against any other KOS commit, nevermind that it runs or runs correctly.
-
-If you are going to file a Github issue, make sure you are using that version to test your problem. Your issue will be closed without action otherwise.
-
-Please follow the instructions for building KOS found in the wiki: [ https://dreamcast.wiki/Getting_Started_with_Dreamcast_development#Configuring_and_compiling_KOS_and_kos-ports ].
-
-And be sure to not skip `Building kos-ports`.
-
-*AGAIN: BE SURE TO USE THE `environ.sh` FILE PROVIDED IN THE `mario-kart-64-dc` FOR YOUR KOS BUILD.*
-
-**Compiling Mario Kart 64 for Dreamcast**
-
-Somehow acquire a Mario Kart 64 ROM in Z64 format and *name it all lowercase `baserom.us.z64` .*
-
-Copy `baserom.us.z64` into `~/mario-kart-64-dc`.
-
-Check that your Mario Kart 64 ROM is a supported version.
-
-The below is the expected md5sum output:
-
-    md5sum baserom.us.z64
-    3a67d9986f54eb282924fca4cd5f6dff  baserom.us.z64
-
-Go to the repo directory and compile it like any other KallistiOS project. Make sure you source your KOS environment first (third reminder, use the `environ.sh` provided with in mario-kart-64-dc repo).
-
-To build the source into an ELF file, run the following commands (exactly as written, except for the path to the mario-kart-64-dc repo, do not change, if it doesn't build, it is your fault not mine):
-
-    source /opt/toolchains/dc/kos/environ.sh
-    cd ~/mario-kart-64-dc
-    git submodule update --init
-    cd tools/torch
-
-Under `~/mario-kart-64-dc/tools/torch` you will find a `README.md` with instructions on installing dependencies for `torch`.
-See: [ https://github.com/HarbourMasters/Torch/blob/6a2eb921482f2eb3b3cb5b675152d6d21d1a20ff/README.md ]
-
-For Linux and other Linux-like environments, follow those instructions or nothing else will work. Then continue with the following commands (we will start from the beginning so there is no confusion):
-
-    source /opt/toolchains/dc/kos/environ.sh
-    cd ~/mario-kart-64-dc
-    cd tools/torch
-    make
-    cd ..
-    make
-    cd ..
-    make assets
-    make
-
-For macOS, make sure you have `gmake` installed (you may need to install it with `brew`) and try the following (this is how I build it):
-
-    source /opt/toolchains/dc/kos/environ.sh
-    cd ~/mario-kart-64-dc
-    cd tools/torch
-    CMAKE_POLICY_VERSION_MINIMUM=3.5 gmake
-    cd ..
-    CMAKE_POLICY_VERSION_MINIMUM=3.5 gmake
-    cd ..
-    CMAKE_POLICY_VERSION_MINIMUM=3.5 gmake assets
-    CMAKE_POLICY_VERSION_MINIMUM=3.5 gmake
-
-For Windows DreamSDK users the following prerequesites must be installed:
-* Python, CMake, Git
-* GLdc from kos-ports
-
-Next, you must fix the `CMakeLists.txt` file in `tools/torch` to add the `wininet` library:
-
-    # Link StormLib
-
-    set(STORMLIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/lib/StormLib)
-    add_subdirectory(${STORMLIB_DIR})
-    target_link_libraries(${PROJECT_NAME} PRIVATE storm wininet)
-
-After doing this, we can build Mario Kart 64 with DreamSDK using the following commands:
-
-    git clone https://github.com/jnmartin84/mk64-dc.git mario-kart-64-dc
-    cd ~/mario-kart-64-dc
-    mv /opt/toolchains/dc/kos/environ.sh /opt/toolchains/dc/kos/environ.sh.orig
-    cp environ.sh /opt/toolchains/dc/kos/environ.sh
-    source /opt/toolchains/dc/kos/environ.sh
-    cd tools
-    CMAKE_POLICY_VERSION_MINIMUM=3.5 make
-    cd ~/mario-kart-64-dc
-    make assets
-    make
-
-**How to Generate Mario Kart 64 Disc Image**
-
-Make sure that you have `mkdcdisc` built and the executable available on your path.
-See: [ https://gitlab.com/simulant/mkdcdisc ] for that. Windows users of DreamSDK
-will not need this dependency.
-
-Once that is taken care of, run the following commands 
-
-    cd ~/mario-kart-64-dc
-    make cdi
-
-Moments later, you will have a `mariokart64.cdi` ready to burn to disc.
-
-If you are trying to use the disc image on anything OTHER than a CDR, I cannot help you and will not even pretend to try to help. You're on your own.
-
-**How to Generate Mario Kart 64 DreamShell Image**
-
-Users of DreamShell will want to create a DreamShell-compatible ISO using the following commands
-
-    cd ~/mario-kart-64-dc
-    make dsiso
-
-Moments later, you will have a `mariokart64.ds.iso` which is ready to be copied to your IDE drive or SD card!
-
-# Playing Mario Kart 64 on the Sega Dreamcast #
-
-The following is the mapping of N64 controls/actions to Dreamcast controls.
-
-    Dreamcast DPAD - N64 DPAD (move in menus)
-    Dreamcast Analog Stick - N64 Analog Stick (move in game)
-    Dreamcast Start - N64 Start (... start)
-    Dreamcast A button - N64 A button (accelerate, menu select)
-    Dreamcast B button - N64 B button (brake, menu back?)
-    Dreamcast X button - N64 right C button (HUD change)
-    Dreamcast Y button - N64 up C button (camera)
-    Dreamcast L trigger - N64 Z trigger (use item)
-    Dreamcast R trigger - N64 R trigger (jump/drift)
-
-These controls are fixed, they are not configurable. If you don't like it, submit a Pull Request.
-
-Options/race records (EEPROM) and time trial ghosts (Controller Pak) saving are both supported when a VMU is
-inserted in controller 1 and has enough free blocks to write the files.
-
-The EEPROM save requires 3 blocks. The time trial ghost save requires 67 blocks.
-
-The game will still function normally without a VMU present.
-
-# Acknowledgments
-
-## Dreamcast Side ##
-Falco Girgis (@gyrovorbis) - the game doesn't have sound without him. Extreme optimizations to the audio mixer made full speed gameplay and pristine sound possible.
-Other optimizations to matrix math across the entire code base kept it fast and made it faster.
-
-Paul Cercueil (@pcercuei) - "HEY THAT'S A FIPR" and now we have FPU matrix-accelerated audio.
-
-Luke Benstead (@kazade) - Without GLdc, this project would have taken 6 more months for me to go and write a new Fast3d backend instead of being able to start with an existing GL one. And for quickly reviewing and accepting my PRs to GLdc to add mirrored repeat :-D
-
-@stiffpeaks - VMU assets and case artwork
-
-John Brooks (@JBrooksBSI) - The man credited as the "Lead Technologist" for World Series Baseball 2k2 graciously offered some incredibly good advice over X/Twitter with regards to vectorizing aDPCMdecImpl(), which directly resulted in better audio performance while under load.
-
-## Nintendo 64 Side ##
-
-MK64 decomp team.
-
-MegaMech for taking time to personally answer questions and show me many bug-fixes. Game wouldn't be right without them.
-
-N64 Decompilation Discord/#mk64-decomp.
-
-Spaghetti Kart project/team. Without being able to reference that code, there are things that would not be working and would never be working.
-
-SonicDreamcaster - we're going to bring you over to the Dreamcast dark side.
+# Mario Kart 64 - Miyoo Mini Plus / OnionOS Port
+
+This is a port of [**mk64-dc**](https://github.com/jnmartin84/mk64-dc) - jnmartin84's Sega Dreamcast port of
+the [Mario Kart 64 decompilation](https://github.com/n64decomp/mk64) - to the **Miyoo Mini Plus** handheld
+running **OnionOS**.
+
+The Miyoo Mini Plus has no 3D GPU, so this port draws the game with a software renderer written for it:
+NEON-accelerated and spread over both CPU cores. It plays the **USA version** of Mario Kart 64, built from your
+own ROM.
+
+**[Download the latest release](https://github.com/cacuracaptors/mk64-miyoomini/releases)**
+
+## OnionOS Exclusive Features
+
+- Native 640x480, no overclock needed
+- 60 FPS single-player races, with dynamic resolution: in the heaviest moments the picture drops for an
+  instant to as low as 448x336 instead of the frame rate dropping
+- A software renderer made for the Miyoo Mini Plus:
+  - perspective-correct textures and a proper depth buffer
+  - rendering pipelined over both CPU cores
+  - the N64's 3-point texture filter on the road and other close-up surfaces
+  - a smooth, filtered waterfall in D.K.'s Jungle Parkway
+- Full sound: the N64 music and sound effects, mixed in software
+- Records, options and ghosts are saved
+- Easy installation: just copy your ROM (`.z64`, `.n64`, `.v64` or zipped) into the game's folder. The game data
+  is built from it automatically on the first start, with a progress screen, and the ROM is removed afterwards
+- The Menu key quits the game on a single press, and the OnionOS Menu+Power screenshot combo is safe to use
+
+## Installation
+
+1. Download the release zip and extract it to the root of your OnionOS SD card. This places the `MarioKart64`
+   folder in `Roms/PORTS/Games/`, and the shortcut and its image in `Roms/PORTS/Shortcuts/` and
+   `Roms/PORTS/Imgs/`.
+2. You need your own legitimate copy of **Mario Kart 64 (USA)** as a ROM file. Copy it into
+   `Roms/PORTS/Games/MarioKart64/`. Any of `.z64`, `.n64` or `.v64` works, also inside a `.zip`; the file name
+   doesn't matter.
+3. On OnionOS, open **Mario Kart 64** from the Ports list (use "Refresh roms" at the bottom of the list if it
+   doesn't show up).
+
+The first start builds the game data from the ROM. It takes about a minute, shows a progress screen, and only
+happens once: the ROM is removed at the end. It needs about 25 MB of free space on the SD card; if there isn't
+enough, the screen says how much is needed. If the ROM is not the USA version (or was modified), the screen says
+so and nothing is changed.
+
+When you update the port to a new version, copy the ROM into the folder again: the new version rebuilds its data
+from it on its first start.
+
+## Controls
+
+| Button | Action |
+|---|---|
+| D-pad | Steer / move in menus |
+| A | Accelerate / confirm |
+| B | Brake, reverse / back |
+| R1 or R2 | Hop / drift |
+| L1 or L2 | Use item (L1 is also the N64 L button in menus) |
+| Y | Change the camera (C-up) |
+| X | C-right |
+| Start | Pause / start |
+| Select | N64 L button (the "L: Option" menu) |
+| Menu | Quit the game (press and release) |
+
+Select+Start held for one second also quits.
+
+## Options
+
+The shortcut (`Roms/PORTS/Shortcuts/Mario Kart 64.port`) starts the game with `-hires -60fps -resdin -filtro`.
+You can edit its `Arguments` line:
+
+| Option | Effect |
+|---|---|
+| `-hires` | Renders at 640x480 (without it: 320x240, faster and blurrier) |
+| `-60fps` | Single-player races at up to 60 FPS (without it: 30 FPS, as on the N64) |
+| `-resdin` | Dynamic resolution (with `-hires`): smaller frames only while a frame doesn't fit in 1/60 s |
+| `-filtro` | N64-style texture filter on the road and other close-up surfaces |
+| `-mudo` | No sound |
+| `-perf` | Timing lines in `log.txt` every 2 seconds |
+
+## Known issues
+
+- Only the USA version of the game is supported.
+- There is one controller, so the multiplayer modes can't be played.
+- An OnionOS screenshot (Menu+Power) pauses the game for about a second while it is saved.
+- The game's log is in `log.txt`, in `Roms/PORTS/Games/MarioKart64/` - please attach it to your reports.
+
+## Changelog
+
+- **v1.0.0** - Initial release.
+
+## Building from source
+
+This port cross-compiles for ARMv7 hard-float on Windows + WSL2, with the
+[union-miyoomini-toolchain](https://github.com/shauninman/union-miyoomini-toolchain) (the same glibc as OnionOS).
+
+### Prerequisites
+
+- WSL2 with Ubuntu, `python3` and `gcc`
+- The toolchain copied out of its Docker container once, to `~/fallout-miyoo/miyoomini-toolchain`:
+  `docker cp miyoomini-toolchain-debug:/opt/miyoomini-toolchain ~/fallout-miyoo/miyoomini-toolchain`
+  (or point `CROSS_PREFIX` at your own `arm-linux-gnueabihf-`)
+- Your Mario Kart 64 (USA) ROM as `baserom.us.z64` in the root of this repository
+
+### Steps
+
+```bash
+sh port/build_miyoo.sh          # the game, with its data, in ~/fallout-miyoo/mk64-pacote (for testing)
+sh port/release_miyoo.sh 1.0.0  # the release zip, without any game data
+```
+
+`release_miyoo.sh` takes the game data out of the executable (`port/romkit/romdata.py`), writes the recipe
+`mk64.rcp` that rebuilds it - and all of `dc_data/` - from the player's ROM (`port/romkit/romrecipe.c`), checks
+that everything comes back byte for byte, and zips the OnionOS folder layout. The recipe holds no game data:
+only where each piece comes from in the ROM, plus the few bytes the port itself changed.
+
+### What this fork changes (compared to upstream jnmartin84/mk64-dc)
+
+- **`port/gfx_sw.c`** - the software renderer that replaces the Dreamcast PowerVR backend: NEON span
+  rasterizer, fixed-point depth buffer, translucency sorted like the PowerVR, the 3-point filter, and frames
+  drawn on the second core while the first prepares the next one
+- **`port/video_miyoo.c`**, **`port/gfx_wm_miyoo.c`** - the screen: frames converted, rotated and scaled by the
+  Miyoo Mini's 2D engine (MI_GFX), the game clock taken from the panel's vsync, dynamic resolution
+- **`port/audio_miyoo.c`**, **`port/mixer_miyoo.c`**, **`src/audio/synthesis.c`** - sound: the N64 software
+  synthesis path (the Dreamcast mixed on its AICA chip) with the audio microcode commands in C, output
+  through MI_AO
+- **`port/input_miyoo.c`** - the Miyoo Mini Plus buttons
+- **`port/saves_miyoo.c`** - the EEPROM and the Controller Pak (ghosts) as files in `saves/`
+- **`port/setup_miyoo.c`**, **`port/romkit/`** - the first-run setup that rebuilds the game data from the
+  player's ROM with a progress screen, and the release tools
+- **`port/port_main.c`**, **`port/kos_shim.c`**, **`port/n64_stubs.c`**, **`port/include/`** - startup,
+  options and the KallistiOS services the game code still calls
+- **`Makefile.miyoo`**, **`port/build_miyoo.sh`**, **`port/release_miyoo.sh`**, **`port/tools/`** - the ARM
+  build
+- **`src/`** - small fixes for the ARM build and for 60 FPS (the race steps by the vblanks a frame took)
+
+## Credits
+
+- Mario Kart 64 decompilation by the n64decomp team - https://github.com/n64decomp/mk64
+- Mario Kart 64 for Dreamcast by jnmartin84 - https://github.com/jnmartin84/mk64-dc
+- Software audio mixer from the Super Mario 64 PC port (sm64-port)
+- Miyoo Mini audio output (MI_AO) based on Steward Fu's SDL2 port - https://github.com/steward-fu/sdl2
+- Miyoo Mini toolchain by Shaun Inman - https://github.com/shauninman/union-miyoomini-toolchain
+- tinf (zip support in the setup) by Joergen Ibsen - https://github.com/jibsen/tinf
+- Setup screen text in DejaVu Sans Mono - https://dejavu-fonts.github.io
+- Original Mario Kart 64 (1996) by Nintendo
+- Miyoo Mini Plus port by [cacuracaptors](https://github.com/cacuracaptors)
+
+## License
+
+The decompilation and the Dreamcast port this fork is based on come without a license file; the code added for
+the Miyoo Mini Plus follows the same terms. tinf is under the zlib license (see `port/romkit/tinflate.c`).
+Mario Kart 64 is a trademark of Nintendo; no game data is included - you need your own copy of the game.
