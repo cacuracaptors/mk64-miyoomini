@@ -83,7 +83,7 @@ You can edit its `Arguments` line:
 - Occasionally, the second screen showing your competitors after the race finishes briefly flashes with random rendering artifacts.
 - On the Award Ceremony screen, the floor disappears depending on the camera angle and position.
 - Some tracks are missing filtering on their ground textures.
-- The ice in "Sherbet Land" is showing some rendering issues with transparency and reflexes.
+- The ice floor in "Sherbet Land" is showing some rendering issues with transparency and reflexes.
 - An OnionOS screenshot (Menu+Power) pauses the game for about a second while it is saved.
 - The game's log is in `log.txt`, in `Roms/PORTS/Games/MarioKart64/` - please attach it to your reports.
 
