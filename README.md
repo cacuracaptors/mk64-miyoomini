@@ -20,6 +20,8 @@ own ROM.
   - rendering pipelined over both CPU cores
   - the N64's 3-point texture filter on the road and other close-up surfaces
   - a smooth, filtered waterfall in D.K.'s Jungle Parkway
+- No overclock
+- Smooth controls: steering ramps up while held
 - Full sound: the N64 music and sound effects, mixed in software
 - Records, options and ghosts are saved
 - Easy installation: just copy your ROM (`.z64`, `.n64`, `.v64` or zipped) into the game's folder. The game data
