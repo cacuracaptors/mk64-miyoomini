@@ -78,6 +78,10 @@ int proj_is_ortho = 0;
 // overlay-ortho BACKGROUND (the over-skybox clouds, drawn in a race) from a Z-off
 // overlay-ortho OVERLAY (menu glyph text, drawn with no 3D scene) — otherwise identical.
 int cur_frame_persp = 0;
+// Miyoo: whether the CURRENT projection is a perspective one (guPerspective: [3][3]==0),
+// set on every projection LOAD. Its triangles are clipped at the N64's own near plane
+// (z_clip = -w_clip, i.e. w = the projection's near distance) instead of the eye plane.
+int proj_is_persp = 0;
 int prev_frame_had_persp = 0;
 // Set when a PERSPECTIVE (real 3D) triangle has been emitted this frame; reset in
 // start_frame. Used by gfx_draw_rectangle: a 2D quad drawn BEFORE any 3D, in a frame that
@@ -1541,6 +1545,7 @@ static __attribute__((noinline)) void gfx_sp_matrix(uint8_t parameters, const in
 			// the skybox must keep its far-plane pin (else it occludes the 3D scene).
 			proj_is_ortho = (matrix[3][3] > 0.5f) && (matrix[3][2] > -0.5f);
 			if (matrix[3][3] <= 0.5f) cur_frame_persp = 1;   // a perspective scene this frame
+			proj_is_persp = matrix[3][3] <= 0.5f;
 			shz_matrix_4x4_copy(rsp.P_matrix, matrix);
 		} else {
 			gfx_matrix_mul(rsp.P_matrix, (const float (*)[4]) matrix, (const float (*)[4]) rsp.P_matrix);
@@ -1799,6 +1804,21 @@ static inline float approx_recip_sign(float v) {
 // usual, keeping perspective-correct texturing/shading with no re-transform error.
 #define CLIP_MAX 12
 
+// Miyoo: a vertex in front of the eye but far outside the screen (|x/w| or |y/w| past
+// MIYOO_GUARD, in NDC) is clipped to the screen instead of emitted: the rasterizer's
+// fixed point and its 1e6-pixel guard need screen coordinates of sane size.
+#define MIYOO_GUARD 32.0f
+static inline int miyoo_in_guard(const struct LoadedVertex* v) {
+	const float g = MIYOO_GUARD * v->_w;
+	return v->_x <= g && v->_x >= -g && v->_y <= g && v->_y >= -g;
+}
+// Miyoo: a perspective vertex in front of the N64's near plane (clip_rej bit 4 clear:
+// _z < -_w); such a triangle must be clipped at that plane, as the RSP does.
+#define MIYOO_NEAR_IN 0x10
+// Miyoo: set around the full-screen path's clip: its edge planes sit at the guard band
+// (+-MIYOO_GUARD) instead of the viewport, so nothing on screen is cut that wasn't before.
+static int clip_edges_at_guard = 0;
+
 static struct LoadedVertex clip_bufA[CLIP_MAX] __attribute__((aligned(32)));
 static struct LoadedVertex clip_bufB[CLIP_MAX] __attribute__((aligned(32)));
 
@@ -1827,16 +1847,29 @@ static inline void clip_lerp_vertex(struct LoadedVertex* o, const struct LoadedV
 // Fill the active 5 clip planes (eye + 4 scissor) as {A,B,C,D,E}:
 // signed distance = A*_x + B*_y + C*_z + D*_w + E ; inside when >= 0.
 static inline void clip_fill_planes(float planes[5][5]) {
+	if (proj_is_persp) {
+		// Miyoo: a perspective projection is clipped where the RSP clips it, at its near
+		// plane: _z + _w >= 0 (guPerspective: w >= near > 0, so it also keeps every vertex
+		// in front of the eye). The old eye plane (w >= 1e-5) left vertices at w ~ 1e-5,
+		// whose x/w, y/w ran to millions of pixels: the rasterizer drops such a triangle
+		// whole, and the ceremony floor (big triangles, low camera) vanished.
+		planes[0][0] = 0.0f; planes[0][1] = 0.0f; planes[0][2] = 1.0f; planes[0][3] = 1.0f; planes[0][4] = 0.0f;
+	} else {
 	// eye guard: _w - eps >= 0
 	planes[0][0] = 0.0f; planes[0][1] = 0.0f; planes[0][2] = 0.0f; planes[0][3] = 1.0f; planes[0][4] = -SCISSOR_W_EPS;
+	}
+	const float xmin = clip_edges_at_guard ? -MIYOO_GUARD : sc_ndc_xmin;
+	const float xmax = clip_edges_at_guard ?  MIYOO_GUARD : sc_ndc_xmax;
+	const float ymin = clip_edges_at_guard ? -MIYOO_GUARD : sc_ndc_ymin;
+	const float ymax = clip_edges_at_guard ?  MIYOO_GUARD : sc_ndc_ymax;
 	// _x/_w >= xmin  ->  _x - xmin*_w >= 0
-	planes[1][0] = 1.0f; planes[1][1] = 0.0f; planes[1][2] = 0.0f; planes[1][3] = -sc_ndc_xmin; planes[1][4] = 0.0f;
+	planes[1][0] = 1.0f; planes[1][1] = 0.0f; planes[1][2] = 0.0f; planes[1][3] = -xmin; planes[1][4] = 0.0f;
 	// _x/_w <= xmax  ->  xmax*_w - _x >= 0
-	planes[2][0] = -1.0f; planes[2][1] = 0.0f; planes[2][2] = 0.0f; planes[2][3] = sc_ndc_xmax; planes[2][4] = 0.0f;
+	planes[2][0] = -1.0f; planes[2][1] = 0.0f; planes[2][2] = 0.0f; planes[2][3] = xmax; planes[2][4] = 0.0f;
 	// _y/_w >= ymin
-	planes[3][0] = 0.0f; planes[3][1] = 1.0f; planes[3][2] = 0.0f; planes[3][3] = -sc_ndc_ymin; planes[3][4] = 0.0f;
+	planes[3][0] = 0.0f; planes[3][1] = 1.0f; planes[3][2] = 0.0f; planes[3][3] = -ymin; planes[3][4] = 0.0f;
 	// _y/_w <= ymax
-	planes[4][0] = 0.0f; planes[4][1] = -1.0f; planes[4][2] = 0.0f; planes[4][3] = sc_ndc_ymax; planes[4][4] = 0.0f;
+	planes[4][0] = 0.0f; planes[4][1] = -1.0f; planes[4][2] = 0.0f; planes[4][3] = ymax; planes[4][4] = 0.0f;
 }
 
 static inline float clip_dist(const struct LoadedVertex* v, const float p[5]) {
@@ -2663,11 +2696,17 @@ static void  __attribute__((noinline)) GFX_HOT gfx_sp_tri1_impl(uint8_t vtx1_idx
     if (sc_is_fullscreen) {
         // PVR backend does no near-clipping, so the full-screen fast path must
         // reject/clip eye-plane straddles itself or 1/_w at emit explodes.
-        if (v1->_w > SCISSOR_W_EPS && v2->_w > SCISSOR_W_EPS && v3->_w > SCISSOR_W_EPS) {
+        // Miyoo: also clip at the near plane (perspective) and to the screen edges when a
+        // vertex would project far off-screen; the clip used to stop at the eye plane only.
+        const int near_cut = proj_is_persp && !(v1->clip_rej & v2->clip_rej & v3->clip_rej & MIYOO_NEAR_IN);
+        if (!near_cut && v1->_w > SCISSOR_W_EPS && v2->_w > SCISSOR_W_EPS && v3->_w > SCISSOR_W_EPS &&
+            miyoo_in_guard(v1) && miyoo_in_guard(v2) && miyoo_in_guard(v3)) {
             fan_tris[0][0] = v1; fan_tris[0][1] = v2; fan_tris[0][2] = v3;
             n_tris = 1;
         } else {
-            n_tris = gfx_build_clipped_fan(v1, v2, v3, fan_tris, SC_FORCE);
+            clip_edges_at_guard = 1;
+            n_tris = gfx_build_clipped_fan(v1, v2, v3, fan_tris, SC_FORCE | SC_EDGE_MASK);
+            clip_edges_at_guard = 0;
         }
     } else {
 #if GFX_PROF
@@ -2678,6 +2717,9 @@ static void  __attribute__((noinline)) GFX_HOT gfx_sp_tri1_impl(uint8_t vtx1_idx
         if (v3->scissor_gen != cur_scissor_gen) { v3->scissor_oc = compute_scissor_outcode(v3->_x, v3->_y, v3->_w); v3->scissor_gen = cur_scissor_gen; }
 
         uint8_t oc_or  = v1->scissor_oc | v2->scissor_oc | v3->scissor_oc;
+        // Miyoo: a perspective triangle crossing the N64's near plane takes the full clip
+        if (proj_is_persp && !(v1->clip_rej & v2->clip_rej & v3->clip_rej & MIYOO_NEAR_IN))
+            oc_or |= SC_FORCE;
         uint8_t oc_and = v1->scissor_oc & v2->scissor_oc & v3->scissor_oc;
 #if GFX_PROF
         prof_t_sc_oc += PROF_NOW() - psc0;   // outcode refresh + classify (every split-screen tri)
@@ -2700,6 +2742,8 @@ static void  __attribute__((noinline)) GFX_HOT gfx_sp_tri1_impl(uint8_t vtx1_idx
             // off-screen and the PVR clips it, so the SH pass would be wasted work).
             uint8_t clip_mask = (oc_or & SC_FORCE) ? (SC_FORCE | SC_EDGE_MASK)
                                                    : (oc_or & sc_active_mask);
+            if (clip_mask == 0 && !(miyoo_in_guard(v1) && miyoo_in_guard(v2) && miyoo_in_guard(v3)))
+                clip_mask = oc_or & SC_EDGE_MASK;   // Miyoo: far off-screen: clip to the edges
             if (clip_mask == 0) {
                 // only redundant border edges were crossed -> emit as-is, PVR guard-bands it
                 fan_tris[0][0] = v1; fan_tris[0][1] = v2; fan_tris[0][2] = v3;
