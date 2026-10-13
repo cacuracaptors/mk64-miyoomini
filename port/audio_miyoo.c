@@ -102,10 +102,21 @@ static void fill_block(frame_t *out) {
         memset(out, 0, OUT_FRAMES * sizeof(frame_t));
         return;
     }
-    /* step: SRC_RATE / OUT_RATE, nudged by how far the ring is from its target */
-    double adj = (double) (fill - TARGET_FILL) / TARGET_FILL * 0.005;
-    if (adj > 0.005) adj = 0.005;
-    if (adj < -0.005) adj = -0.005;
+    /* step: SRC_RATE / OUT_RATE, nudged by how far the ring is from its target. The game
+       makes its sound by the panel's refresh, which is not quite 60 Hz (59.68 Hz measured:
+       0.53% less sound than 26880 a second), so a fixed nudge of at most 0.5% let the ring
+       run dry every fraction of a second (clicks). The slow term learns the real rate
+       (up to 3%, about a second to settle); the quick one keeps the ring near its target. */
+    static double learned;
+    double err = (double) (fill - TARGET_FILL) / TARGET_FILL;
+    if (err > 1.0) err = 1.0;
+    if (err < -1.0) err = -1.0;
+    learned += err * 0.0002;
+    if (learned > 0.03) learned = 0.03;
+    if (learned < -0.03) learned = -0.03;
+    double adj = learned + err * 0.005;
+    if (adj > 0.035) adj = 0.035;
+    if (adj < -0.035) adj = -0.035;
     const uint32_t step = (uint32_t) ((double) SRC_RATE / OUT_RATE * (1.0 + adj) * 65536.0);
     for (int i = 0; i < OUT_FRAMES; i++) {
         if ((int32_t) (w - r) < 2) {   /* ran dry inside the block: hold the last frame */

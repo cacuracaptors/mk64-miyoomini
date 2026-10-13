@@ -161,7 +161,9 @@ static void tex_detach(struct SwTex *t) {
     t->mpx = NULL;
     t->mpf = NULL;
 }
+static void pf_job_cancel(uint32_t id);
 static void tex_free(struct SwTex *t) {
+    pf_job_cancel((uint32_t) (t - sTex));
     tex_detach(t);
     free(t->px);
     free(t->ext);
@@ -488,7 +490,7 @@ static inline int ifloor(float f) {
     return (f < (float) i) ? i - 1 : i;
 }
 
-/* -filtro worked out in advance: cells per texel side (see tex_build_pf) */
+/* -filtro worked out in advance: cells per texel side (see fill_pf) */
 #define PF_SHIFT 2
 #define PF_SUB (1 << PF_SHIFT)
 
@@ -2489,6 +2491,7 @@ static void sw_upload_texture_now(const uint8_t *buf16, int width, int height, u
                 return;
         }
     }
+    pf_job_cancel((uint32_t) (t - sTex));   /* (a filter being worked out for the old texels) */
     tex_detach(t);   /* (-paralelo: the frame being drawn keeps the old texels) */
     free(t->pf);     /* (the filter worked out in advance belongs to the old texels) */
     t->pf = NULL;
@@ -2703,10 +2706,10 @@ static int pf_shift(int w, int h) {
 
 /* one grid of cells: cell x covers texture coordinates x / SUB up to (x + 1) / SUB, and holds
    the 3-point filter at its centre (texel centres at i + 0.5, as on the N64) */
-static void fill_pf(uint32_t *pf, const uint32_t *px, int tw, int th, int wrap, int shift) {
-    const int SUB = 1 << shift, W = tw << shift, H = th << shift, D = 2 * SUB;
+static void fill_pf(uint32_t *pf, const uint32_t *px, int tw, int th, int wrap, int shift, int y0, int y1) {
+    const int SUB = 1 << shift, W = tw << shift, D = 2 * SUB;
     const int cu = wrap & 1, cv = (wrap >> 1) & 1;
-    for (int y = 0; y < H; y++) {
+    for (int y = y0; y < y1; y++) {
         /* (the centre, measured from the texel centres, in 1/(2 SUB) of a texel) */
         const int ny = 2 * y + 1 - SUB;
         const int iv = ny >= 0 ? ny / D : -((-ny + D - 1) / D);
@@ -2740,89 +2743,130 @@ static void fill_pf(uint32_t *pf, const uint32_t *px, int tw, int th, int wrap, 
     }
 }
 
-/* the grid with 2^shift cells per texel side, followed by the one with half as many */
-static uint32_t *build_pf(const uint32_t *px, int tw, int th, int wrap, int shift) {
-    const size_t n0 = ((size_t) tw << shift) * ((size_t) th << shift);
-    const size_t n1 = ((size_t) tw << (shift - 1)) * ((size_t) th << (shift - 1));
-    uint32_t *pf = malloc((n0 + n1) * 4);
-    if (!pf)
-        return NULL;
-    fill_pf(pf, px, tw, th, wrap, shift);
-    fill_pf(pf + n0, px, tw, th, wrap, shift - 1);
-    return pf;
-}
-
-static void tex_build_pf(struct SwTex *t, int wrap) {
-    const int shift = pf_shift(t->w, t->h);
-    t->pf = build_pf(t->px, t->w, t->h, wrap, shift);
-    if (!t->pf) {
-        t->pfnever = 1;
+/* the opaque textures of the frame about to be drawn get their filter worked out in
+   advance, a few rows at a time: at most PF_BUDGET_MS of each frame (one 64x64 texture
+   took about 11 ms, all at once: D.K.'s Jungle Parkway stuttered when new textures came
+   into view). Until a texture's is complete it is drawn as before. */
+#define PF_BUDGET_MS 1.5
+static struct {
+    int active, axes, wrap, shift, w, h, row, rows0, rows;
+    uint32_t tex;
+    uint32_t *src, *dst;   /* src: the texels, or the mirrored copy made for the job */
+} sPfJob;
+static void pf_job_cancel(uint32_t id) {
+    if (!sPfJob.active || sPfJob.tex != id)
         return;
-    }
-    t->pfwrap = (uint8_t) wrap;
-    t->pfs = (uint8_t) shift;
+    if (sPfJob.axes)
+        free(sPfJob.src);
+    free(sPfJob.dst);
+    sPfJob.active = 0;
 }
-
-/* the mirrored copy (bit 0: along u, bit 1: along v) and its filter worked out in advance */
-static void tex_build_mirror(struct SwTex *t, int axes, int wrap) {
-    const int w = t->w, h = t->h, W = w << (axes & 1), H = h << ((axes >> 1) & 1);
-    uint32_t *m = malloc((size_t) W * H * 4);
-    if (!m) {
-        t->pfnever = 1;
-        return;
-    }
-    for (int y = 0; y < H; y++) {
-        const int sy = y < h ? y : 2 * h - 1 - y;
-        for (int x = 0; x < W; x++) {
-            const int sx = x < w ? x : 2 * w - 1 - x;
-            m[y * W + x] = t->px[sy * w + sx];
+static int pf_job_start(struct SwTex *t, int axes, int wrap) {
+    const int w = t->w << (axes & 1), h = t->h << ((axes >> 1) & 1), shift = pf_shift(w, h);
+    uint32_t *src = t->px;
+    if (axes) {   /* the mirrored copy (bit 0: along u, bit 1: along v) */
+        src = malloc((size_t) w * h * 4);
+        if (!src)
+            return 0;
+        for (int y = 0; y < h; y++) {
+            const int sy = y < t->h ? y : 2 * t->h - 1 - y;
+            for (int x = 0; x < w; x++) {
+                const int sx = x < t->w ? x : 2 * t->w - 1 - x;
+                src[y * w + x] = t->px[sy * t->w + sx];
+            }
         }
     }
-    const int shift = pf_shift(W, H);
-    uint32_t *f = build_pf(m, W, H, wrap, shift);
-    if (!f) {
-        free(m);
-        t->pfnever = 1;
-        return;
+    const size_t n0 = ((size_t) w << shift) * ((size_t) h << shift), n1 = ((size_t) w << (shift - 1)) * ((size_t) h << (shift - 1));
+    uint32_t *dst = malloc((n0 + n1) * 4);
+    if (!dst) {
+        if (axes)
+            free(src);
+        return 0;
     }
-    t->mpx = m;
-    t->mw = (uint16_t) W;
-    t->mh = (uint16_t) H;
-    t->mbake = (uint8_t) axes;
-    t->mpf = f;
-    t->mpfwrap = (uint8_t) wrap;
-    t->mpfs = (uint8_t) shift;
+    sPfJob.active = 1;
+    sPfJob.tex = (uint32_t) (t - sTex);
+    sPfJob.axes = axes;
+    sPfJob.wrap = wrap;
+    sPfJob.shift = shift;
+    sPfJob.w = w;
+    sPfJob.h = h;
+    sPfJob.row = 0;
+    sPfJob.rows0 = h << shift;
+    sPfJob.rows = sPfJob.rows0 + (h << (shift - 1));
+    sPfJob.src = src;
+    sPfJob.dst = dst;
+    return 1;
 }
-
-/* the opaque textures of the frame about to be drawn get their filter worked out (a few
-   per frame, so a new track does not stall: the others use the filter as before) */
-static int sPfPerFrame = 4;
+/* some more rows of the job; 1 when it is complete (and handed to its texture) */
+static int pf_job_step(double until) {
+    while (sPfJob.row < sPfJob.rows) {
+        const int r = sPfJob.row;
+        if (r < sPfJob.rows0)
+            fill_pf(sPfJob.dst, sPfJob.src, sPfJob.w, sPfJob.h, sPfJob.wrap, sPfJob.shift, r, r + 1);
+        else
+            fill_pf(sPfJob.dst + ((size_t) sPfJob.w << sPfJob.shift) * ((size_t) sPfJob.h << sPfJob.shift), sPfJob.src,
+                    sPfJob.w, sPfJob.h, sPfJob.wrap, sPfJob.shift - 1, r - sPfJob.rows0, r - sPfJob.rows0 + 1);
+        sPfJob.row++;
+        if (port_now_ms() >= until)
+            break;
+    }
+    if (sPfJob.row < sPfJob.rows)
+        return 0;
+    struct SwTex *t = &sTex[sPfJob.tex];
+    if (sPfJob.axes) {
+        t->mpx = sPfJob.src;
+        t->mw = (uint16_t) sPfJob.w;
+        t->mh = (uint16_t) sPfJob.h;
+        t->mbake = (uint8_t) sPfJob.axes;
+        t->mpf = sPfJob.dst;
+        t->mpfwrap = (uint8_t) sPfJob.wrap;
+        t->mpfs = (uint8_t) sPfJob.shift;
+    } else {
+        t->pf = sPfJob.dst;
+        t->pfwrap = (uint8_t) sPfJob.wrap;
+        t->pfs = (uint8_t) sPfJob.shift;
+    }
+    sPfJob.active = 0;
+    return 1;
+}
 static void prefilter_prepare(void) {
     if (!port_opt_filter || port_opt_exact)
         return;
+    const double t0 = port_now_ms(), until = t0 + PF_BUDGET_MS;
     int built = 0;
-    for (int k = 0; k < 2; k++) {
-    const Bucket *b = &sRenB[k == 0 ? KIND_OP : KIND_TR];
-    for (int i = 0; i < b->nbatch && built < sPfPerFrame; i++) {
-        const RState *st = &b->batch[i].st;
-        if (!st->tex || !b->batch[i].count || (k == 1 && !tr_ground(st)))
-            continue;
-        struct SwTex *t = &sTex[st->tex];
-        const int axes = (st->mirru && !st->clampu) | ((st->mirrv && !st->clampv) << 1);
-        if (!t->px || (axes ? t->mpx != NULL : t->pf != NULL) || t->pfnever || t->w > 64 || t->h > 64)
-            continue;
-        if ((!st->clampu && (t->w & (t->w - 1))) || (!st->clampv && (t->h & (t->h - 1))))
-            continue;   /* (the filter only runs with power-of-two repeat or clamp) */
-        const double tb = port_now_ms();
-        if (axes)
-            tex_build_mirror(t, axes, st->clampu | (st->clampv << 1));
-        else
-            tex_build_pf(t, st->clampu | (st->clampv << 1));
-        sFS.pf += port_now_ms() - tb;
-        sFS.pfn++;
+    for (;;) {
+        if (!sPfJob.active) {
+            /* the next texture of this frame that needs one */
+            int started = 0;
+            for (int k = 0; k < 2 && !started; k++) {
+                const Bucket *b = &sRenB[k == 0 ? KIND_OP : KIND_TR];
+                for (int i = 0; i < b->nbatch && !started; i++) {
+                    const RState *st = &b->batch[i].st;
+                    if (!st->tex || !b->batch[i].count || (k == 1 && !tr_ground(st)))
+                        continue;
+                    struct SwTex *t = &sTex[st->tex];
+                    const int axes = (st->mirru && !st->clampu) | ((st->mirrv && !st->clampv) << 1);
+                    if (!t->px || (axes ? t->mpx != NULL : t->pf != NULL) || t->pfnever || t->w > 64 || t->h > 64)
+                        continue;
+                    if ((!st->clampu && (t->w & (t->w - 1))) || (!st->clampv && (t->h & (t->h - 1))))
+                        continue;   /* (the filter only runs with power-of-two repeat or clamp) */
+                    if (!pf_job_start(t, axes, st->clampu | (st->clampv << 1)))
+                        t->pfnever = 1;
+                    else
+                        started = 1;
+                }
+            }
+            if (!started)
+                break;
+        }
+        if (!pf_job_step(until))
+            break;
         built++;
+        if (port_now_ms() >= until)
+            break;
     }
-    }
+    sFS.pf += port_now_ms() - t0;
+    sFS.pfn += built;
 }
 
 static void sort_tr(void) {
@@ -3250,18 +3294,21 @@ static void pipe_finish(int adapt) {
 
 /* -resdin: the size of the next frame. The time the game needed for the last frame, apart
    from waiting for the screen or the 30 fps beat, says whether the drawing keeps up: over
-   16.4 ms the frames get smaller one step; when the estimate one step up (the drawing
-   grows with the pixels, the rest does not) fits in 15 ms they grow back. Changes wait a
-   little for the estimate to settle. */
+   16.4 ms on average, or one frame over 20 ms (it missed the screen's refresh), the frames
+   get smaller one step, at most every 4 frames (it used to wait 15 frames a step: at D.K.'s
+   Jungle Parkway, three steps took a quarter of a second at 45 fps, felt as a stutter);
+   when the estimate one step up (the drawing grows with the pixels, the rest does not)
+   fits in 15 ms they grow back, after 30 frames without a change. */
 static const int kResW[4] = { 640, 576, 512, 448 }, kResH[4] = { 480, 432, 384, 336 };
-static int sResLevel, sResHold;
+static int sResLevel, sResHold, sResDownHold;
 static double sResEma, sResLastT, sResLastPacing, sResWait;
 static void resdin_pick(void) {
     if (!port_opt_resdin || !port_video_scales() || sCapF || port_render_w > 640)
         return;
     const double now = port_now_ms();
+    double c = 0;
     if (sResLastT > 0) {
-        double c = now - sResLastT - sResWait - (port_pacing_ms - sResLastPacing);
+        c = now - sResLastT - sResWait - (port_pacing_ms - sResLastPacing);
         if (c < 0)
             c = 0;
         sResEma = sResEma > 0 ? 0.8 * sResEma + 0.2 * c : c;
@@ -3269,12 +3316,15 @@ static void resdin_pick(void) {
     sResLastT = now;
     sResLastPacing = port_pacing_ms;
     sResWait = 0;
-    if (sResHold > 0) {
+    if (sResHold > 0)
         sResHold--;
-    } else if (sResEma > 16.4 && sResLevel < 3) {
+    if (sResDownHold > 0)
+        sResDownHold--;
+    if (sResLevel < 3 && !sResDownHold && (sResEma > 16.4 || c > 20.0)) {
         sResLevel++;
-        sResHold = 15;
-    } else if (sResLevel > 0) {
+        sResDownHold = 4;
+        sResHold = 30;
+    } else if (sResLevel > 0 && !sResHold) {
         const double cur = (double) kResW[sResLevel] * kResH[sResLevel], up = (double) kResW[sResLevel - 1] * kResH[sResLevel - 1];
         const double fixed = 2.5;   /* the game and the display list: they do not shrink with the frame */
         if ((sResEma - fixed) * (up / cur) + fixed < 15.0) {
