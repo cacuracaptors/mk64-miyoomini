@@ -16,6 +16,7 @@ double port_now_ms(void);
 extern int port_opt_perf;
 extern int port_opt_60fps;   /* -60fps: 1P races not capped at 30 (experimental) */
 extern int port_opt_filter;  /* -filtro: 3-point filter on magnified 3D opaque surfaces */
+extern int port_opt_filter_lite; /* -filtroleve: only the filter worked out in advance (cheaper) */
 extern int port_opt_nogfx;   /* -semgfx: frame copy by the CPU instead of the 2D engine */
 extern int port_opt_parallel; /* on unless -semparalelo: core 1 draws a frame while the game prepares the next (shown 1 frame later) */
 extern int port_opt_mute;     /* -mudo: no sound */

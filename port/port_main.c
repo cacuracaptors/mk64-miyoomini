@@ -34,6 +34,7 @@
 int port_opt_perf = 0;
 int port_opt_60fps = 0;
 int port_opt_filter = 0;
+int port_opt_filter_lite = 0;   /* -filtroleve: the filter worked out in advance everywhere (cheaper) */
 int port_opt_parallel = 1;   /* -semparalelo turns it off */
 int port_opt_resdin = 0;     /* -resdin: smaller frames while the drawing does not keep up */
 int port_opt_mute = 0;       /* -mudo: no sound */
@@ -157,6 +158,10 @@ void port_init(int argc, char **argv) {
             opt_timer = 1;
         else if (!strcmp(argv[i], "-filtro"))
             port_opt_filter = 1;
+        else if (!strcmp(argv[i], "-filtroleve")) {
+            port_opt_filter = 1;
+            port_opt_filter_lite = 1;
+        }
         else if (!strcmp(argv[i], "-semgfx"))
             port_opt_nogfx = 1;
         else if (!strcmp(argv[i], "-paralelo"))
