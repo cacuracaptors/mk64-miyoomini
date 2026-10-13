@@ -514,6 +514,8 @@ typedef struct {
     int pfs;
     const uint32_t *pf1;     /* the same with half as many cells per side (2^(pfs-1)), right after it */
     int32_t flim;            /* the exact filter up to this step per pixel (16.16 texels) */
+    int32_t pfmin;           /* the filter worked out in advance only from this step on (closer: exact) */
+    int32_t pfc;             /* ... and its coarser grid from this step on */
 } TriCtx;
 
 static uint8_t sExp5[32], sExp6[64];   /* 565 -> 8 bit, same rounding as before (v*255/max) */
@@ -1597,14 +1599,14 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 nv_lerp8(tex + 8, &smp[2], &smp[3], &smp[4]);
                 U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
                 V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
-            } else if (FILT_SPAN(OUT, TEX) && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536 && c->pf) {
+            } else if (FILT_SPAN(OUT, TEX) && c->filt && dU > -c->flim && dU < c->flim && dV > -c->flim && dV < c->flim && c->pf &&
+                       (dU <= -c->pfmin || dU >= c->pfmin || dV <= -c->pfmin || dV >= c->pfmin)) {
                 /* the filter worked out in advance: one cell per pixel (positions relative to
                    the texel centres, as in nv_fetch3; repeat wraps on the cell grid as well) */
                 /* which of the two: the finer one only where a texel covers 4 pixels or more
                    (-filtroleve: the coarser one is a quarter of the size, so more of it stays
                    in the cache; see port_opt_pf_level) */
-                const int coarse = port_opt_pf_level == 2 ||
-                    (port_opt_pf_level == 1 && (dU <= -16384 || dU >= 16384 || dV <= -16384 || dV >= 16384));
+                const int coarse = dU <= -c->pfc || dU >= c->pfc || dV <= -c->pfc || dV >= c->pfc;
                 const int ps = c->pfs - coarse;
                 const uint32_t *pfx = coarse ? c->pf1 : c->pf;
                 /* (cell i covers texture coordinates i / 2^ps up to (i + 1) / 2^ps, like the texels
@@ -1925,13 +1927,20 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
            items, HUD, menus), magnified or up to 2 texels a pixel, computed exactly */
         c.filt = textured && st->filter && wraps_ok;
         c.flim = 131072;
+        /* where a texel covers under 4 pixels the filter worked out in advance (cells of a
+           pixel or less: the same to the eye), closer the exact one: the far palms of
+           D.K.'s Jungle Parkway took up to 20 ms a core exact */
+        c.pfmin = 16384;
+        c.pfc = 32768;
         if (c.filt)
             c.ext = NULL;   /* (filtered, the invisible texels at a row's ends blend into the visible ones) */
     } else {
         c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo && wraps_ok;
         c.flim = 65536;
+        c.pfmin = 0;
+        c.pfc = port_opt_pf_level == 2 ? 0 : (port_opt_pf_level == 1 ? 16384 : 0x7FFFFFFF);
     }
-    c.pf = c.filt && !port_opt_exact && !port_opt_filter_all && tpf && tpfwrap == (st->clampu | (st->clampv << 1)) ? tpf : NULL;
+    c.pf = c.filt && !port_opt_exact && tpf && tpfwrap == (st->clampu | (st->clampv << 1)) ? tpf : NULL;
     c.pfs = tpfs;
     c.pf1 = c.pf ? c.pf + ((size_t) c.tw << tpfs) * ((size_t) c.th << tpfs) : NULL;
     if (port_opt_filter && !port_opt_filter_all && kind == KIND_OP && persp_geo && !c.filt) {
@@ -2857,8 +2866,8 @@ static void prefilter_prepare(void) {
                     const int axes = (st->mirru && !st->clampu) | ((st->mirrv && !st->clampv) << 1);
                     if (!st->tex || !b->batch[i].count)
                         continue;
-                    if (port_opt_filter_all ? !axes || !st->filter : (k == 2 || (k == 1 && !tr_ground(st))))
-                        continue;   /* (-qualidade: only the mirrored copies are needed, in every list) */
+                    if (port_opt_filter_all ? !st->filter : (k == 2 || (k == 1 && !tr_ground(st))))
+                        continue;   /* (-qualidade: every list, every texture that asks for the filter) */
                     struct SwTex *t = &sTex[st->tex];
                     if (!t->px || (axes ? t->mpx != NULL : t->pf != NULL) || t->pfnever || t->w > 64 || t->h > 64)
                         continue;
@@ -3341,7 +3350,7 @@ static void resdin_pick(void) {
         sResDownHold--;
     /* (at 30 fps -- the menus, and the quality mode -- a frame has twice the time) */
     extern int force_30fps;
-    const double budget = force_30fps ? 32.8 : 16.4, spike = force_30fps ? 40.0 : 20.0, up_fit = force_30fps ? 30.0 : 15.0;
+    const double budget = force_30fps ? 32.8 : 16.4, spike = force_30fps ? 40.0 : 20.0, up_fit = force_30fps ? 28.0 : 15.0;   /* (at 30 fps a step up waits for more room: frames over 1/30 s are felt) */
     if (sResLevel < 3 && !sResDownHold && (sResEma > budget || c > spike)) {
         sResLevel++;
         sResDownHold = 4;
