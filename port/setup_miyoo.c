@@ -635,14 +635,13 @@ static int load_romdata(void) {
    release (port/release_miyoo.sh) has it zeroed, to be filled in from romdata.bin. Asked
    of the data itself, since romdata.bin's table of addresses belongs to the build it was
    made for: a development build sent over a release install moved the addresses, did not
-   match it, and stopped at "The game data is damaged" (and dropped setup.ok). */
+   match it, and stopped at "The game data is damaged" (and dropped setup.ok). (A first
+   try looked at data_segment2's .data, which holds too little of it to tell.) */
 static int has_own_data(void) {
-    extern uint8_t _data_segment2SegmentRomStart[], _data_segment2SegmentRomEnd[];
-    const uint8_t *p = _data_segment2SegmentRomStart, *e = _data_segment2SegmentRomEnd;
-    size_t samples = 0, set = 0;
-    for (; p < e; p += 61, samples++)
-        set += *p != 0;
-    return samples > 1000 && set * 4 > samples;
+    /* the start-up logo and the ceremony are MIO0 blocks (the 4 letters "MIO0" first) in
+       objects the release zeroes (port/release_miyoo.sh) */
+    extern uint8_t _startupLogoSegmentRomStart[], _ceremonyDataSegmentRomStart[];
+    return !memcmp(_startupLogoSegmentRomStart, "MIO0", 4) || !memcmp(_ceremonyDataSegmentRomStart, "MIO0", 4);
 }
 
 void port_setup(void) {
