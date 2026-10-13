@@ -317,6 +317,10 @@ u8* dma_textures(u8 texture[], UNUSED size_t arg1, size_t arg2) {
     return temp_v0;
 }
 
+#ifdef TARGET_MIYOO
+void gfx_mirrored_vertices(const void* start, uint32_t bytes);
+#endif
+
 void func_802A86A8(CourseVtx* data, u32 arg1) {
     CourseVtx* courseVtx = data;
     Vtx* vtx;
@@ -326,6 +330,10 @@ void func_802A86A8(CourseVtx* data, u32 arg1) {
     s8 flags;
 
     vtx = (Vtx*) SEG4_BUF;
+#ifdef TARGET_MIYOO
+    /* (mirror mode: the course triangles drawn from this block face the other way) */
+    gfx_mirrored_vertices(gIsMirrorMode ? (const void*) vtx : NULL, arg1 * sizeof(Vtx));
+#endif
 
     // s32 to u32 comparison required for matching.
     for (i = 0; i < arg1; i++) {

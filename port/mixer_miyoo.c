@@ -13,6 +13,12 @@
  */
 #include <stdint.h>
 #include <string.h>
+#if defined(__ARM_NEON) && !defined(MIXER_SCALAR)
+#include <arm_neon.h>
+#define MIXER_NEON 1   /* ADPCM, resampler and envelope mixer 8 samples at a time (see below) */
+#else
+#define MIXER_NEON 0
+#endif
 
 #include <PR/ultratypes.h>
 #include "audio/mixer.h"
@@ -139,6 +145,68 @@ void aADPCMdecImpl(uint8_t flags, ADPCM_STATE state) {
         memcpy(out, state, 16 * sizeof(int16_t));
     out += 16;
 
+#if MIXER_NEON
+    /* NEON (sm64-port's, as in mr-finster/miyoo64's MK64 port, MIT): the same integer
+       arithmetic as the loop below, result for result (checked against it under qemu) */
+    {
+        static const int8_t pos0_data[16] = { -1, 0, -1, 0, -1, 1, -1, 1, -1, 2, -1, 2, -1, 3, -1, 3 };
+        static const int8_t pos1_data[16] = { -1, 4, -1, 4, -1, 5, -1, 5, -1, 6, -1, 6, -1, 7, -1, 7 };
+        static const int16_t mult_data[8] = { 0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10 };
+        static const int16_t table_prefix_data[8] = { 0, 0, 0, 0, 0, 0, 0, 1 << 11 };
+        const int8x16_t pos0 = vld1q_s8(pos0_data);
+        const int8x16_t pos1 = vld1q_s8(pos1_data);
+        const int16x8_t mult = vld1q_s16(mult_data);
+        const int16x8_t mask = vdupq_n_s16((int16_t) 0xf000);
+        const int16x8_t table_prefix = vld1q_s16(table_prefix_data);
+        int16x8_t result = vld1q_s16(out - 8);
+        while (nbytes > 0) {
+            const int shift = *in >> 4;
+            const int16_t (*tbl)[8] = rspa.adpcm_table[*in++ & 7];
+            const int8x8_t inv = vld1_s8((const int8_t *) in);
+            const int16x8_t tblvec[2] = { vld1q_s16(tbl[0]), vld1q_s16(tbl[1]) };
+            int16x8_t invec[2] = {
+                vreinterpretq_s16_s8(vcombine_s8(vtbl1_s8(inv, vget_low_s8(pos0)), vtbl1_s8(inv, vget_high_s8(pos0)))),
+                vreinterpretq_s16_s8(vcombine_s8(vtbl1_s8(inv, vget_low_s8(pos1)), vtbl1_s8(inv, vget_high_s8(pos1))))
+            };
+            const int16x8_t shiftcount = vdupq_n_s16((int16_t) (shift - 12));   /* (negative: right) */
+            int16x8_t tv1[8];
+            in += 8;
+            tv1[0] = vextq_s16(table_prefix, tblvec[1], 7);
+            tv1[1] = vextq_s16(table_prefix, tblvec[1], 6);
+            tv1[2] = vextq_s16(table_prefix, tblvec[1], 5);
+            tv1[3] = vextq_s16(table_prefix, tblvec[1], 4);
+            tv1[4] = vextq_s16(table_prefix, tblvec[1], 3);
+            tv1[5] = vextq_s16(table_prefix, tblvec[1], 2);
+            tv1[6] = vextq_s16(table_prefix, tblvec[1], 1);
+            tv1[7] = table_prefix;
+            invec[0] = vshlq_s16(vandq_s16(vmulq_s16(invec[0], mult), mask), shiftcount);
+            invec[1] = vshlq_s16(vandq_s16(vmulq_s16(invec[1], mult), mask), shiftcount);
+            for (int i = 0; i < 2; i++) {
+                int32x4_t acc0, acc1;
+                acc1 = vmull_lane_s16(vget_high_s16(tblvec[0]), vget_high_s16(result), 2);
+                acc1 = vmlal_lane_s16(acc1, vget_high_s16(tblvec[1]), vget_high_s16(result), 3);
+                acc0 = vmull_lane_s16(vget_low_s16(tblvec[0]), vget_high_s16(result), 2);
+                acc0 = vmlal_lane_s16(acc0, vget_low_s16(tblvec[1]), vget_high_s16(result), 3);
+                acc0 = vmlal_lane_s16(acc0, vget_low_s16(tv1[0]), vget_low_s16(invec[i]), 0);
+                acc0 = vmlal_lane_s16(acc0, vget_low_s16(tv1[1]), vget_low_s16(invec[i]), 1);
+                acc0 = vmlal_lane_s16(acc0, vget_low_s16(tv1[2]), vget_low_s16(invec[i]), 2);
+                acc0 = vmlal_lane_s16(acc0, vget_low_s16(tv1[3]), vget_low_s16(invec[i]), 3);
+                acc1 = vmlal_lane_s16(acc1, vget_high_s16(tv1[0]), vget_low_s16(invec[i]), 0);
+                acc1 = vmlal_lane_s16(acc1, vget_high_s16(tv1[1]), vget_low_s16(invec[i]), 1);
+                acc1 = vmlal_lane_s16(acc1, vget_high_s16(tv1[2]), vget_low_s16(invec[i]), 2);
+                acc1 = vmlal_lane_s16(acc1, vget_high_s16(tv1[3]), vget_low_s16(invec[i]), 3);
+                acc1 = vmlal_lane_s16(acc1, vget_high_s16(tv1[4]), vget_high_s16(invec[i]), 0);
+                acc1 = vmlal_lane_s16(acc1, vget_high_s16(tv1[5]), vget_high_s16(invec[i]), 1);
+                acc1 = vmlal_lane_s16(acc1, vget_high_s16(tv1[6]), vget_high_s16(invec[i]), 2);
+                acc1 = vmlal_lane_s16(acc1, vget_high_s16(tv1[7]), vget_high_s16(invec[i]), 3);
+                result = vcombine_s16(vqshrn_n_s32(acc0, 11), vqshrn_n_s32(acc1, 11));
+                vst1q_s16(out, result);
+                out += 8;
+            }
+            nbytes -= 16 * sizeof(int16_t);
+        }
+    }
+#else
     while (nbytes > 0) {
         const int shift = *in >> 4;          /* 0..12 */
         const int table_index = *in++ & 0xf; /* 0..7 */
@@ -161,6 +229,7 @@ void aADPCMdecImpl(uint8_t flags, ADPCM_STATE state) {
         }
         nbytes -= 16 * sizeof(int16_t);
     }
+#endif
     memcpy(state, out - 16, 16 * sizeof(int16_t));
 }
 
@@ -185,6 +254,61 @@ void aResampleImpl(uint8_t flags, uint16_t pitch, RESAMPLE_STATE state) {
     pitch_accumulator = (uint16_t) tmp[4];
     memcpy(in, tmp, 4 * sizeof(int16_t));
 
+#if MIXER_NEON
+    /* NEON: 8 outputs a step, each tap (in * tbl + 0x4000) >> 15 and the four summed in
+       32 bits with one clamp, as in the loop below (positions from a 32-bit accumulator:
+       its high half is how far in has moved) */
+    {
+        static const uint16_t multiples_data[8] = { 0, 2, 4, 6, 8, 10, 12, 14 };
+        const uint16x8_t multiples = vld1q_u16(multiples_data);
+        const uint32x4_t step8 = vdupq_n_u32((uint32_t) (pitch << 1) * 8);
+        const uint32x4_t acclo = vdupq_n_u32((uint16_t) pitch_accumulator);
+        uint32x4_t acc_a = vmlal_n_u16(acclo, vget_low_u16(multiples), pitch);
+        uint32x4_t acc_b = vmlal_n_u16(acclo, vget_high_u16(multiples), pitch);
+        do {
+            const uint16x8x2_t uz = vuzpq_u16(vreinterpretq_u16_u32(acc_a), vreinterpretq_u16_u32(acc_b));
+            const uint16x8_t tp = vshrq_n_u16(uz.val[0], 10);
+            const uint16x8_t ip = uz.val[1];
+            int32x4_t sums[2];
+            for (int k = 0; k < 4; k++) {
+                int16x8_t t, x;
+                switch (k) {   /* (lane numbers must be constants) */
+                case 0:
+                    t = vcombine_s16(vld1_s16(resample_table[vgetq_lane_u16(tp, 0)]), vld1_s16(resample_table[vgetq_lane_u16(tp, 1)]));
+                    x = vcombine_s16(vld1_s16(&in[vgetq_lane_u16(ip, 0)]), vld1_s16(&in[vgetq_lane_u16(ip, 1)]));
+                    break;
+                case 1:
+                    t = vcombine_s16(vld1_s16(resample_table[vgetq_lane_u16(tp, 2)]), vld1_s16(resample_table[vgetq_lane_u16(tp, 3)]));
+                    x = vcombine_s16(vld1_s16(&in[vgetq_lane_u16(ip, 2)]), vld1_s16(&in[vgetq_lane_u16(ip, 3)]));
+                    break;
+                case 2:
+                    t = vcombine_s16(vld1_s16(resample_table[vgetq_lane_u16(tp, 4)]), vld1_s16(resample_table[vgetq_lane_u16(tp, 5)]));
+                    x = vcombine_s16(vld1_s16(&in[vgetq_lane_u16(ip, 4)]), vld1_s16(&in[vgetq_lane_u16(ip, 5)]));
+                    break;
+                default:
+                    t = vcombine_s16(vld1_s16(resample_table[vgetq_lane_u16(tp, 6)]), vld1_s16(resample_table[vgetq_lane_u16(tp, 7)]));
+                    x = vcombine_s16(vld1_s16(&in[vgetq_lane_u16(ip, 6)]), vld1_s16(&in[vgetq_lane_u16(ip, 7)]));
+                    break;
+                }
+                const int32x4_t lo = vrshrq_n_s32(vmull_s16(vget_low_s16(x), vget_low_s16(t)), 15);
+                const int32x4_t hi = vrshrq_n_s32(vmull_s16(vget_high_s16(x), vget_high_s16(t)), 15);
+                const int32x2_t pair = vpadd_s32(vpadd_s32(vget_low_s32(lo), vget_high_s32(lo)),
+                                                 vpadd_s32(vget_low_s32(hi), vget_high_s32(hi)));
+                if (k & 1)
+                    sums[k >> 1] = vcombine_s32(vget_low_s32(sums[k >> 1]), pair);
+                else
+                    sums[k >> 1] = vcombine_s32(pair, pair);
+            }
+            vst1q_s16(out, vcombine_s16(vqmovn_s32(sums[0]), vqmovn_s32(sums[1])));
+            acc_a = vaddq_u32(acc_a, step8);
+            acc_b = vaddq_u32(acc_b, step8);
+            out += 8;
+            nbytes -= 8 * sizeof(int16_t);
+        } while (nbytes > 0);
+        in += vgetq_lane_u16(vreinterpretq_u16_u32(acc_a), 1);
+        pitch_accumulator = vgetq_lane_u16(vreinterpretq_u16_u32(acc_a), 0);
+    }
+#else
     do {
         for (i = 0; i < 8; i++) {
             const int16_t *tbl = resample_table[pitch_accumulator * 64 >> 16];
@@ -197,6 +321,7 @@ void aResampleImpl(uint8_t flags, uint16_t pitch, RESAMPLE_STATE state) {
         }
         nbytes -= 8 * sizeof(int16_t);
     } while (nbytes > 0);
+#endif
 
     state[4] = (int16_t) pitch_accumulator;
     memcpy(state, in, 4 * sizeof(int16_t));
@@ -232,6 +357,34 @@ void aEnvMixerImpl(uint16_t in_addr, uint16_t n_samples, int swap_reverb, int ne
     int n = ROUND_UP_16(n_samples);
     uint16_t vl = rspa.vol[0], vr = rspa.vol[1];
     const uint16_t rl = rspa.rate[0], rr = rspa.rate[1];
+#if MIXER_NEON
+    /* NEON, 8 samples a step (the volumes step once per 8 there too): the product's bits
+       16..31, XOR the sign, then a saturating add. Buffers that overlap only partly stay
+       on the loop below (sample order would matter there). */
+    {
+        const intptr_t a = (intptr_t) in, b = (intptr_t) dl, c = (intptr_t) dr, len = n * 2;
+#define MX_PART(p, q) ((p) != (q) && (p) < (q) + len && (q) < (p) + len)
+        if (!MX_PART(a, b) && !MX_PART(a, c) && !MX_PART(b, c)) {
+            const int16x8_t vnl = vdupq_n_s16(nl), vnr = vdupq_n_s16(nr);
+            do {
+                const int16x8_t x = vld1q_s16(in);
+                const int32x4_t xl = vmovl_s16(vget_low_s16(x)), xh = vmovl_s16(vget_high_s16(x));
+                const int16x8_t l = veorq_s16(vcombine_s16(vshrn_n_s32(vmulq_n_s32(xl, vl), 16),
+                                                           vshrn_n_s32(vmulq_n_s32(xh, vl), 16)), vnl);
+                vst1q_s16(dl, vqaddq_s16(vld1q_s16(dl), l));
+                const int16x8_t r = veorq_s16(vcombine_s16(vshrn_n_s32(vmulq_n_s32(xl, vr), 16),
+                                                           vshrn_n_s32(vmulq_n_s32(xh, vr), 16)), vnr);
+                vst1q_s16(dr, vqaddq_s16(vld1q_s16(dr), r));
+                in += 8; dl += 8; dr += 8;
+                vl += rl;
+                vr += rr;
+                n -= 8;
+            } while (n > 0);
+            return;
+        }
+#undef MX_PART
+    }
+#endif
     do {
         for (int i = 0; i < 8; i++) {
             const int32_t s = *in++;

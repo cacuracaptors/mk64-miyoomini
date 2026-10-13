@@ -66,6 +66,21 @@ static float pane_zbias = 0.0f;
 #ifdef TARGET_MIYOO
 void gfx_sw_set_pane(int on);   // port/gfx_sw.c: the pane's depths are lifted there instead
 void gfx_sw_set_early(int on);  // port/gfx_sw.c: the ice reflection, drawn before the other translucent triangles
+// Mirror (Extra) mode: the game negates the X of every course vertex at load, and the N64's
+// course unpacker swaps each course triangle's first and third vertex so its faces still
+// point outward. The DC build draws precompiled course lists that were never unpacked, so it
+// turned face culling off altogether in mirror mode (every back face drawn). memory.c now
+// names the mirrored vertex block, and only triangles made of its vertices have their
+// facing reversed; the rest is culled as on the N64 (as in mr-finster/miyoo64, MIT).
+static const uint8_t *mirror_vtx_lo, *mirror_vtx_hi;
+static uint64_t mirror_slots;   // which of the 64 vertex slots hold mirrored course vertices
+void gfx_mirrored_vertices(const void *start, uint32_t bytes) {
+	mirror_vtx_lo = (const uint8_t *) start;
+	mirror_vtx_hi = start ? mirror_vtx_lo + bytes : NULL;
+	mirror_slots = 0;
+}
+// -reflexoantigo: the texgen axes as before (see gfx_sp_vertex)
+extern int port_opt_old_lookat;
 #endif
 
 // Set when a G_MTX_PROJECTION load is an ORTHO matrix (guOrtho: [3][3]==1; guPerspective:
@@ -1765,6 +1780,15 @@ static void __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices, size_t de
 	// Reloaded slots carry new shade colours -> their cached combiner results are stale.
 	cc_cache_invalidate((int) dest_index, (int) n_vertices);
 	PROF_ADD(prof_verts, n_vertices);
+#ifdef TARGET_MIYOO
+	if (mirror_vtx_lo) {
+		const int in = (const uint8_t *) vertices >= mirror_vtx_lo && (const uint8_t *) vertices < mirror_vtx_hi;
+		uint64_t m = 0;
+		for (size_t i = 0; i < n_vertices && dest_index + i < 64; i++)
+			m |= (uint64_t) 1 << (dest_index + i);
+		mirror_slots = in ? (mirror_slots | m) : (mirror_slots & ~m);
+	}
+#endif
 #if GFX_PROF
 	uint64_t prof_t0 = PROF_NOW();
 #endif
@@ -1777,8 +1801,20 @@ static void __attribute__((noinline)) gfx_sp_vertex(size_t n_vertices, size_t de
             }
             static const Light_t lookat_x = { { 0, 0, 0 }, 0, { 0, 0, 0 }, 0, { 127, 0, 0 }, 0 };
             static const Light_t lookat_y = { { 0, 0, 0 }, 0, { 0, 0, 0 }, 0, { 0, 127, 0 }, 0 };
+#ifdef TARGET_MIYOO
+            // Texgen (the chrome of the ceremony trophies, the Nintendo logo, Rainbow Road):
+            // MK64 never sends a lookat, so the RSP uses F3DEX's defaults, where s comes from
+            // the y axis and t from the x axis (checked by mr-finster against the N64's own
+            // microcode in an LLE emulator, MIT); the DC build had them the other way round.
+            if (!port_opt_old_lookat) {
+                calculate_normal_dir(&lookat_y, rsp.current_lookat_coeffs[0]);
+                calculate_normal_dir(&lookat_x, rsp.current_lookat_coeffs[1]);
+            } else
+#endif
+            {
             calculate_normal_dir(&lookat_x, rsp.current_lookat_coeffs[0]);
             calculate_normal_dir(&lookat_y, rsp.current_lookat_coeffs[1]);
+            }
             rsp.lights_changed = 0;
         }
         gfx_sp_vertex_light(n_vertices, dest_index, vertices);
@@ -2632,7 +2668,20 @@ static void  __attribute__((noinline)) GFX_HOT gfx_sp_tri1_impl(uint8_t vtx1_idx
             cross = -cross;
         }
 
+#ifdef TARGET_MIYOO
+        // (mirror mode: a course triangle's vertices are mirrored, so its facing is reversed;
+        // anything else is culled as usual -- see gfx_mirrored_vertices)
+        int mirrored_tri = 0;
+        if (gIsMirrorMode) {
+            const uint64_t need = ((uint64_t) 1 << (vtx1_idx & 63)) | ((uint64_t) 1 << (vtx2_idx & 63)) | ((uint64_t) 1 << (vtx3_idx & 63));
+            mirrored_tri = vtx1_idx < 64 && vtx2_idx < 64 && vtx3_idx < 64 && (mirror_slots & need) == need;
+            if (mirrored_tri)
+                cross = -cross;
+        }
+        switch (0) {
+#else
         switch (!!gIsMirrorMode) {
+#endif
             case 0:
                 switch (rsp.geometry_mode & G_CULL_BOTH) {
                     case G_CULL_FRONT:
