@@ -380,6 +380,16 @@ void gfx_sw_perf_report(int frames, double ms) {
         fprintf(stderr, "perf paralelo: core1 sozinho %.2f  core0 esperando core1 %.2f  mostrar %.2f ms/quadro\n",
                 stLeadMs / frames, stWaitMs / frames, stPresentMs / frames);
     stLeadMs = stPresentMs = stWaitMs = 0;
+    if (port_opt_filter_test) {
+        /* -filtroteste: the next stretch of the race is drawn with the next filter mode, so
+           every mode is measured over the same parts of the course */
+        static const char *const names[3] = { "sem filtro", "filtro", "filtroleve" };
+        static int mode;
+        fprintf(stderr, "perf filtroteste: este trecho foi com %s\n", names[mode]);
+        mode = (mode + 1) % 3;
+        port_opt_filter = mode != 0;
+        port_opt_filter_lite = mode == 2;
+    }
     if (port_opt_resdin) {
         fprintf(stderr, "perf resdin: quadros em 640x480 %d  576x432 %d  512x384 %d  448x336 %d\n",
                 sResFrames[0], sResFrames[1], sResFrames[2], sResFrames[3]);
@@ -2663,7 +2673,8 @@ static int tr_cmp(const void *a, const void *b) {
 /* -filtroleve: textures up to 32x32 get 8 x 8 cells per texel (the blocks of a strongly
    magnified road come out 8 times smaller), the others 4 x 4 as for -filtro */
 static int pf_shift(int w, int h) {
-    return port_opt_filter_lite && w <= 32 && h <= 32 ? 3 : PF_SHIFT;
+    /* (-filtroteste switches between the modes as it goes: one size for all of them) */
+    return port_opt_filter_lite && !port_opt_filter_test && w <= 32 && h <= 32 ? 3 : PF_SHIFT;
 }
 
 static uint32_t *build_pf(const uint32_t *px, int tw, int th, int wrap, int shift) {
