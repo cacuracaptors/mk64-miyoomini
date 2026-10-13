@@ -65,6 +65,7 @@ void* segmented_to_virtual(void* addr);
 static float pane_zbias = 0.0f;
 #ifdef TARGET_MIYOO
 void gfx_sw_set_pane(int on);   // port/gfx_sw.c: the pane's depths are lifted there instead
+void gfx_sw_set_early(int on);  // port/gfx_sw.c: the ice reflection, drawn before the other translucent triangles
 #endif
 
 // Set when a G_MTX_PROJECTION load is an ORTHO matrix (guOrtho: [3][3]==1; guPerspective:
@@ -3806,6 +3807,12 @@ static void  __attribute__((noinline)) GFX_HOT gfx_run_dl(Gfx* cmd) {
 #else
 				pane_zbias = 0.0f;         // "PAN0": OFF (every other pane)
 #endif
+#ifdef TARGET_MIYOO
+			} else if (cmd->words.w1 == 0x52454631) {
+				gfx_sw_set_early(1);       // "REF1": the ice reflection starts
+			} else if (cmd->words.w1 == 0x52454630) {
+				gfx_sw_set_early(0);       // "REF0": and ends
+#endif
 			}
 			++cmd;
 			continue;
@@ -4099,6 +4106,7 @@ void gfx_run(Gfx* commands) {
 	pane_zbias = 0.0f;   // per-frame safety: a pane's PAN1 must never leak across frames
 #ifdef TARGET_MIYOO
 	gfx_sw_set_pane(0);
+	gfx_sw_set_early(0);
 #endif
 
 	// DC 4P perf: pulled-in far plane. Depth-tested tris with ALL THREE verts beyond

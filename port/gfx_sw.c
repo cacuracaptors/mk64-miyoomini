@@ -174,6 +174,7 @@ typedef struct {
     uint8_t clampu, clampv, mirru, mirrv;
     uint8_t filter;        /* bilinear requested: sampled at the nearest texel centre */
     uint8_t pane;          /* the winner's pane growing over the others (see gfx_sw_set_pane) */
+    uint8_t early;         /* drawn before the other translucent triangles (see gfx_sw_set_early) */
 } RState;
 
 static uint8_t sDepthTest = 1, sDepthWrite = 1, sFog = 0, sTexEnv = GFX_TEXENV_MODULATE;
@@ -242,6 +243,20 @@ void gfx_sw_set_pane(int on) {
 }
 #define PANE_ZOFF 0x40000000u
 
+/* Sherbet Land: the kart's reflection is drawn under the ice before the ice itself (the
+   course's translucent pass comes after the players on the N64), so the ice is blended over
+   it. Sorted by depth like the rest of the translucent list, the reflection came before or
+   after the big ice triangles depending on where the kart was: it flickered. Its triangles
+   now go first in the translucent list, in depth order among themselves. */
+static uint8_t sEarly;
+void gfx_sw_set_early(int on) {
+    on = on ? 1 : 0;
+    if (sEarly != on) {
+        sEarly = (uint8_t) on;
+        mark_dirty();
+    }
+}
+
 static void current_state(RState *s) {
     uint32_t t = sBound[0];
     int textured = cur_shader && cur_shader->texture_used[0] && t && t < TEX_MAX && sTex[t].px;
@@ -253,6 +268,7 @@ static void current_state(RState *s) {
     s->blend_src = sBlendSrc;
     s->blend_dst = sBlendDst;
     s->pane = sPane;
+    s->early = sEarly;
     if (textured) {
         s->clampu = sTex[t].clampu;
         s->filter = sTex[t].filter;
@@ -1371,6 +1387,10 @@ static inline __attribute__((always_inline)) void nv_lerp8(uint32_t *out, const 
     vst4_u8((uint8_t *) out, R);
 }
 
+/* -filtro in the span: the opaque list, and the translucent list's modulated textures (the
+   ice of Sherbet Land, see raster_tri); the other translucent spans do not get the code */
+#define FILT_SPAN(OUT, TEX) ((OUT) == KIND_OP || ((OUT) == KIND_TR && \
+                             ((TEX) == GFX_TEXENV_MODULATE || (TEX) == GFX_TEXENV_MODULATEALPHA)))
 static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, int py, int xs, int xe, const float *a,
                                                                const float *ddx, const int OUT, const int TEX, const int COL) {
     const int W = port_render_w;
@@ -1490,7 +1510,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 prun_end = px + plen;
             }
             uint32_t um, vm;
-            if (OUT == KIND_OP && c->filt && !port_opt_exact && dU > -8192 && dU < 8192 && dV > -8192 && dV < 8192) {
+            if (FILT_SPAN(OUT, TEX) && c->filt && !port_opt_exact && dU > -8192 && dU < 8192 && dV > -8192 && dV < 8192) {
                 /* 8 or more pixels per texel (the road right in front): the filter changes
                    slowly and linearly along the run, so it is computed exactly every 4 pixels
                    and the pixels between are blended from those (the filter worked out in
@@ -1501,7 +1521,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 nv_lerp8(tex + 8, &smp[2], &smp[3], &smp[4]);
                 U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
                 V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
-            } else if (OUT == KIND_OP && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536 && c->pf) {
+            } else if (FILT_SPAN(OUT, TEX) && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536 && c->pf) {
                 /* the filter worked out in advance: one cell per pixel (positions relative to
                    the texel centres, as in nv_fetch3; repeat wraps on the cell grid as well) */
                 const int32_t QU = (int32_t) (((uint32_t) U - 33024u) << PF_SHIFT), QV = (int32_t) (((uint32_t) V - 33024u) << PF_SHIFT);
@@ -1524,7 +1544,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 }
                 U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
                 V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
-            } else if (OUT == KIND_OP && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536) {
+            } else if (FILT_SPAN(OUT, TEX) && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536) {
                 nv_fetch3(tex, len, U, dU, V, dV, c);
                 U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
                 V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
@@ -1688,6 +1708,13 @@ static uint32_t sky_fill_row(const TriCtx *c, int py, int xs, int xe, const floa
 #ifndef GFX_SW_NEXTROW
 #define GFX_SW_NEXTROW 3   /* cache lines of the next row asked for ahead (3 or 5) */
 #endif
+/* -filtro on a translucent surface: one that writes depth on the N64 (Z_UPD), with a modulated
+   texture. That is the ice of Sherbet Land (bilinear on the N64, like the road); smoke, item
+   boxes, water and the kart effects do not write depth and stay unfiltered. */
+static inline int tr_ground(const RState *st) {
+    return st->depth_write && (st->texenv == GFX_TEXENV_MODULATE || st->texenv == GFX_TEXENV_MODULATEALPHA);
+}
+
 /* draw one triangle with state st and list kind */
 static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t *v2, const RState *st, int kind) {
     const int W = port_render_w, H = port_render_h;
@@ -1791,7 +1818,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     c.ext = textured && tx->margin ? tx->ext : NULL;
     /* -filtro: 3D opaque surfaces in perspective (the track: karts, trees and items are
        sprites in the other lists, the HUD has no perspective) */
-    c.filt = port_opt_filter && kind == KIND_OP && persp_geo &&
+    c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo &&
              (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
     c.pf = c.filt && !port_opt_exact && tx->pf && tx->pfwrap == (st->clampu | (st->clampv << 1)) ? tx->pf : NULL;
     SpanFn span = sSpanFns[kind][textured ? 1 : 0][extras ? 2 : (flat ? 0 : 1)];
@@ -2005,8 +2032,8 @@ static void cap_draw(const dc_fast_t *v, size_t n, const RState *st, int kind) {
     cap_u32((uint32_t) kind);
     cap_u32(st->tex);
     {
-        uint8_t b[12] = { st->texenv, st->depth_test, st->depth_write, st->fog, st->blend_src, st->blend_dst,
-                          st->clampu, st->clampv, st->mirru, st->mirrv, st->filter, st->pane };
+        uint8_t b[13] = { st->texenv, st->depth_test, st->depth_write, st->fog, st->blend_src, st->blend_dst,
+                          st->clampu, st->clampv, st->mirru, st->mirrv, st->filter, st->pane, st->early };
         fwrite(b, 1, sizeof(b), sCapF);
     }
     cap_u32(sFogColor);
@@ -2549,11 +2576,12 @@ static int sPfPerFrame = 4;
 static void prefilter_prepare(void) {
     if (!port_opt_filter || port_opt_exact)
         return;
-    const Bucket *b = &sRenB[KIND_OP];
     int built = 0;
+    for (int k = 0; k < 2; k++) {
+    const Bucket *b = &sRenB[k == 0 ? KIND_OP : KIND_TR];
     for (int i = 0; i < b->nbatch && built < sPfPerFrame; i++) {
         const RState *st = &b->batch[i].st;
-        if (!st->tex || !b->batch[i].count || st->mirru || st->mirrv)
+        if (!st->tex || !b->batch[i].count || st->mirru || st->mirrv || (k == 1 && !tr_ground(st)))
             continue;
         struct SwTex *t = &sTex[st->tex];
         if (!t->px || t->pf || t->pfnever || t->w > 64 || t->h > 64)
@@ -2562,6 +2590,7 @@ static void prefilter_prepare(void) {
             continue;   /* (the filter only runs with power-of-two repeat or clamp) */
         tex_build_pf(t, st->clampu | (st->clampv << 1));
         built++;
+    }
     }
 }
 
@@ -2584,7 +2613,8 @@ static void sort_tr(void) {
         Batch *bt = &b->batch[i];
         for (uint32_t t = 0; t + 2 < bt->count; t += 3) {
             const dc_fast_t *v = &b->verts[bt->start + t];
-            sTrSort[nt].key = v[0].vert.z + v[1].vert.z + v[2].vert.z + (bt->st.pane ? 192.0f : 0.0f);
+            sTrSort[nt].key = v[0].vert.z + v[1].vert.z + v[2].vert.z + (bt->st.pane ? 192.0f : 0.0f) -
+                              (bt->st.early ? 1e6f : 0.0f);
             sTrSort[nt].seq = bt->start + t;
             sTrSort[nt].batch = (uint16_t) i;
             nt++;
@@ -2635,6 +2665,10 @@ static void sort_tr(void) {
         for (uint32_t i = 0; i < nt; i++) {
             const TrSort e = sTrSort[i];
             const dc_fast_t *v = &b->verts[e.seq];
+            if (b->batch[e.batch].st.early) {   /* (after the sky in the game's order: not in the box) */
+                sTrSort[keep++] = e;
+                continue;
+            }
             if (sSkyN < SKY_MAX && e.key < 3.0f * zfar && sky_candidate(v, &b->batch[e.batch].st, zfar, box)) {
                 sSky[sSkyN++] = e;
                 continue;

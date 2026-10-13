@@ -2136,6 +2136,13 @@ void render_player_ice_reflection(Player* player, s8 playerId, s8 screenId, s8 a
     mtxf_scale2(spA8, gCharacterSize[player->characterId] * player->size);
     convert_to_fixed_point_matrix(&gGfxPool->mtxEffect[gMatrixEffectCount], spA8);
 
+#ifdef TARGET_MIYOO
+    /* the reflection is drawn before the ice over it (the translucent course pass comes after
+       the players); the renderer sorts its translucent list by depth, so tell it ("REF1") */
+    gDisplayListHead->words.w0 = 0x424C4E44;
+    gDisplayListHead->words.w1 = 0x52454631;
+    gDisplayListHead++;
+#endif
     gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(&gGfxPool->mtxEffect[gMatrixEffectCount]),
               G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
     gSPDisplayList(gDisplayListHead++, rk_common_setting_render_character);
@@ -2150,6 +2157,11 @@ void render_player_ice_reflection(Player* player, s8 playerId, s8 screenId, s8 a
                         G_TX_NOLOD);
     gSPVertex(gDisplayListHead++, &gPlayerVtx[playerId][arg3], 8, 0);
     gSPDisplayList(gDisplayListHead++, kart_common_square_plain_render);
+#ifdef TARGET_MIYOO
+    gDisplayListHead->words.w0 = 0x424C4E44;
+    gDisplayListHead->words.w1 = 0x52454630;   /* "REF0" */
+    gDisplayListHead++;
+#endif
     gSPTexture(gDisplayListHead++, 1, 1, 0, G_TX_RENDERTILE, G_OFF);
     gDPSetAlphaCompare(gDisplayListHead++, G_AC_NONE);
 
