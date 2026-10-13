@@ -58,4 +58,10 @@ typedef struct {
 void gfx_sw_frame_stats(SwFrameStats *out);
 extern double port_audio_total_ms;   /* all the time spent mixing the sound (src/main.c) */
 
+/* battery_miyoo.c: OnionOS's low battery warning and shutdown, done by the game */
+void port_battery_init(void);
+void port_battery_release(void);   /* (async-signal-safe) */
+void port_battery_draw(uint16_t *buf, int w, int h);
+extern volatile int port_battery_exit;
+
 #endif

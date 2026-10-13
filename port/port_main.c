@@ -53,6 +53,7 @@ double port_now_ms(void) {
 }
 
 void port_quit(int code) {
+    port_battery_release();
     port_video_shutdown();
     fflush(stdout);
     fflush(stderr);
@@ -61,6 +62,7 @@ void port_quit(int code) {
 }
 
 static void on_signal(int sig) {
+    port_battery_release();
     port_video_shutdown();
     signal(sig, SIG_DFL);
     raise(sig);
@@ -95,6 +97,7 @@ static void crash_hex(int fd, const char *label, unsigned long v) {
 }
 
 static void on_crash(int sig, siginfo_t *info, void *context) {
+    port_battery_release();
     int fd = open("crash_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd >= 0) {
         const char *name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGABRT ? "SIGABRT"
@@ -198,6 +201,7 @@ void port_init(int argc, char **argv) {
     mkdir("saves", 0777);
 
     port_video_init(hires);
+    port_battery_init();
     if (port_opt_perf)
         port_video_membench();
     port_input_init();
@@ -270,6 +274,10 @@ static void start_timer_clock(void) {
 }
 
 void port_poll_quit(void) {
+    if (port_battery_exit) {   /* (battery_miyoo.c: OnionOS shows its low battery screen and turns off) */
+        printf("mk64: saindo (bateria baixa)\n");
+        port_quit(0);
+    }
     if (port_input_quit_requested()) {
         printf("mk64: saindo\n");
         port_quit(0);

@@ -551,6 +551,7 @@ void port_video_init(int hires) {
 void port_video_present(void) {
     if (!flip_started)
         return;
+    port_battery_draw(cbuf[cur_idx], port_render_w, port_render_h);   /* (low battery: OnionOS's icon) */
     pthread_mutex_lock(&flip_mutex);
     while (!snap_free)
         pthread_cond_wait(&flip_cond, &flip_mutex);
