@@ -631,7 +631,25 @@ static int load_romdata(void) {
     return ok;
 }
 
+/* A development build (port/build_miyoo.sh) carries the game data in the executable; the
+   release (port/release_miyoo.sh) has it zeroed, to be filled in from romdata.bin. Asked
+   of the data itself, since romdata.bin's table of addresses belongs to the build it was
+   made for: a development build sent over a release install moved the addresses, did not
+   match it, and stopped at "The game data is damaged" (and dropped setup.ok). */
+static int has_own_data(void) {
+    extern uint8_t _data_segment2SegmentRomStart[], _data_segment2SegmentRomEnd[];
+    const uint8_t *p = _data_segment2SegmentRomStart, *e = _data_segment2SegmentRomEnd;
+    size_t samples = 0, set = 0;
+    for (; p < e; p += 61, samples++)
+        set += *p != 0;
+    return samples > 1000 && set * 4 > samples;
+}
+
 void port_setup(void) {
+    if (has_own_data()) {
+        fprintf(stderr, "setup: the executable already has its game data (development build)\n");
+        return;
+    }
     size_t recipe_size = 0;
     uint8_t *recipe = read_file(RECIPE_FILE, 64u << 20, &recipe_size);
     if (!recipe)
