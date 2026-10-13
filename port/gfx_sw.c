@@ -187,8 +187,10 @@ static const uint32_t *sFogRd = &sFogColor;
 /* exported for the front-end (only used by its DC inline OP path) */
 uint8_t gfx_pvr_op_dirty = 1;
 
-#define BUCKET_VERTS 32768
-#define BUCKET_BATCH 2048
+/* (twice the first sizes: the results screen after a win draws two whole tracks in one frame;
+   anything that does not fit is dropped and noted in descartes.txt, see drop_note) */
+#define BUCKET_VERTS 65536
+#define BUCKET_BATCH 4096
 
 typedef struct {
     RState st;
@@ -218,6 +220,42 @@ static Bucket *sRecB = sBk[0], *sRenB = sBk[0];
 #define sPT (sRecB[KIND_PT])
 #define sTR (sRecB[KIND_TR])
 static int sDropLog;
+
+/* Dropped triangles (a list full) are counted per frame and, at the end of a frame that lost
+   some, noted in descartes.txt in the game folder. That file is appended to and never cleared
+   by the game (log.txt is rewritten at every start), so a rare case shows up later too. The
+   first such frame of a run also asks for a capture of the next frame (as SELECT + X does). */
+static uint32_t sDropTris[3], sDropBatch[3];
+static uint32_t sPeakVerts[3], sPeakBatch[3];
+static int sDropNotes, sDropCaptured;
+static uint32_t sFrameNo;
+extern s32 gGamestate;
+extern s16 gCurrentCourseId;
+void gfx_sw_request_capture(void);
+static void drop_note(void) {
+    if (sDropNotes < 100) {
+        FILE *f = fopen("descartes.txt", "a");
+        if (f) {
+            if (sDropNotes == 0)
+                fprintf(f, "--- nova execucao (listas de %d vertices e %d estados)\n", BUCKET_VERTS, BUCKET_BATCH);
+            fprintf(f, "quadro %u, %.1f s: estado do jogo %d, pista %d | triangulos perdidos op %u pt %u tr %u, "
+                       "estados perdidos op %u pt %u tr %u | maximo usado: vertices %u/%u/%u, estados %u/%u/%u\n",
+                    (unsigned) sFrameNo, port_now_ms() / 1000.0, (int) gGamestate, (int) gCurrentCourseId,
+                    (unsigned) sDropTris[0], (unsigned) sDropTris[1], (unsigned) sDropTris[2],
+                    (unsigned) sDropBatch[0], (unsigned) sDropBatch[1], (unsigned) sDropBatch[2],
+                    (unsigned) sPeakVerts[0], (unsigned) sPeakVerts[1], (unsigned) sPeakVerts[2],
+                    (unsigned) sPeakBatch[0], (unsigned) sPeakBatch[1], (unsigned) sPeakBatch[2]);
+            fclose(f);
+        }
+        sDropNotes++;
+    }
+    if (!sDropCaptured) {
+        sDropCaptured = 1;
+        gfx_sw_request_capture();
+    }
+    for (int k = 0; k < 3; k++)
+        sDropTris[k] = sDropBatch[k] = 0;
+}
 
 static void mark_dirty(void) {
     sOP.dirty = 1;
@@ -2068,6 +2106,11 @@ static dc_fast_t *bucket_reserve(Bucket *b, size_t n) {
         if (b->nbatch >= BUCKET_BATCH) {
             if (sDropLog++ < 8)
                 printf("SW_DROP batch\n");
+            const int k = (int) (b - sRecB);
+            if (k >= 0 && k < 3) {
+                sDropBatch[k]++;
+                sDropTris[k] += (uint32_t) (n / 3);
+            }
             return NULL;
         }
         b->cur = b->nbatch++;
@@ -2079,6 +2122,9 @@ static dc_fast_t *bucket_reserve(Bucket *b, size_t n) {
     if (b->nverts + n > BUCKET_VERTS) {
         if (sDropLog++ < 8)
             printf("SW_DROP verts\n");
+        const int k = (int) (b - sRecB);
+        if (k >= 0 && k < 3)
+            sDropTris[k] += (uint32_t) (n / 3);
         return NULL;
     }
     dc_fast_t *out = &b->verts[b->nverts];
@@ -3083,6 +3129,13 @@ static void pipe_handover(void) {
 
 static void sw_end_frame(void) {
     double t0 = port_now_ms();
+    sFrameNo++;
+    for (int k = 0; k < 3; k++) {
+        if (sRecB[k].nverts > sPeakVerts[k]) sPeakVerts[k] = sRecB[k].nverts;
+        if ((uint32_t) sRecB[k].nbatch > sPeakBatch[k]) sPeakBatch[k] = (uint32_t) sRecB[k].nbatch;
+    }
+    if (sDropTris[0] | sDropTris[1] | sDropTris[2] | sDropBatch[0] | sDropBatch[1] | sDropBatch[2])
+        drop_note();
     stWalkMs += t0 - sFrameT0;
     count_list(&sOP, &stOpTris, KIND_OP);
     count_list(&sPT, &stPtTris, KIND_PT);
