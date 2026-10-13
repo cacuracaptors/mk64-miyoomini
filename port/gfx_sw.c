@@ -513,6 +513,7 @@ typedef struct {
     const uint32_t *pf;      /* -filtro: the filter worked out in advance (2^pfs x 2^pfs cells per texel) */
     int pfs;
     const uint32_t *pf1;     /* the same with half as many cells per side (2^(pfs-1)), right after it */
+    int32_t flim;            /* the exact filter up to this step per pixel (16.16 texels) */
 } TriCtx;
 
 static uint8_t sExp5[32], sExp6[64];   /* 565 -> 8 bit, same rounding as before (v*255/max) */
@@ -1464,8 +1465,8 @@ static inline __attribute__((always_inline)) void nv_lerp8(uint32_t *out, const 
 
 /* -filtro in the span: the opaque list, and the translucent list's modulated textures (the
    ice of Sherbet Land, see raster_tri); the other translucent spans do not get the code */
-#define FILT_SPAN(OUT, TEX) ((OUT) == KIND_OP || ((OUT) == KIND_TR && \
-                             ((TEX) == GFX_TEXENV_MODULATE || (TEX) == GFX_TEXENV_MODULATEALPHA)))
+/* (-qualidade: every list, see raster_tri) */
+#define FILT_SPAN(OUT, TEX) ((OUT) == KIND_OP || (OUT) == KIND_PT || (OUT) == KIND_TR)
 static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, int py, int xs, int xe, const float *a,
                                                                const float *ddx, const int OUT, const int TEX, const int COL) {
     const int W = port_render_w;
@@ -1628,7 +1629,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 }
                 U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
                 V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
-            } else if (FILT_SPAN(OUT, TEX) && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536) {
+            } else if (FILT_SPAN(OUT, TEX) && c->filt && dU > -c->flim && dU < c->flim && dV > -c->flim && dV < c->flim) {
                 nv_fetch3(tex, len, U, dU, V, dV, c);
                 U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
                 V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
@@ -1902,7 +1903,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     c.ext = textured && tx->margin ? tx->ext : NULL;
     const uint32_t *tpf = textured ? tx->pf : NULL;
     int tpfwrap = textured ? tx->pfwrap : 0, tpfs = textured ? tx->pfs : PF_SHIFT;
-    if (port_opt_filter && !port_opt_exact && persp_geo && (kind == KIND_OP || tr_ground(st))) {
+    if (port_opt_filter && !port_opt_exact && ((persp_geo && (kind == KIND_OP || tr_ground(st))) || port_opt_filter_all)) {
         /* a mirrored texture: its doubled copy with the mirror in place, read as a plain
            repeat (the coordinates stay in the original texture's texels) */
         const int axes = (st->mirru && !st->clampu) | ((st->mirrv && !st->clampv) << 1);
@@ -1918,12 +1919,22 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     }
     /* -filtro: 3D opaque surfaces in perspective (the track: karts, trees and items are
        sprites in the other lists, the HUD has no perspective) */
-    c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo &&
-             (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
-    c.pf = c.filt && !port_opt_exact && tpf && tpfwrap == (st->clampu | (st->clampv << 1)) ? tpf : NULL;
+    const int wraps_ok = (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
+    if (port_opt_filter_all) {
+        /* -qualidade: the N64's filter wherever the game asks for it (track, karts, trees,
+           items, HUD, menus), magnified or up to 2 texels a pixel, computed exactly */
+        c.filt = textured && st->filter && wraps_ok;
+        c.flim = 131072;
+        if (c.filt)
+            c.ext = NULL;   /* (filtered, the invisible texels at a row's ends blend into the visible ones) */
+    } else {
+        c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo && wraps_ok;
+        c.flim = 65536;
+    }
+    c.pf = c.filt && !port_opt_exact && !port_opt_filter_all && tpf && tpfwrap == (st->clampu | (st->clampv << 1)) ? tpf : NULL;
     c.pfs = tpfs;
     c.pf1 = c.pf ? c.pf + ((size_t) c.tw << tpfs) * ((size_t) c.th << tpfs) : NULL;
-    if (port_opt_filter && kind == KIND_OP && persp_geo && !c.filt) {
+    if (port_opt_filter && !port_opt_filter_all && kind == KIND_OP && persp_geo && !c.filt) {
         /* (a 3D opaque texture the filter cannot take: noted once per kind, for the log) */
         static uint32_t seen[16];
         static int nseen;
@@ -2838,14 +2849,17 @@ static void prefilter_prepare(void) {
         if (!sPfJob.active) {
             /* the next texture of this frame that needs one */
             int started = 0;
-            for (int k = 0; k < 2 && !started; k++) {
-                const Bucket *b = &sRenB[k == 0 ? KIND_OP : KIND_TR];
+            for (int k = 0; k < 3 && !started; k++) {
+                static const int kKind[3] = { KIND_OP, KIND_TR, KIND_PT };
+                const Bucket *b = &sRenB[kKind[k]];
                 for (int i = 0; i < b->nbatch && !started; i++) {
                     const RState *st = &b->batch[i].st;
-                    if (!st->tex || !b->batch[i].count || (k == 1 && !tr_ground(st)))
-                        continue;
-                    struct SwTex *t = &sTex[st->tex];
                     const int axes = (st->mirru && !st->clampu) | ((st->mirrv && !st->clampv) << 1);
+                    if (!st->tex || !b->batch[i].count)
+                        continue;
+                    if (port_opt_filter_all ? !axes || !st->filter : (k == 2 || (k == 1 && !tr_ground(st))))
+                        continue;   /* (-qualidade: only the mirrored copies are needed, in every list) */
+                    struct SwTex *t = &sTex[st->tex];
                     if (!t->px || (axes ? t->mpx != NULL : t->pf != NULL) || t->pfnever || t->w > 64 || t->h > 64)
                         continue;
                     if ((!st->clampu && (t->w & (t->w - 1))) || (!st->clampv && (t->h & (t->h - 1))))
@@ -3303,6 +3317,11 @@ static const int kResW[4] = { 640, 576, 512, 448 }, kResH[4] = { 480, 432, 384, 
 static int sResLevel, sResHold, sResDownHold;
 static double sResEma, sResLastT, sResLastPacing, sResWait;
 static void resdin_pick(void) {
+    if (!port_opt_resdin && sResLevel) {   /* (switched off while smaller: back to full size) */
+        sResLevel = 0;
+        port_render_w = kResW[0];
+        port_render_h = kResH[0];
+    }
     if (!port_opt_resdin || !port_video_scales() || sCapF || port_render_w > 640)
         return;
     const double now = port_now_ms();

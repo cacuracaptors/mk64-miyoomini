@@ -115,7 +115,12 @@ u8 D_8018ED91;
 s32 sIntroModelTimer;
 
 Unk_D_800E70A0 D_800E70A0[] = {
+#ifdef TARGET_MIYOO
+    /* (one player only: the 1P box in the middle, where it goes once chosen) */
+    { 0x3d, 0x11, 0x00, 0x00 }, { 0x80, 0x3e, 0x00, 0x00 }, { 0x5c, 0x3e, 0x00, 0x00 },
+#else
     { 0x3d, 0x11, 0x00, 0x00 }, { 0x15, 0x3e, 0x00, 0x00 }, { 0x5c, 0x3e, 0x00, 0x00 },
+#endif
     { 0xa3, 0x3e, 0x00, 0x00 }, { 0xea, 0x3e, 0x00, 0x00 }, { 0x10a, 0xc8, 0x00, 0x00 },
     { 0x15, 0xc8, 0x00, 0x00 }, { 0x55, 0xc8, 0x00, 0x00 }, { 0x00, 0x00, 0x00, 0x00 },
 };
@@ -1425,7 +1430,7 @@ void text_rainbow_effect(s32 test, s32 target, s32 alternative_color) {
         if (is_screen_being_faded() != 0) {
             set_text_color(gGlobalTimer % 3);
         } else {
-            set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+            set_text_color(TEXT_BLUE);
         }
     } else {
         set_text_color(alternative_color);
@@ -1434,7 +1439,7 @@ void text_rainbow_effect(s32 test, s32 target, s32 alternative_color) {
 
 void set_text_color_rainbow_if_selected(s32 test, s32 target, s32 alternative_color) {
     if (test == target) {
-        set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+        set_text_color(TEXT_BLUE);
     } else {
         set_text_color(alternative_color);
     }
@@ -5968,6 +5973,10 @@ void render_menus(MenuItem* arg0) {
             case MENU_ITEM_UI_3P_GAME:
             case MENU_ITEM_UI_4P_GAME:
                 var_a1 = arg0->type - MENU_ITEM_UI_1P_GAME;
+#ifdef TARGET_MIYOO
+                if (var_a1 != 0)
+                    break;   /* (one player only on this device) */
+#endif
                 func_800A8270(var_a1, arg0);
                 func_800A0FA4(arg0, var_a1);
                 break;
@@ -5994,6 +6003,16 @@ void render_menus(MenuItem* arg0) {
                 var_v1 = arg0->type - 0xA;
                 gDisplayListHead =
                     func_8009BC9C(gDisplayListHead, D_800E8254[var_v1], arg0->column, arg0->row, 2, arg0->param1);
+#ifdef TARGET_MIYOO
+                if (arg0->type == MAIN_MENU_DATA_GFX) {
+                    /* SELECT: performance or quality, between DATA and OK (the font has no colon) */
+                    extern int port_opt_quality;
+                    set_text_color(TEXT_BLUE);
+                    print_text1_center_mode_1(0xCC, 0xCF, "SELECT", 0, 0.65f, 0.65f);
+                    set_text_color(port_opt_quality ? TEXT_GREEN : TEXT_YELLOW);
+                    print_text1_center_mode_1(0xCC, 0xDB, port_opt_quality ? "QUALITY" : "PERFORMANCE", 0, 0.65f, 0.65f);
+                }
+#endif
                 break;
             case MAIN_MENU_50CC:              /* switch 6 */
             case MAIN_MENU_100CC:             /* switch 6 */
@@ -6231,7 +6250,7 @@ void render_menus(MenuItem* arg0) {
                 print_text1_left(arg0->column, arg0->row, gCupNames[D_800DC540], arg0->param1, arg0->paramf, 1.0f);
                 break;
             case MENU_ITEM_TYPE_097: /* switch 6 */
-                set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+                set_text_color(TEXT_BLUE);
                 print_text_mode_1(arg0->column, arg0->row, gCourseNames[gCurrentCourseId], arg0->param1, arg0->paramf,
                                   1.0f);
                 break;
@@ -7161,7 +7180,7 @@ void func_800A2EB8(MenuItem* arg0) {
     }
     set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_1);
     print_text_mode_1(arg0->column + 0x1E, arg0->row + 0x19, "results", 0, 1.0f, 1.0f);
-    set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+    set_text_color(TEXT_BLUE);
     print_text_mode_1(arg0->column + 0x2C, arg0->row + 0x28, "round", 0, 0.7f, 0.7f);
     convert_number_to_ascii(gCourseIndexInCup + 1, sp68);
     print_text_mode_1(arg0->column + 0x57, arg0->row + 0x28, &sp68[1], 0, 0.7f, 0.7f);
@@ -7183,7 +7202,7 @@ void func_800A2EB8(MenuItem* arg0) {
         set_text_color(var_a0);
         func_800A32B4(0xBE - arg0->column, arg0->row + (0x10 * var_s2) + 0x5A, sp70[var_s2], var_s2);
     }
-    set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+    set_text_color(TEXT_BLUE);
     temp_s0 = (s32) (((f32) (get_string_width(gCupNames[gCupSelection]) + 8) * 0.6f) / 2);
     print_text1_center_mode_1(
         (-(s32) (((f32) (get_string_width(D_800E76CC[gCCSelection]) + 8) * 0.6f) / 2) - arg0->column) + 0xF5,
@@ -7242,7 +7261,7 @@ void func_800A34A8(MenuItem* arg0) {
         }
         set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_1);
         print_text_mode_1(arg0->column + 0x19, 0x19 - arg0->row, "driver's points", 0, 0.8f, 0.8f);
-        set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+        set_text_color(TEXT_BLUE);
         print_text_mode_1(arg0->column + 0x36, 0x28 - arg0->row, "round", 0, 0.7f, 0.7f);
         convert_number_to_ascii(gCourseIndexInCup + 1, sp78);
         print_text_mode_1(arg0->column + 0x61, (0x28 & 0xFFFFFFFF) - arg0->row, &sp78[1], 0, 0.7f, 0.7f);
@@ -7301,7 +7320,7 @@ void func_800A34A8(MenuItem* arg0) {
                 func_800A3ADC(arg0, 0xBE - arg0->column, arg0->row + (rank * 0x10) + 0x5A, sp80[rank], rank, sp80);
             }
         }
-        set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+        set_text_color(TEXT_BLUE);
         temp_s0_3 = ((get_string_width(gCupNames[gCupSelection]) + 8) * 0.6f) / 2;
         print_text1_center_mode_1(
             (-(s32) (((get_string_width(D_800E76CC[gCCSelection]) + 8) * 0.6f) / 2) - arg0->column) + 0xE6,
@@ -8055,7 +8074,7 @@ void func_800A6034(MenuItem* arg0) {
     if (D_801657E8 != 1) {
         gDPSetPrimColor(gDisplayListHead++, 0, 0, 0x00, 0x00, 0x00, arg0->param1);
         text = gCupNames[D_800DC540];
-        set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+        set_text_color(TEXT_BLUE);
         print_text1_center_mode_2(arg0->column + 0x41, arg0->row + 0xA0, text, 0, 0.85f, 1.0f);
         text = gCourseNames[gCurrentCourseId];
         set_text_color((s32) gCurrentCourseId % 4);
@@ -8108,12 +8127,12 @@ void func_800A638C(MenuItem* arg0) {
 
     if (arg0->state == 0) {
         gDisplayListHead = draw_box(gDisplayListHead, 0, 0, 0x0000013F, 0x000000EF, 0, 0, 0, arg0->param1);
-        set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+        set_text_color(TEXT_BLUE);
         gDPSetPrimColor(gDisplayListHead++, 0, 0, 0x00, 0x00, 0x00, (arg0->param1 * 0xFF) / 100);
         print_text1_center_mode_2(0x000000A0, arg0->row + 0x1E, D_800E7778[gModeSelection / 3], 0, 1.0f, 1.0f);
     } else {
         gDisplayListHead = draw_box(gDisplayListHead, 0, 0, 0x0000013F, 0x000000EF, 0, 0, 0, 0x00000064);
-        set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+        set_text_color(TEXT_BLUE);
         print_text1_center_mode_1(0x000000A0, arg0->row + 0x1E, D_800E7778[gModeSelection / 3], 0, 1.0f, 1.0f);
     }
     switch (arg0->state) { /* irregular */
@@ -8424,7 +8443,7 @@ void menu_item_ceremony_placed_render(MenuItem* arg0) {
     func_800A79F4(temp_a0, sp3C);
     sp48 = ((get_string_width(gPlaceText[0]) + 5) * 1.2f) / 2;
     sp44 = ((get_string_width(gPlaceText[temp_a0]) + 5) * 1.2f) / 2;
-    set_text_color(TEXT_BLUE_GREEN_RED_CYCLE_2);
+    set_text_color(TEXT_BLUE);
     print_text1_center_mode_1(arg0->column - sp44, arg0->row, gPlaceText[0], 0, 1.2f, 1.2f);
     set_text_color((s32) gGlobalTimer % 3);
     print_text1_center_mode_1(arg0->column + sp48, arg0->row, gPlaceText[temp_a0], 0, 1.2f, 1.2f);

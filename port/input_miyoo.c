@@ -39,6 +39,9 @@
 #define N64_CL     0x0002
 #define N64_CR     0x0001
 
+volatile int port_menu_mode_screen;   /* set by menus.c every frame the Game Select screen takes input */
+int port_mode_toggle_pressed;          /* SELECT went down on that screen (menus.c takes it) */
+
 enum { K_UP, K_DOWN, K_LEFT, K_RIGHT, K_A, K_B, K_X, K_Y, K_L1, K_R1, K_L2, K_R2, K_START, K_SELECT, K_MENU, K_COUNT };
 
 static int ev_fd = -1;
@@ -178,7 +181,17 @@ void update_controller(s32 index) {
     if (held[K_Y]) b |= N64_CU;
     if (held[K_X]) b |= N64_CR;
     if (held[K_START]) b |= N64_START;
-    if (held[K_SELECT]) b |= N64_L;
+    /* the Game Select screen: SELECT switches between performance and quality (menus.c
+       says when that screen is up, once a frame); elsewhere it is L, as before */
+    const int on_mode_screen = port_menu_mode_screen;
+    port_menu_mode_screen = 0;
+    {
+        static int sel_was;
+        if (on_mode_screen && held[K_SELECT] && !sel_was && !held[K_X] && !held[K_START])
+            port_mode_toggle_pressed = 1;
+        sel_was = held[K_SELECT];
+    }
+    if (held[K_SELECT] && !on_mode_screen) b |= N64_L;
     if (held[K_UP]) b |= N64_DU;
     if (held[K_DOWN]) b |= N64_DD;
     if (held[K_LEFT]) b |= N64_DL;

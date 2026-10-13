@@ -67,6 +67,10 @@ static int perf_frames;
 extern int32_t gGamestate;
 extern int16_t gCurrentCourseId;
 static int sHitches, sHitchLines;
+/* -perf: each frame's own work (its time without waiting for the 30 fps beat or the
+   screen): the average and the worst of the last 2 s, and how many did not fit */
+static double sWorkSum, sWorkMax;
+static int sWorkN, sWorkOver;
 typedef struct {
     int n, pfn, upn, res;
     double t0, total, max, walk, band, wait, present, hand, pf, up, audio, cpu;
@@ -82,12 +86,12 @@ static void hitch_print(const HitchRun *r) {
     fprintf(stderr, "engasgo: t=%.0f ms, %d quadro(s) em %.0f ms (o maior %.0f, perdeu %.0f) estado %d pista %d res %d | "
             "lista %.1f (texturas %d: %.1f) nucleo0 %.1f espera nucleo1 %.1f mostrar %.1f entrega %.1f (filtro feito %d: %.1f) "
             "som %.1f resto %.1f | cpu %.0f ms faltas %ld do cartao %ld\n",
-            r->t0, r->n, r->total, r->max, r->total - r->n * 16.68, (int) gGamestate, (int) gCurrentCourseId, r->res,
+            r->t0, r->n, r->total, r->max, r->total - r->n * (force_30fps ? 33.37 : 16.68), (int) gGamestate, (int) gCurrentCourseId, r->res,
             r->walk, r->upn, r->up, r->band, r->wait, r->present, r->hand, r->pfn, r->pf, r->audio, r->total - known,
             r->cpu, r->minf, r->majf);
 }
 static void hitch_check(double now) {
-    static double last, last_audio, last_cpu;
+    static double last, last_audio, last_cpu, last_pacing;
     static long last_min, last_maj;
     struct rusage ru;
     struct timespec ts;
@@ -98,7 +102,17 @@ static void hitch_check(double now) {
     gfx_sw_frame_stats(&fs);
     const double dt = now - last;
     if (last > 0) {
-        if (dt > 20.0) {   /* a slow frame: part of the stretch */
+        const double work = dt - (port_pacing_ms - last_pacing) - fs.present;
+        sWorkSum += work;
+        sWorkN++;
+        if (work > sWorkMax)
+            sWorkMax = work;
+        if (work > (force_30fps ? 33.0 : 16.5))
+            sWorkOver++;
+    }
+    last_pacing = port_pacing_ms;
+    if (last > 0) {
+        if (dt > (force_30fps ? 37.0 : 20.0)) {   /* a slow frame: part of the stretch */
             HitchRun *r = &sRun;
             if (!r->n)
                 r->t0 = last;
@@ -113,7 +127,7 @@ static void hitch_check(double now) {
             r->minf += ru.ru_minflt - last_min;
             r->majf += ru.ru_majflt - last_maj;
         } else if (sRun.n) {   /* the stretch is over */
-            if (sRun.total - sRun.n * 16.68 > 40.0)
+            if (sRun.total - sRun.n * (force_30fps ? 33.37 : 16.68) > 40.0)
                 hitch_print(&sRun);
             memset(&sRun, 0, sizeof(sRun));
         }
@@ -139,9 +153,13 @@ static void wm_swap_buffers_begin(void) {
         else if (now - perf_last >= 2000.0) {
             gfx_sw_perf_report(perf_frames, now - perf_last);
             extern double port_audio_ms;
-            fprintf(stderr, "perf main: %.1f fps  wait-for-flip %.2f ms/frame  som %.2f ms/frame  engasgos %d\n",
-                    perf_frames * 1000.0 / (now - perf_last), perf_work / perf_frames, port_audio_ms / perf_frames, sHitches);
+            fprintf(stderr, "perf main: %.1f fps  wait-for-flip %.2f ms/frame  som %.2f ms/frame  engasgos %d  "
+                    "trabalho por quadro %.1f ms (maior %.1f, %d de %d acima de %.0f ms)\n",
+                    perf_frames * 1000.0 / (now - perf_last), perf_work / perf_frames, port_audio_ms / perf_frames, sHitches,
+                    sWorkN ? sWorkSum / sWorkN : 0.0, sWorkMax, sWorkOver, sWorkN, force_30fps ? 33.0 : 16.5);
             sHitches = 0;
+            sWorkSum = sWorkMax = 0;
+            sWorkN = sWorkOver = 0;
             port_audio_ms = 0;
             perf_frames = 0;
             perf_work = 0;

@@ -37,7 +37,9 @@ int port_opt_filter = 0;
 int port_opt_filter_test = 0;   /* -filtroteste: the filter modes take turns, one per perf report */
 int port_opt_filter_lite = 0;
 int port_opt_old_lookat = 0;  /* -reflexoantigo: the texgen (chrome) axes as the DC build had them */
-int port_opt_pf_level = 0;    /* -filtroleve: 0 the 4x4 cells, 1 the 2x2 cells below 4 pixels per texel, 2 the 2x2 cells */   /* -filtroleve: the filter worked out in advance everywhere (cheaper) */
+int port_opt_pf_level = 0;
+int port_opt_quality = 0;     /* -qualidade (see port_apply_mode) */
+int port_opt_filter_all = 0;  /* -qualidade: the N64's filter on everything that asks for it */    /* -filtroleve: 0 the 4x4 cells, 1 the 2x2 cells below 4 pixels per texel, 2 the 2x2 cells */   /* -filtroleve: the filter worked out in advance everywhere (cheaper) */
 int port_opt_parallel = 1;   /* -semparalelo turns it off */
 int port_opt_resdin = 0;     /* -resdin: smaller frames while the drawing does not keep up */
 int port_opt_mute = 0;       /* -mudo: no sound */
@@ -148,6 +150,60 @@ void port_chdir_to_exe(void) {
         perror("chdir");
 }
 
+/* The two modes: performance (the shortcut's options: 60 fps, dynamic resolution, the
+   filter worked out in advance on the 3D surfaces) and quality (30 fps, 640x480, the N64's
+   own filter on every texture that asks for it). They can be swapped while the game runs. */
+static int sPerf60, sPerfResdin, sPerfFilter, sPerfLite, sPerfSaved;
+void port_apply_mode(int quality) {
+    if (!sPerfSaved) {
+        sPerfSaved = 1;
+        sPerf60 = port_opt_60fps;
+        sPerfResdin = port_opt_resdin;
+        sPerfFilter = port_opt_filter;
+        sPerfLite = port_opt_filter_lite;
+    }
+    port_opt_quality = quality;
+    if (quality) {
+        port_opt_60fps = 0;
+        port_opt_resdin = 0;
+        port_opt_filter = 1;
+        port_opt_filter_lite = 0;
+        port_opt_filter_all = 1;
+    } else {
+        port_opt_60fps = sPerf60;
+        port_opt_resdin = sPerfResdin;
+        port_opt_filter = sPerfFilter;
+        port_opt_filter_lite = sPerfLite;
+        port_opt_filter_all = 0;
+    }
+    printf("modo: %s\n", quality ? "qualidade (30 fps, filtro do N64 em tudo)" : "desempenho");
+}
+
+/* SELECT on the Game Select screen (menus.c): the other mode, kept in saves/modo.txt so
+   the game starts in it next time (over the shortcut's choice) */
+#define MODE_FILE "saves/modo.txt"
+void port_toggle_mode(void) {
+    port_apply_mode(!port_opt_quality);
+    FILE *f = fopen(MODE_FILE, "w");
+    if (f) {
+        fputs(port_opt_quality ? "qualidade\n" : "desempenho\n", f);
+        fclose(f);
+    }
+}
+static void load_saved_mode(void) {
+    FILE *f = fopen(MODE_FILE, "r");
+    char line[32] = "";
+    if (!f)
+        return;
+    if (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "qualidade", 9))
+            port_opt_quality = 1;
+        else if (!strncmp(line, "desempenho", 10))
+            port_opt_quality = 0;
+    }
+    fclose(f);
+}
+
 void port_init(int argc, char **argv) {
     int hires = 0;
     for (int i = 1; i < argc; i++) {
@@ -170,6 +226,9 @@ void port_init(int argc, char **argv) {
             port_opt_filter = 1;
             port_opt_filter_lite = 1;
             port_opt_pf_level = 2;
+        }
+        else if (!strcmp(argv[i], "-qualidade")) {   /* 30 fps, 640x480, the N64's filter everywhere */
+            port_opt_quality = 1;
         }
         else if (!strcmp(argv[i], "-reflexoantigo"))
             port_opt_old_lookat = 1;
@@ -194,6 +253,8 @@ void port_init(int argc, char **argv) {
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     mkdir("saves", 0777);
+    load_saved_mode();
+    port_apply_mode(port_opt_quality);
 
     port_video_init(hires);
     if (port_opt_perf)

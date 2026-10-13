@@ -1318,6 +1318,23 @@ void main_menu_act(struct Controller* controller, u16 controllerIdx) {
             case MAIN_MENU_NONE:
                 break;
             case MAIN_MENU_PLAYER_SELECT:
+#ifdef TARGET_MIYOO
+                /* one player only on this device (the 2P-4P boxes are not drawn), and SELECT
+                   switches between performance and quality (port_main.c) */
+                {
+                    extern volatile int port_menu_mode_screen;
+                    extern int port_mode_toggle_pressed;
+                    extern void port_toggle_mode(void);
+                    port_menu_mode_screen = 1;
+                    if (port_mode_toggle_pressed) {
+                        port_mode_toggle_pressed = 0;
+                        port_toggle_mode();
+                        play_sound2(SOUND_MENU_SELECT);
+                    }
+                    gPlayerCount = 1;
+                    btnAndStick &= ~(R_JPAD | L_JPAD);
+                }
+#endif
                 if ((btnAndStick & R_JPAD) && (gPlayerCount < 4)) {
                     gPlayerCount += 1;
                     reset_cycle_flash_menu();
