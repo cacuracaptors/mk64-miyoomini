@@ -349,6 +349,12 @@ static double stLeadMs, stPresentMs, stWaitMs;   /* -paralelo: core 1 alone, sho
 static int sPipe;                       /* -paralelo on (see pipe_init) */
 static volatile int sCpuMhz;            /* -perf: the CPU clock as measured (watchdog thread) */
 static int sResFrames[4];               /* -resdin: frames drawn at each size since the last report */
+/* this frame only, for the hitch log (gfx_wm_miyoo.c): where a slow frame's time went */
+static SwFrameStats sFS;
+void gfx_sw_frame_stats(SwFrameStats *out) {
+    *out = sFS;
+    memset(&sFS, 0, sizeof(sFS));
+}
 /* -perf watchdog: where the game thread and core 1 are when frames stop coming */
 static volatile int sMainStage, sWorkerStage;
 static volatile unsigned sFramesDone;
@@ -2451,7 +2457,14 @@ static void tex_fake_filter(struct SwTex *t) {
 
 static void convert_texels(uint32_t *d, const uint16_t *s, uint32_t n, uint32_t fmt);
 
+static void sw_upload_texture_now(const uint8_t *buf16, int width, int height, unsigned int type);
 static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsigned int type) {
+    const double t = port_now_ms();
+    sw_upload_texture_now(buf16, width, height, type);
+    sFS.up += port_now_ms() - t;
+    sFS.upn++;
+}
+static void sw_upload_texture_now(const uint8_t *buf16, int width, int height, unsigned int type) {
     struct SwTex *t = &sTex[sCurBound];
     if (width <= 0 || height <= 0)
         return;
@@ -2800,10 +2813,13 @@ static void prefilter_prepare(void) {
             continue;
         if ((!st->clampu && (t->w & (t->w - 1))) || (!st->clampv && (t->h & (t->h - 1))))
             continue;   /* (the filter only runs with power-of-two repeat or clamp) */
+        const double tb = port_now_ms();
         if (axes)
             tex_build_mirror(t, axes, st->clampu | (st->clampv << 1));
         else
             tex_build_pf(t, st->clampu | (st->clampv << 1));
+        sFS.pf += port_now_ms() - tb;
+        sFS.pfn++;
         built++;
     }
     }
@@ -3198,12 +3214,14 @@ static void pipe_finish(int adapt) {
     sMainStage = 3;
     const double ms0 = port_now_ms() - tj;
     stCore0Ms += ms0;
+    sFS.band += ms0;
     stLeadMs += lead;
 
     pthread_mutex_lock(&sWMutex);
     while (sWorkDone != sPipeGen)
         pthread_cond_wait(&sWCond, &sWMutex);
     stWaitMs += port_now_ms() - tj - ms0;
+    sFS.wait += port_now_ms() - tj - ms0;
     const double ms1 = sWorkerMs;
     tlPixels += sWorkerPixels;
     tlTris += sWorkerTris;
@@ -3306,6 +3324,7 @@ static void sw_end_frame(void) {
     if (sDropTris[0] | sDropTris[1] | sDropTris[2] | sDropBatch[0] | sDropBatch[1] | sDropBatch[2])
         drop_note();
     stWalkMs += t0 - sFrameT0;
+    sFS.walk += t0 - sFrameT0;
     count_list(&sOP, &stOpTris, KIND_OP);
     count_list(&sPT, &stPtTris, KIND_PT);
     count_list(&sTR, &stTrTris, KIND_TR);
@@ -3320,11 +3339,15 @@ static void sw_end_frame(void) {
             sMainStage = 4;
             port_video_present();
             stPresentMs += port_now_ms() - tp;
+            sFS.present += port_now_ms() - tp;
             sResWait += port_now_ms() - tp;
             sPipeState = 0;
         }
         sMainStage = 5;
+        const double th = port_now_ms();
         pipe_handover();
+        sFS.hand += port_now_ms() - th;
+        sFS.res = sResLevel;
         sMainStage = 0;
         sFramesDone++;
         stRasterMs += port_now_ms() - t0;

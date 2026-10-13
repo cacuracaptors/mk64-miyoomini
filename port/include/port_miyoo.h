@@ -49,4 +49,12 @@ void port_input_init(void);
 void port_input_poll(void);
 int port_input_quit_requested(void);
 
+/* one frame's times (ms) in the renderer, for the hitch log (gfx_sw.c, gfx_wm_miyoo.c) */
+typedef struct {
+    double walk, band, wait, present, hand, pf, up;   /* display list, core 0's bands, waiting for core 1, showing, handing over (pf: filter built in advance, up: texture uploads) */
+    int pfn, upn, res;
+} SwFrameStats;
+void gfx_sw_frame_stats(SwFrameStats *out);
+extern double port_audio_total_ms;   /* all the time spent mixing the sound (src/main.c) */
+
 #endif

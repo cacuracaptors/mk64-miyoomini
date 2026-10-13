@@ -55,8 +55,54 @@ static uint8_t wm_start_frame(void) {
 static double perf_last, perf_work;
 static int perf_frames;
 
+/* Hitch log (always on): a frame that took over 50 ms (3 screen refreshes) is written to
+   log.txt with where its time went. The game and the sound run on this thread, so a
+   frame that long is felt as a stutter in both. "resto" is the game itself plus anything
+   not measured; "cpu" is the time this thread actually ran (much less than the frame:
+   it was waiting for something), "faltas" the pages the system had to fetch (from the
+   SD card: "do cartao") or set up for it. */
+#include <sys/resource.h>
+#include <time.h>
+extern int32_t gGamestate;
+extern int16_t gCurrentCourseId;
+static int sHitches, sHitchLines;
+static void hitch_check(double now) {
+    static double last, last_audio, last_cpu;
+    static long last_min, last_maj;
+    static unsigned frame;
+    struct rusage ru;
+    struct timespec ts;
+    getrusage(RUSAGE_SELF, &ru);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    const double cpu = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+    SwFrameStats fs;
+    gfx_sw_frame_stats(&fs);
+    frame++;
+    const double dt = now - last;
+    if (last > 0 && dt > 50.0) {
+        sHitches++;
+        if (sHitchLines < 300) {
+            sHitchLines++;
+            const double audio = port_audio_total_ms - last_audio;
+            const double known = fs.walk + fs.band + fs.wait + fs.present + fs.hand + audio;   /* (uploads are inside the list) */
+            fprintf(stderr, "engasgo: quadro %u de %.0f ms (estado %d pista %d res %d) | lista %.1f (texturas %d: %.1f) "
+                    "nucleo0 %.1f espera nucleo1 %.1f mostrar %.1f entrega %.1f (filtro feito %d: %.1f) som %.1f resto %.1f | "
+                    "cpu %.0f ms faltas %ld do cartao %ld\n",
+                    frame, dt, (int) gGamestate, (int) gCurrentCourseId, fs.res, fs.walk, fs.upn, fs.up,
+                    fs.band, fs.wait, fs.present, fs.hand, fs.pfn, fs.pf, audio, dt - known,
+                    cpu - last_cpu, ru.ru_minflt - last_min, ru.ru_majflt - last_maj);
+        }
+    }
+    last = now;
+    last_audio = port_audio_total_ms;
+    last_cpu = cpu;
+    last_min = ru.ru_minflt;
+    last_maj = ru.ru_majflt;
+}
+
 static void wm_swap_buffers_begin(void) {
     double t0 = port_now_ms();
+    hitch_check(t0);
     if (!gfx_sw_presents)   /* (-paralelo: shown from gfx_sw's end_frame) */
         port_video_present();
     if (port_opt_perf) {
@@ -68,8 +114,9 @@ static void wm_swap_buffers_begin(void) {
         else if (now - perf_last >= 2000.0) {
             gfx_sw_perf_report(perf_frames, now - perf_last);
             extern double port_audio_ms;
-            fprintf(stderr, "perf main: %.1f fps  wait-for-flip %.2f ms/frame  som %.2f ms/frame\n",
-                    perf_frames * 1000.0 / (now - perf_last), perf_work / perf_frames, port_audio_ms / perf_frames);
+            fprintf(stderr, "perf main: %.1f fps  wait-for-flip %.2f ms/frame  som %.2f ms/frame  engasgos %d\n",
+                    perf_frames * 1000.0 / (now - perf_last), perf_work / perf_frames, port_audio_ms / perf_frames, sHitches);
+            sHitches = 0;
             port_audio_ms = 0;
             perf_frames = 0;
             perf_work = 0;
