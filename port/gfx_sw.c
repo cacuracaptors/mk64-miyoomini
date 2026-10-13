@@ -3339,14 +3339,17 @@ static void resdin_pick(void) {
         sResHold--;
     if (sResDownHold > 0)
         sResDownHold--;
-    if (sResLevel < 3 && !sResDownHold && (sResEma > 16.4 || c > 20.0)) {
+    /* (at 30 fps -- the menus, and the quality mode -- a frame has twice the time) */
+    extern int force_30fps;
+    const double budget = force_30fps ? 32.8 : 16.4, spike = force_30fps ? 40.0 : 20.0, up_fit = force_30fps ? 30.0 : 15.0;
+    if (sResLevel < 3 && !sResDownHold && (sResEma > budget || c > spike)) {
         sResLevel++;
         sResDownHold = 4;
         sResHold = 30;
     } else if (sResLevel > 0 && !sResHold) {
         const double cur = (double) kResW[sResLevel] * kResH[sResLevel], up = (double) kResW[sResLevel - 1] * kResH[sResLevel - 1];
         const double fixed = 2.5;   /* the game and the display list: they do not shrink with the frame */
-        if ((sResEma - fixed) * (up / cur) + fixed < 15.0) {
+        if ((sResEma - fixed) * (up / cur) + fixed < up_fit) {
             sResLevel--;
             sResHold = 30;
         }

@@ -151,8 +151,9 @@ void port_chdir_to_exe(void) {
 }
 
 /* The two modes: performance (the shortcut's options: 60 fps, dynamic resolution, the
-   filter worked out in advance on the 3D surfaces) and quality (30 fps, 640x480, the N64's
-   own filter on every texture that asks for it). They can be swapped while the game runs. */
+   filter worked out in advance on the 3D surfaces) and quality (30 fps, the N64's own filter
+   on every texture that asks for it, and -- with -resdin -- smaller frames only while one
+   does not fit in 1/30 s: D.K.'s Jungle Parkway's palms took up to 41 ms at 640x480). They can be swapped while the game runs. */
 static int sPerf60, sPerfResdin, sPerfFilter, sPerfLite, sPerfSaved;
 void port_apply_mode(int quality) {
     if (!sPerfSaved) {
@@ -165,7 +166,7 @@ void port_apply_mode(int quality) {
     port_opt_quality = quality;
     if (quality) {
         port_opt_60fps = 0;
-        port_opt_resdin = 0;
+        port_opt_resdin = sPerfResdin;   /* (smaller only while a frame does not fit in 1/30 s) */
         port_opt_filter = 1;
         port_opt_filter_lite = 0;
         port_opt_filter_all = 1;
