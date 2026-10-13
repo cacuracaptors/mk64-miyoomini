@@ -55,21 +55,40 @@ static uint8_t wm_start_frame(void) {
 static double perf_last, perf_work;
 static int perf_frames;
 
-/* Hitch log (always on): a frame that took over 50 ms (3 screen refreshes) is written to
-   log.txt with where its time went. The game and the sound run on this thread, so a
-   frame that long is felt as a stutter in both. "resto" is the game itself plus anything
-   not measured; "cpu" is the time this thread actually ran (much less than the frame:
-   it was waiting for something), "faltas" the pages the system had to fetch (from the
-   SD card: "do cartao") or set up for it. */
+/* Hitch log (always on): a stretch of slow frames that lost more than 40 ms against
+   60 fps (one frame over 50 ms, or several of 2 screen refreshes in a row), with when it
+   happened (t, the same clock as the sound's gap lines) and where its time went. The
+   game and the sound run on this thread. "resto" is the game itself plus anything not
+   measured; "cpu" is the time this thread really ran (much less than the stretch: it was
+   kept waiting), "faltas" the pages the system had to set up for it (from the SD card:
+   "do cartao"). */
 #include <sys/resource.h>
 #include <time.h>
 extern int32_t gGamestate;
 extern int16_t gCurrentCourseId;
 static int sHitches, sHitchLines;
+typedef struct {
+    int n, pfn, upn, res;
+    double t0, total, max, walk, band, wait, present, hand, pf, up, audio, cpu;
+    long minf, majf;
+} HitchRun;
+static HitchRun sRun;
+static void hitch_print(const HitchRun *r) {
+    sHitches++;
+    if (sHitchLines >= 300)
+        return;
+    sHitchLines++;
+    const double known = r->walk + r->band + r->wait + r->present + r->hand + r->audio;   /* (uploads are inside the list) */
+    fprintf(stderr, "engasgo: t=%.0f ms, %d quadro(s) em %.0f ms (o maior %.0f, perdeu %.0f) estado %d pista %d res %d | "
+            "lista %.1f (texturas %d: %.1f) nucleo0 %.1f espera nucleo1 %.1f mostrar %.1f entrega %.1f (filtro feito %d: %.1f) "
+            "som %.1f resto %.1f | cpu %.0f ms faltas %ld do cartao %ld\n",
+            r->t0, r->n, r->total, r->max, r->total - r->n * 16.68, (int) gGamestate, (int) gCurrentCourseId, r->res,
+            r->walk, r->upn, r->up, r->band, r->wait, r->present, r->hand, r->pfn, r->pf, r->audio, r->total - known,
+            r->cpu, r->minf, r->majf);
+}
 static void hitch_check(double now) {
     static double last, last_audio, last_cpu;
     static long last_min, last_maj;
-    static unsigned frame;
     struct rusage ru;
     struct timespec ts;
     getrusage(RUSAGE_SELF, &ru);
@@ -77,20 +96,26 @@ static void hitch_check(double now) {
     const double cpu = ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
     SwFrameStats fs;
     gfx_sw_frame_stats(&fs);
-    frame++;
     const double dt = now - last;
-    if (last > 0 && dt > 50.0) {
-        sHitches++;
-        if (sHitchLines < 300) {
-            sHitchLines++;
-            const double audio = port_audio_total_ms - last_audio;
-            const double known = fs.walk + fs.band + fs.wait + fs.present + fs.hand + audio;   /* (uploads are inside the list) */
-            fprintf(stderr, "engasgo: quadro %u de %.0f ms (estado %d pista %d res %d) | lista %.1f (texturas %d: %.1f) "
-                    "nucleo0 %.1f espera nucleo1 %.1f mostrar %.1f entrega %.1f (filtro feito %d: %.1f) som %.1f resto %.1f | "
-                    "cpu %.0f ms faltas %ld do cartao %ld\n",
-                    frame, dt, (int) gGamestate, (int) gCurrentCourseId, fs.res, fs.walk, fs.upn, fs.up,
-                    fs.band, fs.wait, fs.present, fs.hand, fs.pfn, fs.pf, audio, dt - known,
-                    cpu - last_cpu, ru.ru_minflt - last_min, ru.ru_majflt - last_maj);
+    if (last > 0) {
+        if (dt > 20.0) {   /* a slow frame: part of the stretch */
+            HitchRun *r = &sRun;
+            if (!r->n)
+                r->t0 = last;
+            r->n++;
+            r->total += dt;
+            if (dt > r->max) r->max = dt;
+            r->walk += fs.walk; r->band += fs.band; r->wait += fs.wait; r->present += fs.present;
+            r->hand += fs.hand; r->pf += fs.pf; r->pfn += fs.pfn; r->up += fs.up; r->upn += fs.upn;
+            r->res = fs.res;
+            r->audio += port_audio_total_ms - last_audio;
+            r->cpu += cpu - last_cpu;
+            r->minf += ru.ru_minflt - last_min;
+            r->majf += ru.ru_majflt - last_maj;
+        } else if (sRun.n) {   /* the stretch is over */
+            if (sRun.total - sRun.n * 16.68 > 40.0)
+                hitch_print(&sRun);
+            memset(&sRun, 0, sizeof(sRun));
         }
     }
     last = now;

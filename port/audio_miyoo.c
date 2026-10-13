@@ -78,10 +78,15 @@ static void *open_lib(const char *name) {
     return NULL;
 }
 
+/* sound gaps for the log (the hitch log in gfx_wm_miyoo.c has the same clock) */
+static int sGapLogs;
+#define GAP_LOG(...) do { if (sGapLogs < 200) { sGapLogs++; fprintf(stderr, __VA_ARGS__); } } while (0)
+
 /* one output block from the ring (silence until the ring first reaches its target, and
    when it runs dry) */
 static void fill_block(frame_t *out) {
     static int primed;
+    int dry_inside = 0;
     pthread_mutex_lock(&ring_mutex);
     uint32_t r = ring_r;
     const uint32_t w = ring_w;
@@ -89,6 +94,8 @@ static void fill_block(frame_t *out) {
     if (!primed && fill >= TARGET_FILL)
         primed = 1;
     if (!primed || muted || fill < 2) {
+        if (fill < 2 && primed)
+            GAP_LOG("som: a reserva esvaziou em t=%.0f ms (o jogo deixou de mandar som a tempo)\n", port_now_ms());
         if (fill < 2)
             primed = 0;
         pthread_mutex_unlock(&ring_mutex);
@@ -102,6 +109,7 @@ static void fill_block(frame_t *out) {
     const uint32_t step = (uint32_t) ((double) SRC_RATE / OUT_RATE * (1.0 + adj) * 65536.0);
     for (int i = 0; i < OUT_FRAMES; i++) {
         if ((int32_t) (w - r) < 2) {   /* ran dry inside the block: hold the last frame */
+            dry_inside = 1;
             out[i] = i ? out[i - 1] : ring[r % RING_FRAMES];
             continue;
         }
@@ -115,12 +123,19 @@ static void fill_block(frame_t *out) {
     }
     ring_r = r;
     pthread_mutex_unlock(&ring_mutex);
+    if (dry_inside)
+        GAP_LOG("som: a reserva acabou no meio de um bloco em t=%.0f ms\n", port_now_ms());
 }
 
 static void *ao_loop(void *arg) {
     (void) arg;
-    int slot = 0, logs = 0;
+    int slot = 0, logs = 0, sent = 0;
+    double last_t = 0;
     while (running) {
+        const double t = port_now_ms();
+        if (last_t > 0 && t - last_t > 40.0)
+            GAP_LOG("som: a thread do som ficou %.0f ms sem rodar, ate t=%.0f ms\n", t - last_t, t);
+        last_t = t;
         frame_t *buf = ao_blocks[slot];
         slot = (slot + 1) % OUT_RING;
         fill_block(buf);
@@ -141,11 +156,14 @@ static void *ao_loop(void *arg) {
             if (ao.QueryChnStat(0, 0, &st) != MI_SUCCESS)
                 break;
             const MI_U32 total = st.u32ChnFreeNum + st.u32ChnBusyNum;
+            if (st.u32ChnBusyNum == 0 && sent > 20)
+                GAP_LOG("som: a saida de som ficou vazia em t=%.0f ms\n", port_now_ms());
             const MI_U32 target = total > 64 ? frame.u32Len * 3 : 3;   /* bytes or blocks */
             if (st.u32ChnBusyNum <= target)
                 break;
             usleep(2000);
         }
+        sent++;
         if (ao.SendFrame(0, 0, &frame, 20) != MI_SUCCESS && logs < 5) {
             fprintf(stderr, "som: o MI_AO recusou um bloco\n");
             logs++;
