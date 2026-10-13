@@ -78,7 +78,8 @@ GameFolder="$FullGamePath"
 export HOME="$FullGamePath"
 
 # -perf: tempos no log.txt a cada 2 s   -hires: renderiza em 640x480 (mais lento)
-# -filtro: filtro de textura no asfalto   -semparalelo: desliga o desenho em linha de montagem nos 2 nucleos
+# -filtroleve: filtro de textura feito de antemao (mais leve)   -filtro: o filtro do N64 calculado na hora
+# -semparalelo: desliga o desenho em linha de montagem nos 2 nucleos
 # -resdin: baixa a resolucao (ate 448x336) so quando o quadro nao cabe em 60 fps
 # -mudo: sem som
 Arguments="-perf"

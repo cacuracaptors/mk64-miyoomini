@@ -160,19 +160,15 @@ void port_init(int argc, char **argv) {
             opt_timer = 1;
         else if (!strcmp(argv[i], "-filtro"))
             port_opt_filter = 1;
-        else if (!strcmp(argv[i], "-filtroleve")) {
+        else if (!strcmp(argv[i], "-filtroleve") || !strcmp(argv[i], "-filtroleveniveis")) {
             port_opt_filter = 1;
             port_opt_filter_lite = 1;
+            port_opt_pf_level = 1;   /* (measured on D.K.'s Jungle Parkway and Yoshi Valley) */
         }
-        else if (!strcmp(argv[i], "-filtroleve2")) {   /* (comparison) */
+        else if (!strcmp(argv[i], "-filtroleve2")) {   /* (the 2x2 cells everywhere: a little cheaper, blockier up close) */
             port_opt_filter = 1;
             port_opt_filter_lite = 1;
             port_opt_pf_level = 2;
-        }
-        else if (!strcmp(argv[i], "-filtroleveniveis")) {   /* (comparison) */
-            port_opt_filter = 1;
-            port_opt_filter_lite = 1;
-            port_opt_pf_level = 1;
         }
         else if (!strcmp(argv[i], "-filtroteste")) {
             port_opt_filter_test = 1;

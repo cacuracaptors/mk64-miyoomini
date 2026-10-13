@@ -87,10 +87,12 @@ export HOME="$FullGamePath"
 #   -60fps    single-player races at up to 60 fps (without it: 30 fps, as on the N64)
 #   -resdin   dynamic resolution: 640x480 frames drop to as low as 448x336 only while
 #             a frame doesn't fit in 1/60 s
-#   -filtro   N64-style texture filter on the road and other close-up surfaces
+#   -filtroleve  texture filter on the road and other 3D surfaces, worked out in
+#             advance (looks like the N64's filter, costs about half as much)
+#   -filtro   the N64's texture filter itself, computed as it draws (slower)
 #   -mudo     no sound
 #   -perf     timing lines in log.txt every 2 s
-Arguments="-hires -60fps -resdin -filtro"
+Arguments="-hires -60fps -resdin -filtroleve"
 
 cd "$GameFolder"
 /mnt/SDCARD/Emu/PORTS/launch_standalone.sh "$GameName" "$GameDir" "$GameExecutable" "$Arguments" "$GameDataFile" "$KillAudioserver" "$PerformanceMode" > "$GameFolder/log.txt" 2>&1
