@@ -3429,6 +3429,22 @@ static void sw_end_frame(void) {
         pipe_handover();
         sFS.hand += port_now_ms() - th;
         sFS.res = sResLevel;
+        extern int force_30fps;
+        if (force_30fps && !sCapF) {
+            /* 30 fps (the menus, the quality mode): core 0 would only sleep until the next
+               beat while core 1 drew the frame alone (the split, seeing core 1 ahead, gave
+               it up to 90% of the lines: 31-33 ms a frame on D.K.'s Jungle Parkway, with
+               core 0 idle). Both cores draw it now, and it is shown as soon as it is done. */
+            sMainStage = 1;
+            pipe_finish(1);
+            const double tp = port_now_ms();
+            sMainStage = 4;
+            port_video_present();
+            stPresentMs += port_now_ms() - tp;
+            sFS.present += port_now_ms() - tp;
+            sResWait += port_now_ms() - tp;
+            sPipeState = 0;
+        }
         sMainStage = 0;
         sFramesDone++;
         stRasterMs += port_now_ms() - t0;
