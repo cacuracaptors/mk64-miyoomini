@@ -6003,16 +6003,6 @@ void render_menus(MenuItem* arg0) {
                 var_v1 = arg0->type - 0xA;
                 gDisplayListHead =
                     func_8009BC9C(gDisplayListHead, D_800E8254[var_v1], arg0->column, arg0->row, 2, arg0->param1);
-#ifdef TARGET_MIYOO
-                if (arg0->type == MAIN_MENU_DATA_GFX) {
-                    /* SELECT: performance or quality, between DATA and OK (the font has no colon) */
-                    extern int port_opt_quality;
-                    set_text_color(TEXT_BLUE);
-                    print_text1_center_mode_1(0xCC, 0xCF, "SELECT", 0, 0.65f, 0.65f);
-                    set_text_color(port_opt_quality ? TEXT_GREEN : TEXT_YELLOW);
-                    print_text1_center_mode_1(0xCC, 0xDB, port_opt_quality ? "QUALITY" : "PERFORMANCE", 0, 0.65f, 0.65f);
-                }
-#endif
                 break;
             case MAIN_MENU_50CC:              /* switch 6 */
             case MAIN_MENU_100CC:             /* switch 6 */

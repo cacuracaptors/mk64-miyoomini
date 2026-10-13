@@ -1470,8 +1470,8 @@ static inline __attribute__((always_inline)) void nv_lerp8(uint32_t *out, const 
 
 /* -filtro in the span: the opaque list, and the translucent list's modulated textures (the
    ice of Sherbet Land, see raster_tri); the other translucent spans do not get the code */
-/* (-qualidade: every list, see raster_tri) */
-#define FILT_SPAN(OUT, TEX) ((OUT) == KIND_OP || (OUT) == KIND_PT || (OUT) == KIND_TR)
+#define FILT_SPAN(OUT, TEX) ((OUT) == KIND_OP || ((OUT) == KIND_TR && \
+                             ((TEX) == GFX_TEXENV_MODULATE || (TEX) == GFX_TEXENV_MODULATEALPHA)))
 static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, int py, int xs, int xe, const float *a,
                                                                const float *ddx, const int OUT, const int TEX, const int COL) {
     const int W = port_render_w;
@@ -1908,7 +1908,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     c.ext = textured && tx->margin ? tx->ext : NULL;
     const uint32_t *tpf = textured ? tx->pf : NULL;
     int tpfwrap = textured ? tx->pfwrap : 0, tpfs = textured ? tx->pfs : PF_SHIFT;
-    if (port_opt_filter && !port_opt_exact && ((persp_geo && (kind == KIND_OP || tr_ground(st))) || port_opt_filter_all)) {
+    if (port_opt_filter && !port_opt_exact && persp_geo && (kind == KIND_OP || tr_ground(st))) {
         /* a mirrored texture: its doubled copy with the mirror in place, read as a plain
            repeat (the coordinates stay in the original texture's texels) */
         const int axes = (st->mirru && !st->clampu) | ((st->mirrv && !st->clampv) << 1);
@@ -1925,36 +1925,18 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     /* -filtro: 3D opaque surfaces in perspective (the track: karts, trees and items are
        sprites in the other lists, the HUD has no perspective) */
     const int wraps_ok = (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
-    if (port_opt_filter_all) {
-        /* -qualidade: the N64's filter wherever the game asks for it (track, karts, trees,
-           items, HUD, menus), magnified or up to 2 texels a pixel, computed exactly */
-        c.filt = textured && st->filter && wraps_ok;
-        c.flim = 131072;
-        /* where a texel covers under 4 pixels the filter worked out in advance (cells of a
-           pixel or less: the same to the eye), closer the exact one: the far palms of
-           D.K.'s Jungle Parkway took up to 20 ms a core exact */
-        c.pfmin = 16384;
-        c.pfc = 32768;
-        c.elim = 16384;   /* (4 pixels or more a texel: exact every 4 pixels, blended between -- the
-                             filter is a plane over each half texel, so the blend can only round a
-                             corner where a run crosses a texel's edge or diagonal) */
-        if (c.filt)
-            c.ext = NULL;   /* (filtered, the invisible texels at a row's ends blend into the visible ones) */
-    } else {
-        c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo && wraps_ok;
-        c.flim = 65536;
-        c.pfmin = 0;
-        c.pfc = port_opt_pf_level == 2 ? 0 : (port_opt_pf_level == 1 ? 16384 : 0x7FFFFFFF);
-    }
+    c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo && wraps_ok;
+    c.flim = 65536;
+    c.pfmin = 0;
+    c.pfc = port_opt_pf_level == 2 ? 0 : (port_opt_pf_level == 1 ? 16384 : 0x7FFFFFFF);
     c.pf = c.filt && !port_opt_exact && tpf && tpfwrap == (st->clampu | (st->clampv << 1)) ? tpf : NULL;
-    if (!port_opt_filter_all)
-        /* the exact filter every 4 pixels where a texel covers more than 8 pixels (-filtro);
-           -filtroleve leaves it to the filter worked out in advance, unless -filtroperto asks
-           for it right in front of the camera (port_opt_near_elim) */
-        c.elim = port_opt_filter_lite && c.pf ? port_opt_near_elim : 8192;
+    /* the exact filter every 4 pixels, blended between, where a texel covers more than 8
+       pixels (-filtro); -filtroleve: the filter worked out in advance, and the exact one
+       only right in front of the camera, over 16 pixels a texel (port_opt_near_elim) */
+    c.elim = port_opt_filter_lite && c.pf ? port_opt_near_elim : 8192;
     c.pfs = tpfs;
     c.pf1 = c.pf ? c.pf + ((size_t) c.tw << tpfs) * ((size_t) c.th << tpfs) : NULL;
-    if (port_opt_filter && !port_opt_filter_all && kind == KIND_OP && persp_geo && !c.filt) {
+    if (port_opt_filter && kind == KIND_OP && persp_geo && !c.filt) {
         /* (a 3D opaque texture the filter cannot take: noted once per kind, for the log) */
         static uint32_t seen[16];
         static int nseen;
@@ -2877,8 +2859,8 @@ static void prefilter_prepare(void) {
                     const int axes = (st->mirru && !st->clampu) | ((st->mirrv && !st->clampv) << 1);
                     if (!st->tex || !b->batch[i].count)
                         continue;
-                    if (port_opt_filter_all ? !st->filter : (k == 2 || (k == 1 && !tr_ground(st))))
-                        continue;   /* (-qualidade: every list, every texture that asks for the filter) */
+                    if (k == 2 || (k == 1 && !tr_ground(st)))
+                        continue;
                     struct SwTex *t = &sTex[st->tex];
                     if (!t->px || (axes ? t->mpx != NULL : t->pf != NULL) || t->pfnever || t->w > 64 || t->h > 64)
                         continue;
@@ -3359,7 +3341,7 @@ static void resdin_pick(void) {
         sResHold--;
     if (sResDownHold > 0)
         sResDownHold--;
-    /* (at 30 fps -- the menus, and the quality mode -- a frame has twice the time) */
+    /* (at 30 fps -- the menus, 2-4 player races -- a frame has twice the time) */
     extern int force_30fps;
     const double budget = force_30fps ? 28.0 : 16.4, spike = force_30fps ? 33.0 : 20.0, up_fit = force_30fps ? 24.0 : 15.0;   /* (at 30 fps a step up waits for more room: frames over 1/30 s are felt) */
     if (sResLevel < 3 && !sResDownHold && (sResEma > budget || c > spike)) {
@@ -3442,7 +3424,7 @@ static void sw_end_frame(void) {
         sFS.res = sResLevel;
         extern int force_30fps;
         if (force_30fps && !sCapF) {
-            /* 30 fps (the menus, the quality mode): core 0 would only sleep until the next
+            /* 30 fps (the menus, 2-4 player races): core 0 would only sleep until the next
                beat while core 1 drew the frame alone (the split, seeing core 1 ahead, gave
                it up to 90% of the lines: 31-33 ms a frame on D.K.'s Jungle Parkway, with
                core 0 idle). Both cores draw it now, and it is shown as soon as it is done. */
