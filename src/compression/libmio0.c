@@ -92,7 +92,24 @@ void mio0decode_noinval(const unsigned char *in, unsigned char *out)
 //	printf("%s(%08x,%08x)%s",__func__,in,out,"\n");
 //   gfx_texture_cache_invalidate(out);
    // extract header
+#ifdef TARGET_MIYOO
+   /* Miyoo: a source that is not MIO0 data is left alone. Right after a race the game
+      switches to the results screens and asks for kart sprites of a screen whose
+      animation indices it has not worked out yet: the lookup gives a null or stray
+      pointer. On the N64 that decode read harmless memory; here a null crashed the game
+      and a stray one wrote a garbage-sized "picture" over whatever followed the kart
+      buffer (the track vanishing for a moment). The kart keeps its previous sprite. */
+   if (in == NULL || !mio0_decode_header(in, &head)) {
+      static int warned;
+      if (warned < 5) {
+         warned++;
+         printf("kart: textura invalida ignorada (%p)\n", (const void *) in);
+      }
+      return;
+   }
+#else
    /* valid = */ mio0_decode_header(in, &head);
+#endif
    // verify MIO0 header
    /* if (!valid) {
       printf("invalid header aborting from libmio0?\n");
