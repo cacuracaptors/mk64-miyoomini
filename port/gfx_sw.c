@@ -2428,10 +2428,33 @@ static void tex_fake_filter(struct SwTex *t) {
     t->h = D;
 }
 
+static void convert_texels(uint32_t *d, const uint16_t *s, uint32_t n, uint32_t fmt);
+
 static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsigned int type) {
     struct SwTex *t = &sTex[sCurBound];
     if (width <= 0 || height <= 0)
         return;
+    /* the same texels again (the front-end re-uploads a texture when its tile settings
+       change, e.g. the road of Mario and Royal Raceway every frame): nothing to do, and the
+       filter worked out in advance stays (it used to be thrown away, and after 3 uploads
+       never made again, so those roads were never filtered) */
+    if (t->px && t->w == width && t->h == height) {
+        static uint32_t *scratch;
+        static uint32_t scratchN;
+        const uint32_t n = (uint32_t) width * (uint32_t) height;
+        if (scratchN < n) {
+            uint32_t *p = realloc(scratch, (size_t) n * 4);
+            if (p) {
+                scratch = p;
+                scratchN = n;
+            }
+        }
+        if (scratchN >= n) {
+            convert_texels(scratch, (const uint16_t *) buf16, n, type & (3u << 27));
+            if (!memcmp(scratch, t->px, (size_t) n * 4))
+                return;
+        }
+    }
     tex_detach(t);   /* (-paralelo: the frame being drawn keeps the old texels) */
     free(t->pf);     /* (the filter worked out in advance belongs to the old texels) */
     t->pf = NULL;
@@ -2440,8 +2463,12 @@ static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsig
     t->mpx = NULL;
     t->mpf = NULL;
     t->mbake = 0;
-    if (++t->ups > 3)
+    if (++t->ups > 3 && !t->pfnever) {
         t->pfnever = 1;
+        static int logged;
+        if (port_opt_filter && logged++ < 8)
+            printf("filtro: textura %dx%d muda a cada pouco, sem o filtro pronto\n", width, height);
+    }
     uint32_t n = (uint32_t) width * (uint32_t) height;
     if (!t->px || t->alloc < n) {
         uint32_t *p = realloc(t->px, n * 4);
@@ -2452,9 +2479,16 @@ static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsig
         t->px = p;
         t->alloc = n;
     }
-    const uint16_t *s = (const uint16_t *) buf16;
-    uint32_t *d = t->px;
-    uint32_t fmt = type & (3u << 27);
+    convert_texels(t->px, (const uint16_t *) buf16, n, type & (3u << 27));
+    t->w = (uint16_t) width;
+    t->h = (uint16_t) height;
+    tex_fake_filter(t);
+    tex_update_opaque(t);
+    stTexUp++;
+    mark_dirty();
+}
+
+static void convert_texels(uint32_t *d, const uint16_t *s, uint32_t n, uint32_t fmt) {
     if (fmt == PVR_TXRFMT_ARGB4444) {
         for (uint32_t i = 0; i < n; i++) {
             uint32_t c = s[i];
@@ -2475,12 +2509,6 @@ static void sw_upload_texture(const uint8_t *buf16, int width, int height, unsig
                    (b << 3 | b >> 2);
         }
     }
-    t->w = (uint16_t) width;
-    t->h = (uint16_t) height;
-    tex_fake_filter(t);
-    tex_update_opaque(t);
-    stTexUp++;
-    mark_dirty();
 }
 
 static void sw_set_sampler_parameters(int tile, uint8_t linear_filter, uint32_t cms, uint32_t cmt) {
