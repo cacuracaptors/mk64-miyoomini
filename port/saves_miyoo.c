@@ -122,6 +122,15 @@ s32 osEepromWrite(OSMesgQueue* mq, unsigned char address, unsigned char* buffer)
     return osEepromLongWrite(mq, address, buffer, 8);
 }
 
+/* after a save state is loaded (savestate_miyoo.c): the game's copy of the save data back
+   from the EEPROM file, so a state never rolls the records and the cups won back (nor
+   writes the old ones over them at the next save) */
+void port_saves_reapply(void) {
+    if (!eep_loaded)
+        return;
+    memcpy(&gSaveData, eep, sizeof(gSaveData) < EEP_SIZE ? sizeof(gSaveData) : EEP_SIZE);
+}
+
 /* ---------------- Controller Pak (um unico arquivo) ---------------- */
 
 int vmu_status(int channel) {

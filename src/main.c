@@ -330,10 +330,27 @@ static bool on_break(const ubc_breakpoint_t *bp,
 }
     #endif
 
+#ifdef TARGET_MIYOO
+/* The sound "ROM" at fixed addresses: the game's sound state (part of a save state, see
+   port/savestate_miyoo.c) points into it, and a state is loaded into another run of the game,
+   whose heap is elsewhere. Loaded the same at every start, so states leave it out
+   (.bss.nosave.rom, port/ld/savestate.ld). */
+#define AUDIO_ROM __attribute__((aligned(32), section(".bss.nosave.rom")))
+static u8 sAudioBanks[79936] AUDIO_ROM;
+static u8 sAudioTables[6 << 20] AUDIO_ROM;   /* (only what the file holds is ever touched) */
+static u8 sInstrumentSets[256] AUDIO_ROM;
+static u8 sSequences[143728] AUDIO_ROM;
+extern void port_state_disable(const char *why);
+#endif
+
 void setup_audio_data(void) {
     char texfn[256];
+#ifdef TARGET_MIYOO
+    u8 *AUDIOBANKS_BUF = sAudioBanks;
+#else
     u8 *AUDIOBANKS_BUF = memalign(32,79936);
     if (!AUDIOBANKS_BUF) printf("can't malloc banks\n");
+#endif
     /* Only the ALSeqFile header of audiotables is needed now (for gAlTbl and
        sample-address anchoring); the 2.4MB of VADPCM is dead -- the AICA driver
        plays from the transcoded adpcm_pool instead. */
@@ -343,10 +360,15 @@ void setup_audio_data(void) {
     u8 *AUDIOTABLES_BUF = memalign(32,4096);
     if (!AUDIOTABLES_BUF) printf("can't malloc tables\n");
 #endif
+#ifdef TARGET_MIYOO
+    u8 *INSTRUMENT_SETS_BUF = sInstrumentSets;
+    u8 *SEQUENCES_BUF = sSequences;
+#else
     u8 *INSTRUMENT_SETS_BUF = memalign(32,256);
     if (!INSTRUMENT_SETS_BUF) printf("can't malloc instruments\n");
     u8 *SEQUENCES_BUF = memalign(32,143728);
     if (!SEQUENCES_BUF) printf("can't malloc sequences\n");
+#endif
     vid_border_color(64, 64, 64);
     // load sound data
     {
@@ -403,8 +425,14 @@ void setup_audio_data(void) {
         rewind(file);
 
 #ifdef TARGET_MIYOO
-        AUDIOTABLES_BUF = memalign(32, (filesize + 31) & ~31);
-        if (!AUDIOTABLES_BUF) { printf("can't malloc tables\n"); exit(-1); }
+        if (filesize <= (long) sizeof(sAudioTables)) {
+            AUDIOTABLES_BUF = sAudioTables;
+        } else {   /* (never with the USA ROM: about 2.5 MB) */
+            AUDIOTABLES_BUF = memalign(32, (filesize + 31) & ~31);
+            if (!AUDIOTABLES_BUF) { printf("can't malloc tables\n"); exit(-1); }
+            port_state_disable("audiotables.bin maior que o espaco fixo");
+        }
+        printf("audio: audiotables %ld bytes\n", filesize);
 #else
         /* Only load the ALSeqFile header; the VADPCM sample data is unused. */
         if (filesize > 4096) filesize = 4096;
@@ -2572,7 +2600,14 @@ void update_gamestate(void) {
 
 void SPINNING_THREAD(UNUSED void *arg);
 
+#ifdef TARGET_MIYOO
+/* the screen's clock: not part of a save state (port/ld/savestate.ld). The 30 fps pacer
+   (port/gfx_wm_miyoo.c) waits for it to pass the tick it last saw; a state from earlier in
+   the game would have set it back and stalled the game until it caught up. */
+volatile uint64_t vblticker __attribute__((section(".bss.nosave")));
+#else
 /* static */ volatile uint64_t vblticker=0;
+#endif
 
 void vblfunc(uint32_t c, void *d) {
 	(void)c;

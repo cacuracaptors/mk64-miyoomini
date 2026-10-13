@@ -79,6 +79,17 @@ void gfx_mirrored_vertices(const void *start, uint32_t bytes) {
 	mirror_vtx_hi = start ? mirror_vtx_lo + bytes : NULL;
 	mirror_slots = 0;
 }
+// save states (port/savestate_miyoo.c): the block belongs to the game's state (it is set when
+// a course loads); the renderer's own memory is not in a state
+void gfx_mirror_state_get(uint32_t out[2]) {
+	out[0] = (uint32_t) (uintptr_t) mirror_vtx_lo;
+	out[1] = (uint32_t) (uintptr_t) mirror_vtx_hi;
+}
+void gfx_mirror_state_set(const uint32_t in[2]) {
+	mirror_vtx_lo = (const uint8_t *) (uintptr_t) in[0];
+	mirror_vtx_hi = (const uint8_t *) (uintptr_t) in[1];
+	mirror_slots = 0;
+}
 // -reflexoantigo: the texgen axes as before (see gfx_sp_vertex)
 extern int port_opt_old_lookat;
 #endif

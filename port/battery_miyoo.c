@@ -12,7 +12,8 @@
  * leaves /tmp/.lowBat, and runtime.sh then shows the low battery screen and turns the
  * device off once the game has ended. A port is not closed by keymon, so the game kept
  * running until the battery died. The game now does the same on its own: it leaves
- * /tmp/.lowBat and quits (the races' results are already saved as they happen).
+ * /tmp/.lowBat, saves its state and quits (port/savestate_miyoo.c), and at the next start
+ * OnionOS opens it again where it was, as RetroArch does.
  *
  * Levels and switches come from OnionOS's settings, as batmon and keymon read them:
  * /tmp/percBat (500 = charging), config/battery/warnAt, config/battery/exitAt,
@@ -60,7 +61,7 @@ static void *battery_proc(void *arg) {
             FILE *f = fopen("/tmp/.lowBat", "w");   /* runtime.sh: low battery screen, then off */
             if (f)
                 fclose(f);
-            printf("bateria: %d%% (sair em %d%%): fechando o jogo para o OnionOS desligar\n", perc, exit_at);
+            printf("bateria: %d%% (sair em %d%%): salvando e fechando o jogo para o OnionOS desligar\n", perc, exit_at);
             port_battery_exit = 1;
         }
         if (valid && port_battery_low && !logged) {

@@ -44,6 +44,7 @@ void port_video_shutdown(void);
 void port_video_membench(void);
 int port_video_set_vsync_clock(void (*fn)(void), void (*fallback)(void));   /* 1 = fn runs at every real vsync */
 uint16_t port_fb_pixel565(int x, int y);   /* last presented frame, N64 320x240 coords */
+int port_video_last_frame(const uint16_t **px, int *w, int *h);   /* the last frame shown (0: none yet) */
 
 /* port/input_miyoo.c */
 void port_input_init(void);
@@ -63,5 +64,18 @@ void port_battery_init(void);
 void port_battery_release(void);   /* (async-signal-safe) */
 void port_battery_draw(uint16_t *buf, int w, int h);
 extern volatile int port_battery_exit;
+
+/* savestate_miyoo.c: save states, OnionOS's Game Switcher, the save at power-off */
+enum { PORT_REQ_SAVE, PORT_REQ_LOAD };
+enum { PORT_MENU_SINGLE, PORT_MENU_LONG, PORT_MENU_DOUBLE };
+void port_state_init(const char *argv0);
+void port_state_boundary(void);       /* between two frames: loads, saves, the ways out */
+void port_state_request(int what);    /* PORT_REQ_*: done at the next boundary */
+void port_state_menu(int press);      /* PORT_MENU_*: what OnionOS's Tweaks set for it */
+int port_state_menu_double_used(void);   /* a double press does something (the single press waits for it) */
+int port_state_take_sigterm(void);    /* (signal handler) 1 = saved and closed at the next frame */
+void port_state_release(void);        /* (async-signal-safe) */
+void port_state_disable(const char *why);
+void port_osd_draw(uint16_t *buf, int w, int h);   /* the state messages, on the frame shown */
 
 #endif

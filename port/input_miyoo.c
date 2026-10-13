@@ -7,8 +7,13 @@
  *   Y       -> C-up (camera)                 X      -> C-right
  *   START   -> START                         SELECT -> L (and L1 outside races)
  *   D-pad   -> analog stick (steering ramps up while held) + D-pad bits
- *   MENU pressed and released alone -> quit (MENU with another key, like OnionOS's
- *   MENU+POWER screenshot, does not); SELECT+START held 1 s -> quit
+ *   MENU alone: a press, a long press (0.7 s) and a double press (within 0.3 s) do what
+ *   OnionOS's Tweaks set for games (by default: the Game Switcher, back to the menu, the
+ *   previous game), the state being saved first; MENU with another key (OnionOS's
+ *   MENU+POWER screenshot, MENU+volume brightness...) does none of them
+ *   MENU+R2 -> save state, MENU+L2 -> load state (as in OnionOS's RetroArch)
+ *   SELECT+START held 1 s -> quit
+ *   (port/savestate_miyoo.c does all of these between two frames)
  *   X held, then SELECT -> save a capture of the next frame (capture_NN.bin, for debugging)
  */
 #include <stdio.h>
@@ -45,10 +50,15 @@ static int ev_fd = -1;
 static unsigned char held[K_COUNT];
 static double quit_since;
 static int quit_flag;
-/* MENU quits on its release, if no other key (mapped or not: POWER, volume...) was down
-   while it was held: MENU+POWER is OnionOS's screenshot */
+/* MENU on its own, timed as OnionOS's keymon times it for RetroArch: a press shorter than
+   0.7 s is a single press (held longer: a long press, at 0.7 s); a second press within 0.3 s
+   of the first is a double press (the single press waits that long only when a double press
+   does something). No other key (mapped or not: POWER, volume...) may be down meanwhile. */
+#define MENU_LONG_MS 700.0
+#define MENU_DOUBLE_MS 300.0
 static unsigned char down_any[KEY_MAX / 8 + 1];   /* every key code down now */
-static int menu_down, menu_mixed;
+static int menu_down, menu_mixed, menu_long_done, menu_single_wait, menu_skip_release;
+static double menu_press_t;
 
 static int others_down(void) {
     for (int i = 0; i < (int) sizeof(down_any); i++) {
@@ -106,14 +116,33 @@ void port_input_poll(void) {
                 else down_any[code / 8] &= (unsigned char) ~(1u << (code % 8));
             }
             if (code == KEY_ESC && ev[i].value == 1) {          /* MENU pressed */
+                const double now = port_now_ms();
+                if (menu_single_wait && now - menu_press_t <= MENU_DOUBLE_MS) {
+                    menu_single_wait = 0;                       /* the second press: double */
+                    menu_skip_release = 1;
+                    port_state_menu(PORT_MENU_DOUBLE);
+                } else {
+                    menu_skip_release = 0;
+                }
                 menu_down = 1;
                 menu_mixed = others_down();
+                menu_long_done = 0;
+                menu_press_t = now;
             } else if (code == KEY_ESC && ev[i].value == 0) {   /* MENU released */
-                if (menu_down && !menu_mixed && !others_down())
-                    quit_flag = 1;
+                if (menu_down && !menu_mixed && !menu_long_done && !menu_skip_release && !others_down()) {
+                    if (port_state_menu_double_used())
+                        menu_single_wait = 1;                   /* single, unless a second press comes */
+                    else
+                        port_state_menu(PORT_MENU_SINGLE);
+                }
                 menu_down = 0;
+                menu_skip_release = 0;
             } else if (code != KEY_ESC && ev[i].value == 1 && menu_down) {
                 menu_mixed = 1;                                 /* another key with MENU */
+                if (code == KEY_BACKSPACE)                      /* MENU+R2 */
+                    port_state_request(PORT_REQ_SAVE);
+                else if (code == KEY_TAB)                       /* MENU+L2 */
+                    port_state_request(PORT_REQ_LOAD);
             }
             int k = key_index(code);
             if (k < 0)
@@ -124,8 +153,18 @@ void port_input_poll(void) {
             break;
     }
 
-    int combo = held[K_SELECT] && held[K_START];
     double now = port_now_ms();
+    if (menu_down && !menu_mixed && !menu_long_done && !menu_skip_release && now - menu_press_t >= MENU_LONG_MS) {
+        menu_long_done = 1;                                     /* held: long press */
+        if (!others_down())
+            port_state_menu(PORT_MENU_LONG);
+    }
+    if (menu_single_wait && now - menu_press_t > MENU_DOUBLE_MS) {
+        menu_single_wait = 0;
+        port_state_menu(PORT_MENU_SINGLE);
+    }
+
+    int combo = held[K_SELECT] && held[K_START];
     if (combo) {
         if (quit_since == 0)
             quit_since = now;
@@ -175,6 +214,11 @@ void update_controller(s32 index) {
         b |= N64_Z;
     }
     if (held[K_R1] || held[K_R2]) b |= N64_R;
+    /* MENU+L2 / MENU+R2 are the state keys: L2 and R2 do not reach the game while MENU is held */
+    if (menu_down) {
+        if (held[K_L2] && (gGamestate != RACING || !held[K_L1])) b &= ~N64_Z;
+        if (held[K_R2] && !held[K_R1]) b &= ~N64_R;
+    }
     if (held[K_Y]) b |= N64_CU;
     if (held[K_X]) b |= N64_CR;
     if (held[K_START]) b |= N64_START;

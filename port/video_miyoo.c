@@ -47,6 +47,7 @@ uint32_t *port_depth;
 static uint16_t *cbuf[3];
 static int cur_idx;          /* buffer being drawn */
 static int last_idx = -1;    /* last presented */
+static int last_w, last_h;   /* its size (-resdin) */
 
 static int fb_fd = -1;
 static struct fb_var_screeninfo fb_var;
@@ -552,6 +553,7 @@ void port_video_present(void) {
     if (!flip_started)
         return;
     port_battery_draw(cbuf[cur_idx], port_render_w, port_render_h);   /* (low battery: OnionOS's icon) */
+    port_osd_draw(cbuf[cur_idx], port_render_w, port_render_h);       /* ("State saved"...) */
     pthread_mutex_lock(&flip_mutex);
     while (!snap_free)
         pthread_cond_wait(&flip_cond, &flip_mutex);
@@ -564,6 +566,8 @@ void port_video_present(void) {
     pthread_mutex_unlock(&flip_mutex);
 
     last_idx = cur_idx;
+    last_w = port_render_w;
+    last_h = port_render_h;
     cur_idx = (cur_idx + 1) % 3;
     port_color = cbuf[cur_idx];
 }
@@ -612,6 +616,16 @@ void port_video_shutdown(void) {
         fb_var.yoffset = 0;
         ioctl(fb_fd, FBIOPAN_DISPLAY, &fb_var);
     }
+}
+
+/* the last frame shown, for the Game Switcher's picture (savestate_miyoo.c) */
+int port_video_last_frame(const uint16_t **px, int *w, int *h) {
+    if (last_idx < 0)
+        return 0;
+    *px = cbuf[last_idx];
+    *w = last_w;
+    *h = last_h;
+    return 1;
 }
 
 uint16_t port_fb_pixel565(int x, int y) {

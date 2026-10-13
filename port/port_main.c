@@ -54,6 +54,7 @@ double port_now_ms(void) {
 
 void port_quit(int code) {
     port_battery_release();
+    port_state_release();
     port_video_shutdown();
     fflush(stdout);
     fflush(stderr);
@@ -62,7 +63,12 @@ void port_quit(int code) {
 }
 
 static void on_signal(int sig) {
+    /* OnionOS's power-off: the game saves its state and closes at the next frame
+       (savestate_miyoo.c; the same as /tmp/.offOrder, which it also watches) */
+    if (sig == SIGTERM && port_state_take_sigterm())
+        return;
     port_battery_release();
+    port_state_release();
     port_video_shutdown();
     signal(sig, SIG_DFL);
     raise(sig);
@@ -98,6 +104,7 @@ static void crash_hex(int fd, const char *label, unsigned long v) {
 
 static void on_crash(int sig, siginfo_t *info, void *context) {
     port_battery_release();
+    port_state_release();
     int fd = open("crash_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd >= 0) {
         const char *name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGABRT ? "SIGABRT"
@@ -202,6 +209,7 @@ void port_init(int argc, char **argv) {
 
     port_video_init(hires);
     port_battery_init();
+    port_state_init(argc > 0 ? argv[0] : "mk64");
     if (port_opt_perf)
         port_video_membench();
     port_input_init();
@@ -214,7 +222,12 @@ void port_init(int argc, char **argv) {
     static const int crash_signals[] = { SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL };
     for (int i = 0; i < 5; i++)
         sigaction(crash_signals[i], &sa, NULL);
-    signal(SIGTERM, on_signal);
+    struct sigaction st;
+    memset(&st, 0, sizeof(st));
+    st.sa_handler = on_signal;
+    st.sa_flags = SA_RESTART;   /* (a save being written when it comes is not cut short) */
+    sigemptyset(&st.sa_mask);
+    sigaction(SIGTERM, &st, NULL);   /* (stays installed: it only raises a flag once the game runs) */
     signal(SIGINT, on_signal);
 }
 
@@ -273,13 +286,8 @@ static void start_timer_clock(void) {
     pthread_detach(th);
 }
 
+/* between two frames: the save states, the Game Switcher, power-off, low battery, quitting
+   (port/savestate_miyoo.c) */
 void port_poll_quit(void) {
-    if (port_battery_exit) {   /* (battery_miyoo.c: OnionOS shows its low battery screen and turns off) */
-        printf("mk64: saindo (bateria baixa)\n");
-        port_quit(0);
-    }
-    if (port_input_quit_requested()) {
-        printf("mk64: saindo\n");
-        port_quit(0);
-    }
+    port_state_boundary();
 }
