@@ -514,6 +514,7 @@ typedef struct {
     int pfs;
     const uint32_t *pf1;     /* the same with half as many cells per side (2^(pfs-1)), right after it */
     int32_t flim;            /* the exact filter up to this step per pixel (16.16 texels) */
+    int32_t elim;            /* below this step (magnified this much) the exact filter every 4 pixels, blended between */
     int32_t pfmin;           /* the filter worked out in advance only from this step on (closer: exact) */
     int32_t pfc;             /* ... and its coarser grid from this step on */
 } TriCtx;
@@ -1588,7 +1589,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 prun_end = px + plen;
             }
             uint32_t um, vm;
-            if (FILT_SPAN(OUT, TEX) && c->filt && !port_opt_exact && !(port_opt_filter_lite && c->pf) && dU > -8192 && dU < 8192 && dV > -8192 && dV < 8192) {
+            if (FILT_SPAN(OUT, TEX) && c->filt && !port_opt_exact && !(port_opt_filter_lite && c->pf) && dU > -c->elim && dU < c->elim && dV > -c->elim && dV < c->elim) {
                 /* 8 or more pixels per texel (the road right in front): the filter changes
                    slowly and linearly along the run, so it is computed exactly every 4 pixels
                    and the pixels between are blended from those (the filter worked out in
@@ -1932,12 +1933,16 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
            D.K.'s Jungle Parkway took up to 20 ms a core exact */
         c.pfmin = 16384;
         c.pfc = 32768;
+        c.elim = 16384;   /* (4 pixels or more a texel: exact every 4 pixels, blended between -- the
+                             filter is a plane over each half texel, so the blend can only round a
+                             corner where a run crosses a texel's edge or diagonal) */
         if (c.filt)
             c.ext = NULL;   /* (filtered, the invisible texels at a row's ends blend into the visible ones) */
     } else {
         c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo && wraps_ok;
         c.flim = 65536;
         c.pfmin = 0;
+        c.elim = 8192;
         c.pfc = port_opt_pf_level == 2 ? 0 : (port_opt_pf_level == 1 ? 16384 : 0x7FFFFFFF);
     }
     c.pf = c.filt && !port_opt_exact && tpf && tpfwrap == (st->clampu | (st->clampv << 1)) ? tpf : NULL;
@@ -3350,7 +3355,7 @@ static void resdin_pick(void) {
         sResDownHold--;
     /* (at 30 fps -- the menus, and the quality mode -- a frame has twice the time) */
     extern int force_30fps;
-    const double budget = force_30fps ? 32.8 : 16.4, spike = force_30fps ? 40.0 : 20.0, up_fit = force_30fps ? 28.0 : 15.0;   /* (at 30 fps a step up waits for more room: frames over 1/30 s are felt) */
+    const double budget = force_30fps ? 28.0 : 16.4, spike = force_30fps ? 33.0 : 20.0, up_fit = force_30fps ? 24.0 : 15.0;   /* (at 30 fps a step up waits for more room: frames over 1/30 s are felt) */
     if (sResLevel < 3 && !sResDownHold && (sResEma > budget || c > spike)) {
         sResLevel++;
         sResDownHold = 4;
