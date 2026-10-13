@@ -19,7 +19,8 @@ extern int port_opt_filter;  /* -filtro: 3-point filter on magnified 3D opaque s
 extern int port_opt_filter_test; /* -filtroteste: the filter modes take turns (measurement) */
 extern int port_opt_filter_lite;
 extern int port_opt_pf_level;
-extern int port_opt_filter_all; /* -qualidade: the N64's filter on every texture that asks for it */
+extern int port_opt_filter_all;
+extern int port_opt_near_elim;  /* -filtroperto: the exact filter right in front of the camera (step, 16.16) */ /* -qualidade: the N64's filter on every texture that asks for it */
 extern int port_opt_quality;    /* quality mode: 30 fps, 640x480, the N64's filter everywhere */
 void port_apply_mode(int quality);   /* port_main.c: swap between performance and quality */  /* -filtroleve: which grid of cells (see the span) */ /* -filtroleve: only the filter worked out in advance (cheaper) */
 extern int port_opt_nogfx;   /* -semgfx: frame copy by the CPU instead of the 2D engine */

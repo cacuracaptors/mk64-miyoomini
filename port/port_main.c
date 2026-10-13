@@ -39,7 +39,8 @@ int port_opt_filter_lite = 0;
 int port_opt_old_lookat = 0;  /* -reflexoantigo: the texgen (chrome) axes as the DC build had them */
 int port_opt_pf_level = 0;
 int port_opt_quality = 0;     /* -qualidade (see port_apply_mode) */
-int port_opt_filter_all = 0;  /* -qualidade: the N64's filter on everything that asks for it */    /* -filtroleve: 0 the 4x4 cells, 1 the 2x2 cells below 4 pixels per texel, 2 the 2x2 cells */   /* -filtroleve: the filter worked out in advance everywhere (cheaper) */
+int port_opt_filter_all = 0;
+int port_opt_near_elim = 0;   /* -filtroperto8 / -filtroperto16: -filtroleve with the exact filter where a texel covers over 8 / 16 pixels */  /* -qualidade: the N64's filter on everything that asks for it */    /* -filtroleve: 0 the 4x4 cells, 1 the 2x2 cells below 4 pixels per texel, 2 the 2x2 cells */   /* -filtroleve: the filter worked out in advance everywhere (cheaper) */
 int port_opt_parallel = 1;   /* -semparalelo turns it off */
 int port_opt_resdin = 0;     /* -resdin: smaller frames while the drawing does not keep up */
 int port_opt_mute = 0;       /* -mudo: no sound */
@@ -230,6 +231,12 @@ void port_init(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "-qualidade")) {   /* 30 fps, 640x480, the N64's filter everywhere */
             port_opt_quality = 1;
+        }
+        else if (!strcmp(argv[i], "-filtroperto8") || !strcmp(argv[i], "-filtroperto16")) {
+            port_opt_filter = 1;
+            port_opt_filter_lite = 1;
+            port_opt_pf_level = 1;
+            port_opt_near_elim = argv[i][12] == '8' ? 8192 : 4096;
         }
         else if (!strcmp(argv[i], "-reflexoantigo"))
             port_opt_old_lookat = 1;

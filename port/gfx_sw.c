@@ -391,13 +391,15 @@ void gfx_sw_perf_report(int frames, double ms) {
     if (port_opt_filter_test) {
         /* -filtroteste: the next stretch of the race is drawn with the next filter mode, so
            every mode is measured over the same parts of the course */
-        static const char *const names[4] = { "sem filtro", "leve 4x4", "leve niveis", "leve 2x2" };
+        static const char *const names[3] = { "leve niveis", "leve niveis + exato a 16 px", "leve niveis + exato a 8 px" };
+        static const int32_t near[3] = { 0, 4096, 8192 };
         static int mode;
         fprintf(stderr, "perf filtroteste: este trecho foi com %s\n", names[mode]);
-        mode = (mode + 1) % 4;
-        port_opt_filter = mode != 0;
-        port_opt_filter_lite = mode != 0;
-        port_opt_pf_level = mode ? mode - 1 : 0;
+        mode = (mode + 1) % 3;
+        port_opt_filter = 1;
+        port_opt_filter_lite = 1;
+        port_opt_pf_level = 1;
+        port_opt_near_elim = near[mode];
     }
     if (port_opt_resdin) {
         fprintf(stderr, "perf resdin: quadros em 640x480 %d  576x432 %d  512x384 %d  448x336 %d\n",
@@ -1589,7 +1591,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 prun_end = px + plen;
             }
             uint32_t um, vm;
-            if (FILT_SPAN(OUT, TEX) && c->filt && !port_opt_exact && !(port_opt_filter_lite && c->pf) && dU > -c->elim && dU < c->elim && dV > -c->elim && dV < c->elim) {
+            if (FILT_SPAN(OUT, TEX) && c->filt && !port_opt_exact && dU > -c->elim && dU < c->elim && dV > -c->elim && dV < c->elim) {
                 /* 8 or more pixels per texel (the road right in front): the filter changes
                    slowly and linearly along the run, so it is computed exactly every 4 pixels
                    and the pixels between are blended from those (the filter worked out in
@@ -1942,10 +1944,14 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo && wraps_ok;
         c.flim = 65536;
         c.pfmin = 0;
-        c.elim = 8192;
         c.pfc = port_opt_pf_level == 2 ? 0 : (port_opt_pf_level == 1 ? 16384 : 0x7FFFFFFF);
     }
     c.pf = c.filt && !port_opt_exact && tpf && tpfwrap == (st->clampu | (st->clampv << 1)) ? tpf : NULL;
+    if (!port_opt_filter_all)
+        /* the exact filter every 4 pixels where a texel covers more than 8 pixels (-filtro);
+           -filtroleve leaves it to the filter worked out in advance, unless -filtroperto asks
+           for it right in front of the camera (port_opt_near_elim) */
+        c.elim = port_opt_filter_lite && c.pf ? port_opt_near_elim : 8192;
     c.pfs = tpfs;
     c.pf1 = c.pf ? c.pf + ((size_t) c.tw << tpfs) * ((size_t) c.th << tpfs) : NULL;
     if (port_opt_filter && !port_opt_filter_all && kind == KIND_OP && persp_geo && !c.filt) {
