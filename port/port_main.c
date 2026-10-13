@@ -35,7 +35,8 @@ int port_opt_perf = 0;
 int port_opt_60fps = 0;
 int port_opt_filter = 0;
 int port_opt_filter_test = 0;   /* -filtroteste: the filter modes take turns, one per perf report */
-int port_opt_filter_lite = 0;   /* -filtroleve: the filter worked out in advance everywhere (cheaper) */
+int port_opt_filter_lite = 0;
+int port_opt_pf_level = 0;    /* -filtroleve: 0 the 4x4 cells, 1 the 2x2 cells below 4 pixels per texel, 2 the 2x2 cells */   /* -filtroleve: the filter worked out in advance everywhere (cheaper) */
 int port_opt_parallel = 1;   /* -semparalelo turns it off */
 int port_opt_resdin = 0;     /* -resdin: smaller frames while the drawing does not keep up */
 int port_opt_mute = 0;       /* -mudo: no sound */
@@ -162,6 +163,16 @@ void port_init(int argc, char **argv) {
         else if (!strcmp(argv[i], "-filtroleve")) {
             port_opt_filter = 1;
             port_opt_filter_lite = 1;
+        }
+        else if (!strcmp(argv[i], "-filtroleve2")) {   /* (comparison) */
+            port_opt_filter = 1;
+            port_opt_filter_lite = 1;
+            port_opt_pf_level = 2;
+        }
+        else if (!strcmp(argv[i], "-filtroleveniveis")) {   /* (comparison) */
+            port_opt_filter = 1;
+            port_opt_filter_lite = 1;
+            port_opt_pf_level = 1;
         }
         else if (!strcmp(argv[i], "-filtroteste")) {
             port_opt_filter_test = 1;

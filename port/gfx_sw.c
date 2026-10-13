@@ -383,12 +383,13 @@ void gfx_sw_perf_report(int frames, double ms) {
     if (port_opt_filter_test) {
         /* -filtroteste: the next stretch of the race is drawn with the next filter mode, so
            every mode is measured over the same parts of the course */
-        static const char *const names[3] = { "sem filtro", "filtro", "filtroleve" };
+        static const char *const names[4] = { "sem filtro", "leve 4x4", "leve niveis", "leve 2x2" };
         static int mode;
         fprintf(stderr, "perf filtroteste: este trecho foi com %s\n", names[mode]);
-        mode = (mode + 1) % 3;
+        mode = (mode + 1) % 4;
         port_opt_filter = mode != 0;
-        port_opt_filter_lite = mode == 2;
+        port_opt_filter_lite = mode != 0;
+        port_opt_pf_level = mode ? mode - 1 : 0;
     }
     if (port_opt_resdin) {
         fprintf(stderr, "perf resdin: quadros em 640x480 %d  576x432 %d  512x384 %d  448x336 %d\n",
@@ -503,6 +504,7 @@ typedef struct {
     const int16_t *ext;      /* the texture's visible extent per row (NULL: draw every texel) */
     const uint32_t *pf;      /* -filtro: the filter worked out in advance (2^pfs x 2^pfs cells per texel) */
     int pfs;
+    const uint32_t *pf1;     /* the same with half as many cells per side (2^(pfs-1)), right after it */
 } TriCtx;
 
 static uint8_t sExp5[32], sExp6[64];   /* 565 -> 8 bit, same rounding as before (v*255/max) */
@@ -1589,21 +1591,29 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
             } else if (FILT_SPAN(OUT, TEX) && c->filt && dU > -65536 && dU < 65536 && dV > -65536 && dV < 65536 && c->pf) {
                 /* the filter worked out in advance: one cell per pixel (positions relative to
                    the texel centres, as in nv_fetch3; repeat wraps on the cell grid as well) */
-                const int ps = c->pfs;
-                const int32_t QU = (int32_t) (((uint32_t) U - 33024u) << ps), QV = (int32_t) (((uint32_t) V - 33024u) << ps);
+                /* which of the two: the finer one only where a texel covers 4 pixels or more
+                   (-filtroleve: the coarser one is a quarter of the size, so more of it stays
+                   in the cache; see port_opt_pf_level) */
+                const int coarse = port_opt_pf_level == 2 ||
+                    (port_opt_pf_level == 1 && (dU <= -16384 || dU >= 16384 || dV <= -16384 || dV >= 16384));
+                const int ps = c->pfs - coarse;
+                const uint32_t *pfx = coarse ? c->pf1 : c->pf;
+                /* (cell i covers texture coordinates i / 2^ps up to (i + 1) / 2^ps, like the texels
+                   themselves: a clamped run only needs the slow loop where the plain one would) */
+                const int32_t QU = (int32_t) (((uint32_t) U - 256u) << ps), QV = (int32_t) (((uint32_t) V - 256u) << ps);
                 const int32_t dQU = (int32_t) ((uint32_t) dU << ps), dQV = (int32_t) ((uint32_t) dV << ps);
                 const int W2 = tw << ps, H2 = th << ps;
                 uint32_t pum, pvm;
                 if (axis_mask(QU, dQU, len, W2, c->uwrap, &pum) && axis_mask(QV, dQV, len, H2, c->vwrap, &pvm)) {
                     TexWalk w = { QU, QV, dQU, dQV, pum, pvm, W2 };
-                    fetch_texels(tex, c->pf, len, &w);
+                    fetch_texels(tex, pfx, len, &w);
                 } else {   /* clamped at an edge */
                     uint32_t qu = (uint32_t) QU, qv = (uint32_t) QV;
                     for (int i = 0; i < len; i++) {
                         int iu = (int32_t) qu >> 16, iv = (int32_t) qv >> 16;
                         iu = c->uwrap == WR_REPEAT2 ? iu & (W2 - 1) : (iu < 0 ? 0 : (iu >= W2 ? W2 - 1 : iu));
                         iv = c->vwrap == WR_REPEAT2 ? iv & (H2 - 1) : (iv < 0 ? 0 : (iv >= H2 ? H2 - 1 : iv));
-                        tex[i] = c->pf[iv * W2 + iu];
+                        tex[i] = pfx[iv * W2 + iu];
                         qu += (uint32_t) dQU;
                         qv += (uint32_t) dQV;
                     }
@@ -1904,6 +1914,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
              (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
     c.pf = c.filt && !port_opt_exact && tpf && tpfwrap == (st->clampu | (st->clampv << 1)) ? tpf : NULL;
     c.pfs = tpfs;
+    c.pf1 = c.pf ? c.pf + ((size_t) c.tw << tpfs) * ((size_t) c.th << tpfs) : NULL;
     if (port_opt_filter && kind == KIND_OP && persp_geo && !c.filt) {
         /* (a 3D opaque texture the filter cannot take: noted once per kind, for the log) */
         static uint32_t seen[16];
@@ -2670,26 +2681,32 @@ static int tr_cmp(const void *a, const void *b) {
    into a texture PF_SUB times larger; the spans then read it like an unfiltered texture
    (one texel per pixel instead of three plus the blend). The filter's position inside a
    texel is rounded to 1/PF_SUB of a texel: steps far below what the 16-bit screen shows. */
-/* -filtroleve: textures up to 32x32 get 8 x 8 cells per texel (the blocks of a strongly
-   magnified road come out 8 times smaller), the others 4 x 4 as for -filtro */
+/* (8 x 8 cells for small textures under -filtroleve made no difference to the eye and cost
+   more: the filter worked out in advance no longer fit the cache) */
 static int pf_shift(int w, int h) {
-    /* (-filtroteste switches between the modes as it goes: one size for all of them) */
-    return port_opt_filter_lite && !port_opt_filter_test && w <= 32 && h <= 32 ? 3 : PF_SHIFT;
+    (void) w; (void) h;
+    return PF_SHIFT;
 }
 
-static uint32_t *build_pf(const uint32_t *px, int tw, int th, int wrap, int shift) {
-    const int SUB = 1 << shift, W = tw << shift, H = th << shift;
+/* one grid of cells: cell x covers texture coordinates x / SUB up to (x + 1) / SUB, and holds
+   the 3-point filter at its centre (texel centres at i + 0.5, as on the N64) */
+static void fill_pf(uint32_t *pf, const uint32_t *px, int tw, int th, int wrap, int shift) {
+    const int SUB = 1 << shift, W = tw << shift, H = th << shift, D = 2 * SUB;
     const int cu = wrap & 1, cv = (wrap >> 1) & 1;
-    uint32_t *pf = malloc((size_t) W * H * 4);
-    if (!pf)
-        return NULL;
     for (int y = 0; y < H; y++) {
-        const int iv = y >> shift, ft = (2 * (y & (SUB - 1)) + 1) * 64 / SUB;
-        const int v0 = iv, v1 = cv ? (iv + 1 < th ? iv + 1 : th - 1) : (iv + 1) & (th - 1);
+        /* (the centre, measured from the texel centres, in 1/(2 SUB) of a texel) */
+        const int ny = 2 * y + 1 - SUB;
+        const int iv = ny >= 0 ? ny / D : -((-ny + D - 1) / D);
+        const int ft = (ny - iv * D) * 64 / SUB;
+        const int v0 = cv ? (iv < 0 ? 0 : iv) : iv & (th - 1);
+        const int v1 = cv ? (iv + 1 < th ? iv + 1 : th - 1) : (iv + 1) & (th - 1);
         const uint32_t *r0 = px + v0 * tw, *r1 = px + v1 * tw;
         for (int x = 0; x < W; x++) {
-            const int iu = x >> shift, fs = (2 * (x & (SUB - 1)) + 1) * 64 / SUB;
-            const int u0 = iu, u1 = cu ? (iu + 1 < tw ? iu + 1 : tw - 1) : (iu + 1) & (tw - 1);
+            const int nx = 2 * x + 1 - SUB;
+            const int iu = nx >= 0 ? nx / D : -((-nx + D - 1) / D);
+            const int fs = (nx - iu * D) * 64 / SUB;
+            const int u0 = cu ? (iu < 0 ? 0 : iu) : iu & (tw - 1);
+            const int u1 = cu ? (iu + 1 < tw ? iu + 1 : tw - 1) : (iu + 1) & (tw - 1);
             uint32_t a, b, c;
             int ws, wt;
             if (fs + ft <= 128) {
@@ -2708,6 +2725,17 @@ static uint32_t *build_pf(const uint32_t *px, int tw, int th, int wrap, int shif
             pf[y * W + x] = o;
         }
     }
+}
+
+/* the grid with 2^shift cells per texel side, followed by the one with half as many */
+static uint32_t *build_pf(const uint32_t *px, int tw, int th, int wrap, int shift) {
+    const size_t n0 = ((size_t) tw << shift) * ((size_t) th << shift);
+    const size_t n1 = ((size_t) tw << (shift - 1)) * ((size_t) th << (shift - 1));
+    uint32_t *pf = malloc((n0 + n1) * 4);
+    if (!pf)
+        return NULL;
+    fill_pf(pf, px, tw, th, wrap, shift);
+    fill_pf(pf + n0, px, tw, th, wrap, shift - 1);
     return pf;
 }
 
