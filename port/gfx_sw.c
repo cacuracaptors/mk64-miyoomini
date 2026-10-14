@@ -363,17 +363,18 @@ void gfx_sw_frame_stats(SwFrameStats *out) {
 static volatile int sMainStage, sWorkerStage;
 static volatile unsigned sFramesDone;
 
-static uint32_t stGeItems, stGeCpuTris, stGeWhy[6];
+static uint32_t stGeItems, stGeCpuTris, stGeWhy[7];
+#define GE_MIN_AREA 2048
 void gfx_sw_perf_report(int frames, double ms) {
     (void) ms;
     if (frames <= 0)
         return;
     if (stGeItems || stGeCpuTris)
         fprintf(stderr, "perf 2d: %.1f pecas/quadro pelo MI_GFX, %.1f triangulos 2D pelos nucleos (nao retangulo %.1f, "
-                        "cor/mistura %.1f, textura %.1f, debaixo de outro %.1f, atras da cena %.1f, sem memoria %.1f)\n",
+                        "cor/mistura %.1f, textura %.1f, debaixo de outro %.1f, atras da cena %.1f, sem memoria %.1f, pequeno %.1f)\n",
                 (double) stGeItems / frames, (double) stGeCpuTris / frames, (double) stGeWhy[0] / frames,
                 (double) stGeWhy[1] / frames, (double) stGeWhy[2] / frames, (double) stGeWhy[3] / frames,
-                (double) stGeWhy[4] / frames, (double) stGeWhy[5] / frames);
+                (double) stGeWhy[4] / frames, (double) stGeWhy[5] / frames, (double) stGeWhy[6] / frames);
     stGeItems = stGeCpuTris = 0;
     memset(stGeWhy, 0, sizeof stGeWhy);
     fprintf(stderr, "perf gfx: tris %u (op %u pt %u tr %u)  pixels %u  tex uploads %u  per frame | walk %.2f  raster %.2f (core0 %.2f core1 %.2f) ms/frame  %dx%d\n",
@@ -3213,6 +3214,26 @@ static void hud_ge_build(void) {
     if (i < sTrSortN)   /* (more pieces than HUD_MAX: all by the cores, in the game's order) */
         for (int k = 0; k < m; k++)
             sHudItems[k].ge = -1;
+    /* small pieces cost the engine more than the cores: each one is a call into its driver
+       (about 35 us of CPU on core 1) and a copy (measured with 300 letters a frame in the
+       menus: 11 ms of calls and 14 ms of copies, slower than the cores drawing them). A piece
+       under GE_MIN_AREA pixels (of the 640x480 screen) stays on the cores, unless it lies over
+       an engine piece (a letter on an engine box: the box keeps the engine, the letter goes
+       with it). */
+    for (int k = 0; k < m; k++) {
+        HudItem *it = &sHudItems[k];
+        if (it->ge < 0 || it->a.dw * it->a.dh >= GE_MIN_AREA)
+            continue;
+        int over = 0;
+        for (int j = k - 1; j >= 0 && !over; j--) {
+            const HudItem *g = &sHudItems[j];
+            over = g->ge >= 0 && g->x0 < it->x1 && it->x0 < g->x1 && g->y0 < it->y1 && it->y0 < g->y1;
+        }
+        if (!over) {
+            it->ge = -1;
+            stGeWhy[6]++;
+        }
+    }
     hud_order(m - 1);
     /* the texels copied for the engine only now, for the pieces it really draws */
     for (int k = 0; k < m; k++) {

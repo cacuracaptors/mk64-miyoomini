@@ -325,7 +325,6 @@ static int ge_place;         /* 0: the rectangle where it is asked for (turned i
 static int ge_sec = -1;      /* the part being filled (the colour buffer being drawn) */
 static double ge_copy_ms;    /* (-perf: the copies, game thread) */
 #define GE_HASH 2048
-static int ge_clip;          /* the engine cuts rectangles at the screen's edges (tested) */
 static struct {
     uint32_t stamp, off;
     GeArgs a;   /* (dx..dh not compared) */
@@ -432,42 +431,6 @@ static int ge_selftest(void) {
         snprintf(why, sizeof why, "mistura errada em %d pixels (ex. %06x, esperado %06x)", bad,
                  (unsigned) (d[(ge_place ? 4 : 3) * 8 + (ge_place ? 4 : 2)] & 0xFFFFFF), (unsigned) want);
         goto out;
-    }
-    /* 3: a rectangle past the game's top left corner (the menus' pictures sliding in): cut
-       right? A 2x2 picture A B / C D at the game's (-1,-1): only D shows, at the game's (0,0),
-       which is the page's (7,7) (the page is turned). Failing this only keeps such pieces on
-       the cores. */
-    for (int i = 0; i < 16; i++)
-        s[i] = 0xFF0000FFu;
-    s[5] = 0xFFFF0000u;    /* A */
-    s[6] = 0xFF00FF00u;    /* B */
-    s[9] = 0xFF00FFFFu;    /* C */
-    s[10] = 0xFFFFFF00u;   /* D */
-    memset(vd, 0, 4096);
-    mi.Flush(vs, 4096);
-    mi.Flush(vd, 4096);
-    {
-        MI_GFX_Rect_t sr3 = { 1, 1, 2, 2 }, dr3 = { -1, -1, 2, 2 };
-        if (!ge_place) {   /* (the place turned here, as in ge_draw: 8 - x - w) */
-            dr3.s32Xpos = 8 - (-1) - 2;
-            dr3.s32Ypos = 8 - (-1) - 2;
-        }
-        ge_clip = 0;
-        int n = snprintf(why, sizeof why, "a copia falhou");
-        if (ge_blit(ps, 4, 4, &sr3, pd, 8, 8, &dr3, E_MI_GFX_ROTATE_180, &fence) == 0) {
-            mi.Wait(TRUE, fence);
-            mi.Flush(vd, 4096);
-            int nz = 0;
-            for (int i = 0; i < 64; i++)
-                nz += (d[i] & 0xFFFFFFu) != 0;
-            ge_clip = nz == 1 && (d[7 * 8 + 7] & 0xFFFFFF) == 0xFFFF00;
-            n = snprintf(why, sizeof why, "resultado:");
-            for (int i = 0; i < 64 && n < (int) sizeof why - 16; i++)
-                if (d[i] & 0xFFFFFFu)
-                    n += snprintf(why + n, sizeof why - n, " (%d,%d)=%06x", i % 8, i / 8, (unsigned) (d[i] & 0xFFFFFF));
-        }
-        if (!ge_clip)
-            printf("video: MI_GFX nao corta nas bordas (%s): pecas fora da tela ficam nos nucleos\n", why);
     }
     ok = 1;
 out:
@@ -596,8 +559,10 @@ static inline uint32_t ge_lerp(uint32_t c0, uint32_t c1, int k, int n) {
     return r;
 }
 
+/* (pieces partly off the screen stay on the cores: with the engine cutting them at the
+   edges, patch 79, the whole system froze at the start of a race) */
 int port_ge_clip_ok(void) {
-    return ge_clip;
+    return 0;
 }
 
 static int ge_same(const GeArgs *x, const GeArgs *y) {
