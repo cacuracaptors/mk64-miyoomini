@@ -3761,6 +3761,20 @@ static void resdin_pick(void) {
     }
     if (!port_opt_resdin || !port_video_scales() || sCapF || port_render_w > 640)
         return;
+    /* only in the races: the menus, the title, the ceremony... always at full size (the Data
+       screen dropped to 512x384 for its many filtered 2D pieces) */
+    if (gGamestate != 4) {
+        if (sResLevel) {
+            sResLevel = 0;
+            port_render_w = kResW[0];
+            port_render_h = kResH[0];
+        }
+        sResLastT = 0;
+        sResEma = 0;
+        sResHold = sResDownHold = 0;
+        sResFrames[0]++;
+        return;
+    }
     const double now = port_now_ms();
     double c = 0;
     if (sResLastT > 0) {

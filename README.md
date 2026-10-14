@@ -83,7 +83,7 @@ You can edit its `Arguments` line:
 |---|---|
 | `-hires` | Renders at 640x480 (without it: 320x240, faster and blurrier) |
 | `-60fps` | Single-player races at up to 60 FPS (without it: 30 FPS, as on the N64) |
-| `-resdin` | Dynamic resolution (with `-hires`): smaller frames only while a frame doesn't fit in 1/60 s |
+| `-resdin` | Dynamic resolution (with `-hires`), in the races only: smaller frames only while a frame doesn't fit in 1/60 s |
 | `-filtroleve` | Texture filter on the road and other 3D surfaces, worked out in advance (looks like the N64's filter, costs about half as much) |
 | `-filtro` | The N64's texture filter itself, computed as it draws (slower) |
 | `-hudcpu` | The HUD and the menus' 2D drawn by the CPU cores only (without it, their large pictures are drawn by the chip's 2D engine at 640x480, smoothed) |
@@ -104,7 +104,7 @@ You can edit its `Arguments` line:
   the rest by the CPU with the texture filter (`-hudcpu` keeps it all on the CPU); menus without stutters or
   sound dropouts (Player Select), the game clock no longer loses screen refreshes; L Option / R Data banners
   centred on the Game Select screen; "Copy N64 Controller Pak" removed from the Option menu; texture filter on
-  the booster pads' moving arrows.
+  the booster pads' moving arrows; dynamic resolution only in the races (the menus always at full size).
 - **v1.1.0** - Save states and Game Switcher integration (Menu, Menu+R2/L2), save on power-off with automatic
   resume, low battery warning icon without flicker and automatic shutdown, faster texture filter (`-filtroleve`,
   the new default) with the exact filter near the camera, dynamic resolution tuning, fixed stutters, fixed
