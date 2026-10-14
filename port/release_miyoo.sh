@@ -90,6 +90,8 @@ export HOME="$FullGamePath"
 #   -filtroleve  texture filter on the road and other 3D surfaces, worked out in
 #             advance (looks like the N64's filter, costs about half as much)
 #   -filtro   the N64's texture filter itself, computed as it draws (slower)
+#   -hudcpu   the HUD and the menus drawn by the CPU cores as before (without it: by the
+#             chip's 2D engine, at 640x480 and smoothed, which frees the cores)
 #   -mudo     no sound
 #   -perf     timing lines in log.txt every 2 s
 Arguments="-hires -60fps -resdin -filtroleve"
