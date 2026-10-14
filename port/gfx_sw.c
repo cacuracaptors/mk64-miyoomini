@@ -391,8 +391,9 @@ void gfx_sw_perf_report(int frames, double ms) {
     if (port_opt_filter_test) {
         /* -filtroteste: the next stretch of the race is drawn with the next filter mode, so
            every mode is measured over the same parts of the course */
-        static const char *const names[3] = { "leve niveis", "leve niveis + exato a 16 px", "leve niveis + exato a 8 px" };
-        static const int32_t near[3] = { 0, 4096, 8192 };
+        static const char *const names[3] = { "leve niveis + exato a 16 px", "leve niveis + exato a 24 px",
+                                              "leve niveis + exato a 32 px" };
+        static const int32_t near[3] = { 4096, 2731, 2048 };
         static int mode;
         fprintf(stderr, "perf filtroteste: este trecho foi com %s\n", names[mode]);
         mode = (mode + 1) % 3;
