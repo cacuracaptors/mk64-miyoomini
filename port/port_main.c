@@ -176,7 +176,7 @@ void port_init(int argc, char **argv) {
             port_opt_filter = 1;
             port_opt_filter_lite = 1;
             port_opt_pf_level = 1;   /* (measured on D.K.'s Jungle Parkway and Yoshi Valley) */
-            port_opt_near_elim = 4096;   /* (the road right in front of the kart: about 1.3 ms a core at 640x480 there) */
+            port_opt_near_elim = 2048;   /* (the road right in front of the kart, over 32 pixels a texel: as good to the eye as over 16, and cheaper) */
         }
         else if (!strcmp(argv[i], "-filtroperto24") || !strcmp(argv[i], "-filtroperto32")) {
             /* (test) -filtroleve with the exact filter only where a texel covers over 24 / 32
