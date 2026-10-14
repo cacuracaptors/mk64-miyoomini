@@ -1806,9 +1806,9 @@ static inline int tr_ground(const RState *st) {
     return st->depth_write && (st->texenv == GFX_TEXENV_MODULATE || st->texenv == GFX_TEXENV_MODULATEALPHA);
 }
 
-/* outside the races (title, logo, menus, ceremony...): every texture the game asks to be
-   filtered (bilinear on the N64), 2D or 3D, in any list, gets the exact filter; the scenes are
-   light there. In a race only the 3D surfaces above (-filtro / -filtroleve). */
+/* outside the races (title, Nintendo logo, menus, ceremony...): every texture, 2D or 3D, in
+   any list, gets the exact filter; the scenes are light there. In a race (the HUD and the
+   pause menu included) only the 3D surfaces above (-filtro / -filtroleve). */
 static int sMenuFilter;
 
 /* draw one triangle with state st and list kind */
@@ -1932,8 +1932,10 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
        sprites in the other lists, the HUD has no perspective) */
     const int wraps_ok = (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
     c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo && wraps_ok;
-    if (sMenuFilter && textured && st->filter && wraps_ok)
-        c.filt = 1;
+    if (sMenuFilter && textured && c.uwrap != WR_MIRROR2 && c.uwrap != WR_MIRRORN && c.vwrap != WR_MIRROR2 &&
+        c.vwrap != WR_MIRRORN)
+        c.filt = 1;   /* (a repeat of any size is read as a clamp by the filter: the menus' pictures
+                         stay inside their texture; mirrored ones keep the plain sampling) */
     c.flim = 65536;
     c.pfmin = 0;
     c.pfc = port_opt_pf_level == 2 ? 0 : (port_opt_pf_level == 1 ? 16384 : 0x7FFFFFFF);
