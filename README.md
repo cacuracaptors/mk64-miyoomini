@@ -18,7 +18,8 @@ own ROM.
 - A software renderer made for the Miyoo Mini Plus:
   - perspective-correct textures and a proper depth buffer
   - rendering pipelined over both CPU cores
-  - the N64's 3-point texture filter on the road and other close-up surfaces
+  - a texture filter on the road and other 3D surfaces, worked out in advance (the N64's own 3-point filter right
+    in front of the camera), and dynamic resolution that keeps the heaviest tracks smooth
   - a smooth, filtered waterfall in D.K.'s Jungle Parkway
 - No overclock
 - Smooth controls: steering ramps up while held
@@ -26,7 +27,9 @@ own ROM.
 - Records, options and ghosts are saved
 - Easy installation: just copy your ROM (`.z64`, `.n64`, `.v64` or zipped) into the game's folder. The game data
   is built from it automatically on the first start, with a progress screen, and the ROM is removed afterwards
-- The Menu key quits the game on a single press, and the OnionOS Menu+Power screenshot combo is safe to use
+- OnionOS integration: save states, the Game Switcher (with a picture of where you left off), the Menu key
+  actions set in Tweaks, save on power-off with automatic resume, and the low battery warning and shutdown
+- The OnionOS Menu+Power screenshot combo is safe to use
 
 ## Installation
 
@@ -60,13 +63,20 @@ from it on its first start.
 | X | C-right |
 | Start | Pause / start |
 | Select | N64 L button (the "L: Option" menu) |
-| Menu | Quit the game (press and release) |
+| Menu | Save the state and open the Game Switcher (press and release) |
+| Menu (held) | Save the state and go back to the OnionOS menu |
+| Menu (double press) | Save the state and switch to the previous game |
+| Menu+R2 | Save state |
+| Menu+L2 | Load state |
 
-Select+Start held for one second also quits.
+The Menu key actions follow OnionOS's Tweaks (Shortcuts > In-game: Menu button), as for RetroArch.
+Resuming from the Game Switcher continues where you left off; opening the game from the game list starts from the
+beginning. Turning the device off during a game saves the state, and OnionOS reopens the game there at the next
+start. Select+Start held for one second also quits (saving the state for the Game Switcher).
 
 ## Options
 
-The shortcut (`Roms/PORTS/Shortcuts/Mario Kart 64.port`) starts the game with `-hires -60fps -resdin -filtro`.
+The shortcut (`Roms/PORTS/Shortcuts/Mario Kart 64.port`) starts the game with `-hires -60fps -resdin -filtroleve`.
 You can edit its `Arguments` line:
 
 | Option | Effect |
@@ -74,21 +84,24 @@ You can edit its `Arguments` line:
 | `-hires` | Renders at 640x480 (without it: 320x240, faster and blurrier) |
 | `-60fps` | Single-player races at up to 60 FPS (without it: 30 FPS, as on the N64) |
 | `-resdin` | Dynamic resolution (with `-hires`): smaller frames only while a frame doesn't fit in 1/60 s |
-| `-filtro` | N64-style texture filter on the road and other close-up surfaces |
+| `-filtroleve` | Texture filter on the road and other 3D surfaces, worked out in advance (looks like the N64's filter, costs about half as much) |
+| `-filtro` | The N64's texture filter itself, computed as it draws (slower) |
 | `-mudo` | No sound |
 | `-perf` | Timing lines in `log.txt` every 2 seconds |
 
 ## Known issues
 
 - Occasionally, the second screen showing your competitors after the race finishes briefly flashes with random rendering artifacts.
-- On the Award Ceremony screen, the floor disappears depending on the camera angle and position.
-- Some tracks are missing filtering on their ground textures.
-- The ice floor in "Sherbet Land" is showing some rendering issues with transparency and reflexes.
 - An OnionOS screenshot (Menu+Power) pauses the game for about a second while it is saved.
 - The game's log is in `log.txt`, in `Roms/PORTS/Games/MarioKart64/` - please attach it to your reports.
 
 ## Changelog
 
+- **v1.1.0** - Save states and Game Switcher integration (Menu, Menu+R2/L2), save on power-off with automatic
+  resume, low battery warning icon without flicker and automatic shutdown, faster texture filter (`-filtroleve`,
+  the new default) with the exact filter near the camera, dynamic resolution tuning, fixed stutters, fixed
+  reflections (Sherbet Land ice, mirror mode), fixed the Award Ceremony floor and the ground filtering on some
+  tracks, 1P-only Game Select screen.
 - **v1.0.0** - Initial release.
 
 ## Building from source
