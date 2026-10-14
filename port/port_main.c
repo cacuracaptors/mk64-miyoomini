@@ -44,6 +44,7 @@ int port_opt_resdin = 0;     /* -resdin: smaller frames while the drawing does n
 int port_opt_mute = 0;       /* -mudo: no sound */
 int port_opt_ceremony = 0;   /* -cerimonia: A on the title screen leads to the podium ceremony (testing) */
 int port_opt_exact = 0;      /* -exato: no drawing shortcuts that change the picture slightly */
+int port_opt_nohud = 0;      /* -semhud: (measurement) races without the HUD */
 static int opt_timer = 0;   /* -timer: old free-running 60 Hz clock, for comparison */
 
 double port_now_ms(void) {
@@ -209,6 +210,8 @@ void port_init(int argc, char **argv) {
             port_opt_resdin = 1;
         else if (!strcmp(argv[i], "-mudo"))
             port_opt_mute = 1;
+        else if (!strcmp(argv[i], "-semhud"))
+            port_opt_nohud = 1;
         else if (!strcmp(argv[i], "-cerimonia"))
             port_opt_ceremony = 1;
     }

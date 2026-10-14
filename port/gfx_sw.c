@@ -1840,6 +1840,10 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
         at[i][A_F] = (float) (o >> 24);
     }
 
+    /* -semhud (measurement): in a race, the 2D drawing (the HUD: flat at the 2D depths, 1.0 and
+       up, see screen_2d_z) is left out, to see what drawing it costs */
+    if (port_opt_nohud && gGamestate == 4 && at[0][A_Z] >= 1.0f && at[0][A_Z] == at[1][A_Z] && at[0][A_Z] == at[2][A_Z])
+        return;
     float area = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
     if (!(fabsf(area) > 1e-6f))
         return;

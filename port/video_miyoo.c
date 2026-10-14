@@ -253,6 +253,43 @@ out:
 }
 #endif
 
+/* (measurement, for drawing the HUD with the 2D engine) does its scaling blend the pixels
+   (bilinear) or repeat them? A black and a white pixel stretched to 16: the log says which */
+#ifdef HAVE_MI_GFX
+static void hw_scale_probe(void) {
+    MI_PHY ps = 0, pd = 0;
+    void *vs = NULL, *vd = NULL;
+    if (mi.MmaAlloc(NULL, 4096, &ps) || mi.MmaAlloc(NULL, 4096, &pd) || mi.Mmap(ps, 4096, &vs, TRUE) ||
+        mi.Mmap(pd, 4096, &vd, TRUE))
+        goto out;
+    uint16_t *src = vs;
+    src[0] = 0x0000;
+    src[1] = 0xFFFF;
+    memset(vd, 0, 4096);
+    mi.Flush(vs, 4096);
+    mi.Flush(vd, 4096);
+    if (hw_blit(ps, 2, 1, pd, 16, 1, E_MI_GFX_ROTATE_0, E_MI_GFX_MIRROR_NONE) == 0) {
+        mi.Flush(vd, 4096);
+        const uint32_t *d = vd;
+        int mid = 0;
+        char line[16 * 4 + 1];
+        for (int x = 0; x < 16; x++) {
+            const int g = (int) ((d[x] >> 8) & 255);
+            mid += g > 24 && g < 232;
+            snprintf(line + x * 4, 5, "%3d ", g);
+        }
+        printf("video: escala do MI_GFX %s: %s\n", mid ? "suave (mistura os pixels)" : "pixelada (repete os pixels)", line);
+    } else {
+        printf("video: escala do MI_GFX: o teste falhou\n");
+    }
+out:
+    if (vs) mi.Munmap(vs, 4096);
+    if (vd) mi.Munmap(vd, 4096);
+    if (ps) mi.MmaFree(ps);
+    if (pd) mi.MmaFree(pd);
+}
+#endif
+
 /* colour buffers in MMA memory when the 2D engine works; 0 = keep the malloc ones */
 static int hw_init(size_t bytes) {
 #ifdef HAVE_MI_GFX
@@ -287,6 +324,7 @@ static int hw_init(size_t bytes) {
         mi.GfxClose();
         return 0;
     }
+    hw_scale_probe();
     hw_size = (bytes + 4095) & ~(size_t) 4095;
     for (int i = 0; i < 3; i++) {
         void *v = NULL;

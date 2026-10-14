@@ -2642,7 +2642,16 @@ static void __attribute__((noinline)) gfx_tri_state_setup(void) {
 }
 
 static void __attribute__((noinline)) gfx_sp_tri1_impl(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx);
+#ifdef TARGET_MIYOO
+// the HUD for the software renderer (gfx_sw_set_hud): rectangles always, triangles under an
+// ortho projection
+static int hud_rect;
+void gfx_sw_set_hud(int on);
+#endif
 static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
+#ifdef TARGET_MIYOO
+    gfx_sw_set_hud(proj_is_ortho || hud_rect);
+#endif
 #if GFX_PROF
     uint64_t t0 = PROF_NOW();
     gfx_sp_tri1_impl(vtx1_idx, vtx2_idx, vtx3_idx);
@@ -3656,7 +3665,13 @@ static void  __attribute__((noinline)) gfx_draw_rectangle(int32_t ulx, int32_t u
 	rdp.viewport_or_scissor_changed = 1;
 	rsp.geometry_mode = 0;
 
+#ifdef TARGET_MIYOO
+	gfx_sw_set_hud(1);
 	gfx_sp_quad_2d(0, 1, 3, 1, 2, 3);
+	gfx_sw_set_hud(proj_is_ortho);
+#else
+	gfx_sp_quad_2d(0, 1, 3, 1, 2, 3);
+#endif
 
 	rsp.geometry_mode = geometry_mode_saved;
 	rdp.viewport = viewport_saved;

@@ -6893,11 +6893,20 @@ void func_800A1FB0(MenuItem* arg0) {
         case SUB_MENU_OPTION_COPY_CONTROLLER_PAK:
         case SUB_MENU_OPTION_ERASE_ALL_DATA:
             for (i = 0; i < ARRAY_COUNT(gTextOptionMenu); i++) {
+#ifdef TARGET_MIYOO
+                /* no Controller Pak to copy to here (the ghosts are a file): the option is gone
+                   and ERASE ALL DATA takes its line (menus.c skips it) */
+                const s32 row = i < 2 ? i : i - 1;
+                if (i == SUB_MENU_OPTION_COPY_CONTROLLER_PAK - SUB_MENU_OPTION_MIN)
+                    continue;
+#else
+                const s32 row = i;
+#endif
                 set_text_color_rainbow_if_selected(gSubMenuSelection - SUB_MENU_OPTION_MIN, i, 3);
-                print_text_mode_1(0x00000032, 0x55 + (0x23 * i), gTextOptionMenu[i], 0, 0.9f, 1.0f);
+                print_text_mode_1(0x00000032, 0x55 + (0x23 * row), gTextOptionMenu[i], 0, 0.9f, 1.0f);
                 if (i == (gSubMenuSelection - SUB_MENU_OPTION_MIN)) {
                     spE0.column = 0x0032;
-                    spE0.row = 0x55 + (0x23 * i);
+                    spE0.row = 0x55 + (0x23 * row);
                 }
             }
             set_text_color(TEXT_GREEN);

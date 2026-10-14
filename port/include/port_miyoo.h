@@ -24,6 +24,7 @@ extern int port_opt_nogfx;   /* -semgfx: frame copy by the CPU instead of the 2D
 extern int port_opt_parallel; /* on unless -semparalelo: core 1 draws a frame while the game prepares the next (shown 1 frame later) */
 extern int port_opt_mute;     /* -mudo: no sound */
 extern int port_opt_exact;    /* -exato: no shortcuts that change the picture slightly */
+extern int port_opt_nohud;    /* -semhud: (measurement) races without the HUD */
 extern int gfx_sw_presents;   /* port/gfx_sw.c: with -paralelo it shows the frames itself */
 extern volatile int port_flip_stage, port_main_pacing;   /* -perf watchdog (port/gfx_sw.c) */
 extern volatile unsigned port_flip_loops;

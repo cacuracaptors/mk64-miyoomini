@@ -274,6 +274,10 @@ void options_menu_act(struct Controller* controller, u16 controllerIdx) {
                 tempVar = 0;
                 if ((btnAndStick & D_JPAD) && (gSubMenuSelection < SUB_MENU_OPTION_MAX)) {
                     gSubMenuSelection += 1;
+#ifdef TARGET_MIYOO
+                    if (gSubMenuSelection == SUB_MENU_OPTION_COPY_CONTROLLER_PAK)   /* (gone: see menu_items.c) */
+                        gSubMenuSelection += 1;
+#endif
                     play_sound2(SOUND_MENU_CURSOR_MOVE);
                     if (sp38->paramf < 4.2) {
                         sp38->paramf += 4.0;
@@ -283,6 +287,10 @@ void options_menu_act(struct Controller* controller, u16 controllerIdx) {
                 }
                 if ((btnAndStick & U_JPAD) && (gSubMenuSelection > SUB_MENU_OPTION_MIN)) {
                     gSubMenuSelection -= 1;
+#ifdef TARGET_MIYOO
+                    if (gSubMenuSelection == SUB_MENU_OPTION_COPY_CONTROLLER_PAK)
+                        gSubMenuSelection -= 1;
+#endif
                     play_sound2(SOUND_MENU_CURSOR_MOVE);
                     if (sp38->paramf < 4.2) {
                         sp38->paramf += 4.0;
