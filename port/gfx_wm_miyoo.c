@@ -73,7 +73,7 @@ static double sWorkSum, sWorkMax;
 static int sWorkN, sWorkOver;
 typedef struct {
     int n, pfn, upn, res;
-    double t0, total, max, walk, band, wait, present, hand, pf, up, audio, cpu;
+    double t0, total, max, walk, band, wait, present, hand, pf, up, audio, cpu, dec;
     long minf, majf;
 } HitchRun;
 static HitchRun sRun;
@@ -82,16 +82,17 @@ static void hitch_print(const HitchRun *r) {
     if (sHitchLines >= 300)
         return;
     sHitchLines++;
-    const double known = r->walk + r->band + r->wait + r->present + r->hand + r->audio;   /* (uploads are inside the list) */
+    const double known = r->walk + r->band + r->wait + r->present + r->hand + r->audio + r->dec;   /* (uploads are inside the list) */
     fprintf(stderr, "engasgo: t=%.0f ms, %d quadro(s) em %.0f ms (o maior %.0f, perdeu %.0f) estado %d pista %d res %d | "
             "lista %.1f (texturas %d: %.1f) nucleo0 %.1f espera nucleo1 %.1f mostrar %.1f entrega %.1f (filtro feito %d: %.1f) "
-            "som %.1f resto %.1f | cpu %.0f ms faltas %ld do cartao %ld\n",
+            "som %.1f descompactar %.1f resto %.1f | cpu %.0f ms faltas %ld do cartao %ld\n",
             r->t0, r->n, r->total, r->max, r->total - r->n * (force_30fps ? 33.37 : 16.68), (int) gGamestate, (int) gCurrentCourseId, r->res,
-            r->walk, r->upn, r->up, r->band, r->wait, r->present, r->hand, r->pfn, r->pf, r->audio, r->total - known,
+            r->walk, r->upn, r->up, r->band, r->wait, r->present, r->hand, r->pfn, r->pf, r->audio, r->dec, r->total - known,
             r->cpu, r->minf, r->majf);
 }
 static void hitch_check(double now) {
-    static double last, last_audio, last_cpu, last_pacing;
+    static double last, last_audio, last_cpu, last_pacing, last_dec;
+    extern double port_decode_ms;
     static long last_min, last_maj;
     struct rusage ru;
     struct timespec ts;
@@ -123,6 +124,7 @@ static void hitch_check(double now) {
             r->hand += fs.hand; r->pf += fs.pf; r->pfn += fs.pfn; r->up += fs.up; r->upn += fs.upn;
             r->res = fs.res;
             r->audio += port_audio_total_ms - last_audio;
+            r->dec += port_decode_ms - last_dec;
             r->cpu += cpu - last_cpu;
             r->minf += ru.ru_minflt - last_min;
             r->majf += ru.ru_majflt - last_maj;
@@ -134,6 +136,7 @@ static void hitch_check(double now) {
     }
     last = now;
     last_audio = port_audio_total_ms;
+    last_dec = port_decode_ms;
     last_cpu = cpu;
     last_min = ru.ru_minflt;
     last_maj = ru.ru_majflt;

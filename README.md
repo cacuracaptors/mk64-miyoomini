@@ -104,7 +104,10 @@ You can edit its `Arguments` line:
   the rest by the CPU with the texture filter (`-hudcpu` keeps it all on the CPU); menus without stutters or
   sound dropouts (Player Select), the game clock no longer loses screen refreshes; L Option / R Data banners
   centred on the Game Select screen; "Copy N64 Controller Pak" removed from the Option menu; texture filter on
-  the booster pads' moving arrows; dynamic resolution only in the races (the menus always at full size).
+  the booster pads' moving arrows; dynamic resolution only in the races (the menus always at full size), the
+  menus' large pictures drawn by the 2D engine under the letters too; no more sound cuts when the menu screen
+  changes (the menus' pictures are decompressed once); faster scenes with many layers (D.K.'s Jungle Parkway
+  bridge): the solid surfaces are drawn nearest first and what is hidden behind them is skipped.
 - **v1.1.0** - Save states and Game Switcher integration (Menu, Menu+R2/L2), save on power-off with automatic
   resume, low battery warning icon without flicker and automatic shutdown, faster texture filter (`-filtroleve`,
   the new default) with the exact filter near the camera, dynamic resolution tuning, fixed stutters, fixed

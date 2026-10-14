@@ -25,7 +25,8 @@ extern int port_opt_parallel; /* on unless -semparalelo: core 1 draws a frame wh
 extern int port_opt_mute;     /* -mudo: no sound */
 extern int port_opt_exact;    /* -exato: no shortcuts that change the picture slightly */
 extern int port_opt_nohud;    /* -semhud: (measurement) races without the HUD */
-extern int port_opt_hudcpu;   /* -hudcpu: the 2D drawn by the cores, not by the 2D engine */
+extern int port_opt_hudcpu;
+void port_audio_set_extra(int frames);   /* audio_miyoo.c: game frames of sound kept in reserve beyond the usual 3 */   /* -hudcpu: the 2D drawn by the cores, not by the 2D engine */
 extern int gfx_sw_presents;   /* port/gfx_sw.c: with -paralelo it shows the frames itself */
 extern volatile int port_flip_stage, port_main_pacing;   /* -perf watchdog (port/gfx_sw.c) */
 extern volatile unsigned port_flip_loops;
@@ -54,11 +55,14 @@ typedef struct {
     uint32_t gen;          /* which upload of the texels (the same gen, the same texels) */
     uint32_t c0, c1;       /* vertex colour (ARGB) */
     uint32_t o0, o1;       /* offset colour (RGB), added after the texture */
+    int layer;             /* 0 over the finished picture, 1 under the cores' 2D (menus) */
 } GeArgs;
 int port_ge_hud_ok(void);
 int port_ge_clip_ok(void);   /* the engine can cut a rectangle at the screen's edges */
 void port_ge_overlay_begin(void);
 int port_ge_overlay_add(const GeArgs *a);   /* index, or -1: no room */
+int port_ge_under_ok(void);   /* the engine can draw into the cores' colour buffer (tested) */
+void port_ge_underlay_run(uint16_t *color, int w, int h);
 void port_ge_overlay_cancel(int idx);
 extern int port_opt_resdin;          /* -resdin: dynamic resolution */
 

@@ -44,6 +44,12 @@ static frame_t ring[RING_FRAMES];
 static volatile uint32_t ring_w, ring_r;   /* frame counters (index = counter % RING_FRAMES) */
 static pthread_mutex_t ring_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile int muted;
+/* the ring's target: TARGET_FILL, and a few game frames more in the menus (see
+   port_audio_pump in src/main.c) */
+static volatile int32_t target_fill = TARGET_FILL;
+void port_audio_set_extra(int frames) {
+    target_fill = TARGET_FILL + frames * (SRC_RATE / 60);
+}
 static int started, running;
 
 #ifdef HAVE_MI_AO
@@ -91,7 +97,8 @@ static void fill_block(frame_t *out) {
     uint32_t r = ring_r;
     const uint32_t w = ring_w;
     int32_t fill = (int32_t) (w - r);
-    if (!primed && fill >= TARGET_FILL)
+    const int32_t target = target_fill;
+    if (!primed && fill >= target)
         primed = 1;
     if (!primed || muted || fill < 2) {
         if (fill < 2 && primed)
@@ -108,7 +115,7 @@ static void fill_block(frame_t *out) {
        run dry every fraction of a second (clicks). The slow term learns the real rate
        (up to 3%, about a second to settle); the quick one keeps the ring near its target. */
     static double learned;
-    double err = (double) (fill - TARGET_FILL) / TARGET_FILL;
+    double err = (double) (fill - target) / target;
     if (err > 1.0) err = 1.0;
     if (err < -1.0) err = -1.0;
     learned += err * 0.0002;
@@ -272,7 +279,7 @@ static int am_buffered(void) {
 }
 
 static int am_get_desired_buffered(void) {
-    return TARGET_FILL;
+    return target_fill;
 }
 
 /* 16-bit stereo frames from the game; when the ring is full the oldest are dropped */

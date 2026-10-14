@@ -38,6 +38,17 @@
 #include "racing/race_logic.h"
 #include "ending/code_80281C40.h"
 #include "spawn_players.h"
+
+#ifdef TARGET_MIYOO
+/* the menus' pictures from the game's data: decompressed once (port/menucache_miyoo.c) */
+void port_mio0decode_cached(const void *in, void *out);
+void port_tkmk00decode_cached(void *in, void *tmp, void *out, uint32_t alpha);
+#define MENU_MIO0(in, out) port_mio0decode_cached((in), (out))
+#define MENU_TKMK00(in, tmp, out, a) port_tkmk00decode_cached((in), (tmp), (out), (a))
+#else
+#define MENU_MIO0(in, out) mio0decode((in), (out))
+#define MENU_TKMK00(in, tmp, out, a) tkmk00decode((in), (tmp), (out), (a))
+#endif
 #include "render_player.h"
 #include "decode.h"
 //! @todo Move gGfxPool out of main.h
@@ -3449,7 +3460,7 @@ void load_menu_img(MenuTexture* addr) {
                 }
 
                 size = ((size+ 7)) & ~7;
-                mio0decode((u8*) segmented_to_virtual(texAddr->textureData),
+                MENU_MIO0((u8*) segmented_to_virtual(texAddr->textureData),
                             (u8*) &gMenuTextureBuffer[sMenuTextureBufferIndex]);
             } else {
                 n64_memcpy(&gMenuTextureBuffer[sMenuTextureBufferIndex],
@@ -3515,7 +3526,7 @@ void func_8009952C(MenuTexture* addr) {
         }
 
         if (imgLoaded == 0) {
-            mio0decode((u8*) texAddr->textureData, (u8*) &gMenuTextureBuffer[sMenuTextureBufferIndex]);
+            MENU_MIO0((u8*) texAddr->textureData, (u8*) &gMenuTextureBuffer[sMenuTextureBufferIndex]);
             texMap[sMenuTextureEntries].textureData = texAddr->textureData;
             texMap[sMenuTextureEntries].offset = sMenuTextureBufferIndex;
             sMenuTextureBufferIndex += texAddr->height * texAddr->width;
@@ -3558,7 +3569,7 @@ void load_menu_img_comp_type(MenuTexture* addr, s32 compType) {
             switch (compType) {
                 case LOAD_MENU_IMG_MIO0_ONCE:
                 case LOAD_MENU_IMG_MIO0_FORCE:
-                    mio0decode((u8*) texAddr->textureData, (u8*) &gMenuTextureBuffer[sMenuTextureBufferIndex]);
+                    MENU_MIO0((u8*) texAddr->textureData, (u8*) &gMenuTextureBuffer[sMenuTextureBufferIndex]);
                     break;
                 case LOAD_MENU_IMG_TKMK00_ONCE:
                 case LOAD_MENU_IMG_TKMK00_FORCE:
@@ -3567,7 +3578,7 @@ void load_menu_img_comp_type(MenuTexture* addr, s32 compType) {
                     } else {
                         clearBit = 1;
                     }
-                    tkmk00decode(texAddr->textureData, sTKMK00_LowResBuffer,
+                    MENU_TKMK00(texAddr->textureData, sTKMK00_LowResBuffer,
                                  &gMenuTextureBuffer[sMenuTextureBufferIndex], clearBit);
                     break;
             }
@@ -3596,7 +3607,7 @@ void func_80099958(MenuTexture* addr, s32 arg1, s32 arg2) {
         }
         size = ((size+ 7)) & ~7;
 
-        mio0decode((u8*) texAddr->textureData,
+        MENU_MIO0((u8*) texAddr->textureData,
                    (u8*) D_802BFB80.arraySize4[arg2][arg1 / 2][(arg1 % 2) + 2].pixel_index_array);
 
         texAddr++;
@@ -3810,7 +3821,7 @@ void func_8009A238(MenuTexture* arg0, s32 arg1) {
     var_a3 = arg0->size;
     var_a3 = ((var_a3+ 7)) & ~7;
     
-    tkmk00decode(sp24, sTKMK00_LowResBuffer, &gMenuTextureBuffer[temp_v1], 1);
+    MENU_TKMK00(sp24, sTKMK00_LowResBuffer, &gMenuTextureBuffer[temp_v1], 1);
     sMenuTextureMap[arg1].textureData = sp24;
     gfx_texture_cache_invalidate(&gMenuTextureBuffer[temp_v1]);
 }

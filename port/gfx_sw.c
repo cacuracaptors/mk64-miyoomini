@@ -27,6 +27,8 @@
 #include <kos.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <pthread.h>
+#include <time.h>
 
 #include "gfx/gfx_cc.h"
 #include "gfx/gfx_rendering_api.h"
@@ -363,6 +365,8 @@ void gfx_sw_frame_stats(SwFrameStats *out) {
 static volatile int sMainStage, sWorkerStage;
 static volatile unsigned sFramesDone;
 
+static uint32_t stEarlyZ[2];   /* -perf: pixels whose texels the early depth test spared (per core) */
+static int sSolidSorted;       /* the last frame's opaque and punch-through lists were drawn nearest first */
 static uint32_t stGeItems, stGeCpuTris, stGeWhy[8];
 #define GE_MIN_AREA 2048
 #define GE_BUDGET_US 5000
@@ -377,6 +381,9 @@ void gfx_sw_perf_report(int frames, double ms) {
                 (double) stGeWhy[1] / frames, (double) stGeWhy[2] / frames, (double) stGeWhy[3] / frames,
                 (double) stGeWhy[4] / frames, (double) stGeWhy[5] / frames, (double) stGeWhy[6] / frames, (double) stGeWhy[7] / frames);
     stGeItems = stGeCpuTris = 0;
+    fprintf(stderr, "perf profundidade: %u pixels/quadro sem ler a textura (escondidos antes)%s\n",
+            (stEarlyZ[0] + stEarlyZ[1]) / frames, sSolidSorted ? "" : " | sem ordem do mais perto");
+    stEarlyZ[0] = stEarlyZ[1] = 0;
     memset(stGeWhy, 0, sizeof stGeWhy);
     fprintf(stderr, "perf gfx: tris %u (op %u pt %u tr %u)  pixels %u  tex uploads %u  per frame | walk %.2f  raster %.2f (core0 %.2f core1 %.2f) ms/frame  %dx%d\n",
             stTris / frames, stOpTris / frames, stPtTris / frames, stTrTris / frames, stPixels / frames,
@@ -587,6 +594,9 @@ static inline float tc_fold(float u, int n, int mode) {
     }
     return u - fq * period;
 }
+
+/* rows handled by this call: all, or (for the two-core split) bands of 8 rows (see below) */
+static __thread int sBandMask, sBandVal;
 
 /* ---- the pixel pipeline, shared by all span loops (inlined, constants fold away) ---- */
 
@@ -1605,6 +1615,38 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 uz = uz1; vz = vz1;
                 prun_end = px + plen;
             }
+            /* early depth: a run wholly behind what is already drawn (its nearest pixel
+               farther than the farthest one there) needs no texels at all. Drawn front to
+               back (sort_solid), most of what lies under the near surfaces is skipped here
+               (the bridge of D.K.'s Jungle Parkway: the river and the canyon under the
+               planks). The group itself already left hidden pixels alone; the texels were
+               fetched for them anyway. */
+            if (c->dtest && !c->zoff) {
+                uint32_t z4[4];
+                vst1q_u32(z4, zi);
+                const int64_t zl = (int64_t) z4[0] + (int64_t) s->dzi * (len - 1);
+                if (zl >= 0 && zl <= 0xFFFFFFFFLL) {
+                    const uint32_t zmx = z4[0] > (uint32_t) zl ? z4[0] : (uint32_t) zl;
+                    uint32_t zmn = 0xFFFFFFFFu;
+                    if (len == 16) {
+                        uint32_t m4[4];
+                        vst1q_u32(m4, vminq_u32(vminq_u32(vld1q_u32(zp), vld1q_u32(zp + 4)),
+                                                vminq_u32(vld1q_u32(zp + 8), vld1q_u32(zp + 12))));
+                        zmn = m4[0] < m4[1] ? m4[0] : m4[1];
+                        zmn = m4[2] < zmn ? m4[2] : zmn;
+                        zmn = m4[3] < zmn ? m4[3] : zmn;
+                    } else {
+                        for (int k = 0; k < len; k++)
+                            zmn = zp[k] < zmn ? zp[k] : zmn;
+                    }
+                    if (zmx < zmn) {
+                        U = (int32_t) ((uint32_t) U + (uint32_t) dU * (uint32_t) len);
+                        V = (int32_t) ((uint32_t) V + (uint32_t) dV * (uint32_t) len);
+                        stEarlyZ[sBandVal & 1] += (uint32_t) len;
+                        goto next_run;
+                    }
+                }
+            }
             uint32_t um, vm;
             if (FILT_SPAN(OUT, TEX) && c->filt && !port_opt_exact && dU > -c->elim && dU < c->elim && dV > -c->elim && dV < c->elim) {
                 /* 8 or more pixels per texel (the road right in front): the filter changes
@@ -1698,6 +1740,7 @@ static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, i
                 }
             }
         }
+    next_run:
         for (int k = 0; k < nch; k++)
             X[k] = (int32_t) ((uint32_t) X[k] + (uint32_t) s->dX[k] * 16);
         cp += len;
@@ -1731,7 +1774,7 @@ static int wrap_mode(int n, int clamp, int mirror) {
 }
 
 /* rows handled by this call: all, or (for the two-core split) bands of 8 rows by parity */
-static __thread int sBandMask = 0, sBandVal = 0;
+static __thread int sBandMask, sBandVal;
 /* two cores: owner (0 / 1) of each band of 8 rows, rebuilt every frame so both cores
    finish together (core 1 also converts the finished frame for the screen) */
 #define MAX_BANDS 128
@@ -2965,6 +3008,40 @@ static void prefilter_prepare(void) {
    piece that a later piece of the cores' would cover is drawn by the cores as well.
    -hudcpu: all of it by the cores. */
 #define HUD_MAX 1024
+#define GE_UNDER_US 4000
+static int sWorkerOk;   /* (the second core draws: defined with the worker below) */
+/* the menus' 2D under-layer: both cores meet after their 3D, the last one in has the engine
+   draw the layer into the colour buffer (port_ge_underlay_run), then both draw their 2D */
+static int sUlN, sUlParts, sUlArrived, sUlDone;
+static pthread_mutex_t sUlMx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sUlCv = PTHREAD_COND_INITIALIZER;
+static void underlay_sync(void) {
+    pthread_mutex_lock(&sUlMx);
+    if (++sUlArrived >= sUlParts) {
+        pthread_mutex_unlock(&sUlMx);
+        port_ge_underlay_run(port_color, port_render_w, port_render_h);
+        pthread_mutex_lock(&sUlMx);
+        sUlDone = 1;
+        pthread_cond_broadcast(&sUlCv);
+    } else {
+        /* (never more than 100 ms: a core that does not come would freeze the game) */
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 100000000L;
+        if (until.tv_nsec >= 1000000000L) {
+            until.tv_nsec -= 1000000000L;
+            until.tv_sec++;
+        }
+        while (!sUlDone)
+            if (pthread_cond_timedwait(&sUlCv, &sUlMx, &until) != 0) {
+                static int logged;
+                if (!logged++)
+                    fprintf(stderr, "gfx: 2D por baixo: o outro nucleo nao chegou (seguindo sem esperar)\n");
+                break;
+            }
+    }
+    pthread_mutex_unlock(&sUlMx);
+}
 typedef struct {
     uint32_t i0, n;              /* sorted triangles */
     float x0, y0, x1, y1;        /* bounding box, 640x480 */
@@ -3194,29 +3271,11 @@ static int hud_quad(const dc_fast_t *v, const TrSort *e, const RState *st, GeArg
     return -1;
 }
 
-/* the game's order, from piece `top` down: an engine piece under a later piece of the
-   cores' goes to the cores (and then, in turn, what is under it) */
-static void hud_order(int top) {
-    for (int k = top; k >= 0; k--) {
-        const HudItem *c = &sHudItems[k];
-        if (c->ge >= 0)
-            continue;
-        for (int j = 0; j < k; j++) {
-            HudItem *g = &sHudItems[j];
-            if (g->ge >= 0 && g->x0 < c->x1 && c->x0 < g->x1 && g->y0 < c->y1 && c->y0 < g->y1) {
-                if (g->ge > 0)
-                    port_ge_overlay_cancel(g->ge - 1);
-                g->ge = -1;
-                stGeWhy[3]++;
-            }
-        }
-    }
-}
-
 static void hud_ge_build(void) {
     memset(sTrSkip, 0, sTrSkipHi);
     sTrSkipHi = 0;
     sOccN = -1;
+    sUlN = 0;
     port_ge_overlay_begin();
     if (sNoGe || sCapF || port_opt_hudcpu || sTrHud >= sTrSortN || !port_ge_hud_ok())
         return;
@@ -3263,38 +3322,107 @@ static void hud_ge_build(void) {
             stGeWhy[6]++;
         }
     }
-    /* and a time budget: the engine's pieces are drawn by the flip thread before the flip,
-       and a frame of them past GE_BUDGET_US (measured: about 35 us a call plus 4 ns a
-       pixel) pushed the flip past the next refresh (the Player Select screen: 152 pieces,
-       14 ms). What does not fit stays on the cores, in the game's order. */
-    {
-        int us = 0;
+    /* which layer each engine piece goes to, keeping the game's order:
+       - under the cores' 2D (menus at 30 fps, see underlay_sync): drawn into the colour
+         buffer after the 3D and before the cores' 2D, so it may only have pieces of the same
+         layer before it where it overlaps (the menus' backgrounds and boxes, with the letters
+         of the cores on them);
+       - over the finished picture (flip thread): only pieces of the same layer after it
+         where it overlaps;
+       - else the cores. */
+    extern int force_30fps;
+    const int under_ok = force_30fps && gGamestate != 4 && port_ge_under_ok();
+    static uint8_t lay[HUD_MAX];   /* 0 cores, 1 over, 2 under */
+    for (int k = 0; k < m; k++)
+        lay[k] = 0;
+    if (under_ok)
         for (int k = 0; k < m; k++) {
-            HudItem *it = &sHudItems[k];
+            const HudItem *it = &sHudItems[k];
             if (it->ge < 0)
                 continue;
-            us += 35 + it->a.dw * it->a.dh / 250;
-            if (us > GE_BUDGET_US) {
-                it->ge = -1;
+            int ok = 1;
+            for (int j = 0; j < k && ok; j++) {
+                const HudItem *g = &sHudItems[j];
+                if (lay[j] != 2 && g->x0 < it->x1 && it->x0 < g->x1 && g->y0 < it->y1 && it->y0 < g->y1)
+                    ok = 0;
+            }
+            if (ok)
+                lay[k] = 2;
+        }
+    for (int k = m - 1; k >= 0; k--) {
+        const HudItem *it = &sHudItems[k];
+        if (it->ge < 0 || lay[k])
+            continue;
+        int ok = 1;
+        for (int j = k + 1; j < m && ok; j++) {
+            const HudItem *g = &sHudItems[j];
+            if (lay[j] != 1 && g->x0 < it->x1 && it->x0 < g->x1 && g->y0 < it->y1 && it->y0 < g->y1)
+                ok = 0;
+        }
+        if (ok)
+            lay[k] = 1;
+        else
+            stGeWhy[3]++;
+    }
+    /* time budgets: the under-layer holds both cores (GE_UNDER_US), the over-layer the flip
+       (GE_BUDGET_US); about 35 us a call plus 4 ns a pixel. Cut from the end of the
+       under-layer and from the start of the over-layer: what is left keeps the order. */
+    {
+        int us = 0, last = -1;
+        for (int k = 0; k < m; k++)
+            if (lay[k] == 2)
+                us += 35 + sHudItems[k].a.dw * sHudItems[k].a.dh / 250;
+        for (int k = m - 1; k >= 0 && us > GE_UNDER_US; k--)
+            if (lay[k] == 2) {
+                us -= 35 + sHudItems[k].a.dw * sHudItems[k].a.dh / 250;
+                lay[k] = 0;
                 stGeWhy[7]++;
             }
-        }
+        us = 0;
+        for (int k = 0; k < m; k++)
+            if (lay[k] == 1)
+                us += 35 + sHudItems[k].a.dw * sHudItems[k].a.dh / 250;
+        for (int k = 0; k < m && us > GE_BUDGET_US; k++)
+            if (lay[k] == 1) {
+                us -= 35 + sHudItems[k].a.dw * sHudItems[k].a.dh / 250;
+                lay[k] = 0;
+                stGeWhy[7]++;
+            }
+        (void) last;
     }
-    hud_order(m - 1);
-    /* the texels copied for the engine only now, for the pieces it really draws */
-    for (int k = 0; k < m; k++) {
+    /* the texels copied for the engine only now, for the pieces it really draws (no room in
+       its memory, rare: all of this frame's 2D on the cores) */
+    int fail = 0;
+    sUlN = 0;
+    for (int k = 0; k < m && !fail; k++) {
         HudItem *it = &sHudItems[k];
-        if (it->ge < 0)
-            continue;
-        const GeArgs *a = &it->a;
-        const int r = port_ge_overlay_add(a);
-        if (r >= 0) {
-            it->ge = r + 1;
+        if (!lay[k]) {
+            it->ge = -1;
             continue;
         }
-        it->ge = -1;   /* no room in the engine's memory: the cores, and what is under it too */
-        stGeWhy[5]++;
-        hud_order(k);
+        it->a.layer = lay[k] == 2;
+        const int r = port_ge_overlay_add(&it->a);
+        if (r < 0) {
+            fail = 1;
+            stGeWhy[5]++;
+            break;
+        }
+        it->ge = r + 1;
+        sUlN += lay[k] == 2;
+    }
+    if (fail) {
+        for (int k = 0; k < m; k++) {
+            HudItem *it = &sHudItems[k];
+            if (it->ge > 0)
+                port_ge_overlay_cancel(it->ge - 1);
+            it->ge = -1;
+        }
+        sUlN = 0;
+    }
+    if (sUlN) {   /* (the cores meet before their 2D: see underlay_sync) */
+        sUlParts = sWorkerOk ? 2 : 1;
+        sUlArrived = 0;
+        sUlDone = 0;
     }
     /* what the cores still draw of the 2D (sTrSkip 2) is smoothed by them, like the engine's
        pieces (the minimap under the karts' markers, rotated, that the engine cannot draw) */
@@ -3311,6 +3439,69 @@ static void hud_ge_build(void) {
     memset(sTrSkip + i, 2, sTrSortN - i);
     stGeCpuTris += sTrSortN - i;
     sTrSkipHi = sTrSortN;
+}
+
+/* ---- the opaque and punch-through lists, nearest first ----
+   Their result does not depend on the order (each pixel keeps the nearest surface: depth
+   tested and written), so they are drawn from the nearest triangle to the farthest: what
+   ends up hidden is then mostly found hidden before its texels are read (the early depth
+   test in nv_span). A list with any triangle that is not depth tested and written (drawn
+   over whatever is there), or a growing pane, keeps the game's order. Equal depths keep
+   the game's order too. */
+static TrSort sOpSort[BUCKET_VERTS / 3], sPtSort[BUCKET_VERTS / 3];
+static uint32_t sOpSortN, sPtSortN;
+static int sOpSorted, sPtSorted;
+
+static int solid_cmp(const void *a, const void *b) {
+    const TrSort *x = a, *y = b;
+    if (x->key > y->key) return -1;
+    if (x->key < y->key) return 1;
+    return (x->seq > y->seq) - (x->seq < y->seq);
+}
+
+static int sort_solid_list(const Bucket *b, TrSort *out, uint32_t *n) {
+    *n = 0;
+    for (int i = 0; i < b->nbatch; i++) {
+        const Batch *bt = &b->batch[i];
+        if (bt->count && (!bt->st.depth_test || !bt->st.depth_write || bt->st.pane))
+            return 0;
+    }
+    uint32_t k = 0;
+    for (int i = 0; i < b->nbatch; i++) {
+        const Batch *bt = &b->batch[i];
+        for (uint32_t t = 0; t + 2 < bt->count; t += 3) {
+            const dc_fast_t *v = &b->verts[bt->start + t];
+            out[k].key = v[0].vert.z + v[1].vert.z + v[2].vert.z;
+            out[k].seq = bt->start + t;
+            out[k].batch = (uint16_t) i;
+            out[k].front = 0;
+            k++;
+        }
+    }
+    qsort(out, k, sizeof(out[0]), solid_cmp);
+    *n = k;
+    return 1;
+}
+
+static void sort_solid(void) {
+    sOpSorted = !port_opt_exact && sort_solid_list(&sRenB[KIND_OP], sOpSort, &sOpSortN);
+    sPtSorted = !port_opt_exact && sort_solid_list(&sRenB[KIND_PT], sPtSort, &sPtSortN);
+    sSolidSorted = sOpSorted && sPtSorted;
+}
+
+static void raster_solid(int kind) {
+    Bucket *b = &sRenB[kind];
+    const int sorted = kind == KIND_OP ? sOpSorted : sPtSorted;
+    if (!sorted) {
+        flush_bucket(b, kind);
+        return;
+    }
+    const TrSort *e = kind == KIND_OP ? sOpSort : sPtSort;
+    const uint32_t n = kind == KIND_OP ? sOpSortN : sPtSortN;
+    for (uint32_t i = 0; i < n; i++) {
+        const dc_fast_t *v = &b->verts[e[i].seq];
+        raster_tri(&v[0], &v[1], &v[2], &b->batch[e[i].batch].st, kind);
+    }
 }
 
 static void sort_tr(void) {
@@ -3405,6 +3596,7 @@ static void sort_tr(void) {
             sTrHud = i;
             break;
         }
+    sort_solid();
     hud_ge_build();
 }
 
@@ -3478,12 +3670,14 @@ static void raster_frame_band(int mask, int val) {
         raster_sky();   /* (more rows than the coverage table: in place, as before) */
     }
     double t2 = port_now_ms();
-    flush_bucket(&sRenB[KIND_OP], KIND_OP);
+    raster_solid(KIND_OP);
     double t3 = port_now_ms();
-    flush_bucket(&sRenB[KIND_PT], KIND_PT);
+    raster_solid(KIND_PT);
     double t4 = port_now_ms();
     raster_tr_sorted(0, sTrHud);
     double t5 = port_now_ms();
+    if (sUlN)
+        underlay_sync();
     raster_tr_sorted(sTrHud, sTrSortN);
     double t6 = port_now_ms();
     double *ph = stPhase[val & 1];   /* each core writes only its own row */

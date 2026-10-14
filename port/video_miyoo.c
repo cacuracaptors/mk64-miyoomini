@@ -186,6 +186,16 @@ static void *open_lib(const char *name) {
 }
 
 static int hw_blit_q(MI_PHY src, int sw, int sh, MI_PHY dst, int dw, int dh, int rotate, int mirror, MI_U16 *fq);
+/* (two threads queue work for the engine: the flip thread, and the cores' 2D under-layer in
+   the menus: one call into its driver at a time) */
+static pthread_mutex_t ge_mx = PTHREAD_MUTEX_INITIALIZER;
+static MI_S32 mi_blit(MI_GFX_Surface_t *s, MI_GFX_Rect_t *sr, MI_GFX_Surface_t *d, MI_GFX_Rect_t *dr, MI_GFX_Opt_t *o,
+                      MI_U16 *f) {
+    pthread_mutex_lock(&ge_mx);
+    const MI_S32 r = mi.Blit(s, sr, d, dr, o, f);
+    pthread_mutex_unlock(&ge_mx);
+    return r;
+}
 static int hw_blit(MI_PHY src, int sw, int sh, MI_PHY dst, int dw, int dh, int rotate, int mirror) {
     return hw_blit_q(src, sw, sh, dst, dw, dh, rotate, mirror, NULL);
 }
@@ -203,7 +213,7 @@ static int hw_blit_q(MI_PHY src, int sw, int sh, MI_PHY dst, int dw, int dh, int
     opt.eRotate = (MI_GFX_Rotate_e) rotate;
     opt.eDFBBlendFlag = E_MI_GFX_DFB_BLEND_NOFX;
     MI_U16 fence = 0;
-    if (mi.Blit(&s, &sr, &d, &dr, &opt, &fence) != 0)
+    if (mi_blit(&s, &sr, &d, &dr, &opt, &fence) != 0)
         return -1;
     if (fq)
         *fq = fence;
@@ -318,10 +328,11 @@ typedef struct {
     uint16_t pw, ph, sw, sh;   /* the copy's size (border included) and the picture in it (at 1,1) */
     int16_t dx, dy, dw, dh;    /* where on the 640x480 screen (as the game sees it) */
     uint8_t on;
+    uint8_t layer;             /* 0 over the finished picture (flip thread), 1 under the cores' 2D */
 } GeItem;
 typedef struct {
     GeItem it[GE_MAX];
-    int n;
+    int n, nover;
     uint32_t used;
     /* the copies made into this part, in order (what its memory holds): a frame that makes
        the same copies at the same places as the last one here (three frames before: a
@@ -337,8 +348,10 @@ static uint8_t *ge_virt[3];
 static uint32_t ge_cap;      /* bytes in each part */
 static int ge_ok;            /* the test passed */
 static int ge_place;         /* 0: the rectangle where it is asked for (turned inside it); 1: the engine turns its place too */
+static int ge_under;         /* the engine blends right into an RGB565 colour buffer (tested) */
 static int ge_sec = -1;      /* the part being filled (the colour buffer being drawn) */
 static double ge_copy_ms;    /* (-perf: the copies, game thread) */
+static int ge_under_n;       /* (-perf: pieces drawn under the cores' 2D) */
 #define GE_HASH 2048
 static struct {
     uint32_t stamp, off;
@@ -346,10 +359,18 @@ static struct {
 } sGeHash[GE_HASH];
 static uint32_t sGeStamp;
 
+static int ge_blit_f(MI_PHY src, int pw, int ph, const MI_GFX_Rect_t *sr, MI_PHY dst, int dw, int dh,
+                     const MI_GFX_Rect_t *dr, int rotate, MI_U16 *fence, int rgb565);
 static int ge_blit(MI_PHY src, int pw, int ph, const MI_GFX_Rect_t *sr, MI_PHY dst, int dw, int dh, const MI_GFX_Rect_t *dr,
                    int rotate, MI_U16 *fence) {
+    return ge_blit_f(src, pw, ph, sr, dst, dw, dh, dr, rotate, fence, 0);
+}
+/* rgb565: the destination is a colour buffer (the cores' RGB565) instead of a screen page */
+static int ge_blit_f(MI_PHY src, int pw, int ph, const MI_GFX_Rect_t *sr, MI_PHY dst, int dw, int dh,
+                     const MI_GFX_Rect_t *dr, int rotate, MI_U16 *fence, int rgb565) {
     MI_GFX_Surface_t s = { src, E_MI_GFX_FMT_ARGB8888, (MI_U32) pw, (MI_U32) ph, (MI_U32) pw * 4 };
-    MI_GFX_Surface_t d = { dst, E_MI_GFX_FMT_ARGB8888, (MI_U32) dw, (MI_U32) dh, (MI_U32) dw * 4 };
+    MI_GFX_Surface_t d = { dst, rgb565 ? E_MI_GFX_FMT_RGB565 : E_MI_GFX_FMT_ARGB8888, (MI_U32) dw, (MI_U32) dh,
+                           (MI_U32) dw * (rgb565 ? 2 : 4) };
     MI_GFX_Rect_t srr = *sr, drr = *dr;
     MI_GFX_Opt_t opt;
     memset(&opt, 0, sizeof opt);
@@ -362,7 +383,7 @@ static int ge_blit(MI_PHY src, int pw, int ph, const MI_GFX_Rect_t *sr, MI_PHY d
     opt.eMirror = E_MI_GFX_MIRROR_NONE;
     opt.eRotate = (MI_GFX_Rotate_e) rotate;
     opt.eDFBBlendFlag = E_MI_GFX_DFB_BLEND_ALPHACHANNEL;
-    return mi.Blit(&s, &srr, &d, &drr, &opt, fence) != 0;
+    return mi_blit(&s, &srr, &d, &drr, &opt, fence) != 0;
 }
 
 static int near_px(uint32_t got, uint32_t want) {
@@ -446,6 +467,38 @@ static int ge_selftest(void) {
         snprintf(why, sizeof why, "mistura errada em %d pixels (ex. %06x, esperado %06x)", bad,
                  (unsigned) (d[(ge_place ? 4 : 3) * 8 + (ge_place ? 4 : 2)] & 0xFFFFFF), (unsigned) want);
         goto out;
+    }
+    /* 3: the same blend into an RGB565 colour buffer, not turned (the 2D under-layer of the
+       menus, see port_ge_underlay_run): over 66,65,66 it must give about 161,96,33 */
+    {
+        uint16_t *d16 = vd;
+        for (int i = 0; i < 64; i++)
+            d16[i] = 0x4208;
+        mi.Flush(vs, 4096);
+        mi.Flush(vd, 4096);
+        MI_GFX_Rect_t dr3 = { 2, 1, 4, 4 };
+        ge_under = 0;
+        if (ge_blit_f(ps, 4, 4, &sr2, pd, 8, 8, &dr3, E_MI_GFX_ROTATE_0, &fence, 1) == 0) {
+            mi.Wait(TRUE, fence);
+            mi.Flush(vd, 4096);
+            int bad3 = 0;
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 8; x++) {
+                    const uint32_t c = d16[y * 8 + x];
+                    const uint32_t c8 = rgb565_to_x8888(c) & 0xFFFFFF;
+                    const int in = x >= 2 && x < 6 && y >= 1 && y < 5;
+                    const uint32_t w8 = in ? 0xA16021u : (rgb565_to_x8888(0x4208) & 0xFFFFFF);
+                    for (int k = 0; k < 24; k += 8) {
+                        const int a = (int) ((c8 >> k) & 255), b = (int) ((w8 >> k) & 255);
+                        if (a - b > 10 || b - a > 10)
+                            bad3++;
+                    }
+                }
+            ge_under = !bad3;
+            if (bad3)
+                printf("video: MI_GFX nao mistura certo na cor de 16 bits (%d erros, ex. %04x): 2D por baixo desligado\n",
+                       bad3, (unsigned) d16[2 * 8 + 3]);
+        }
     }
     ok = 1;
 out:
@@ -560,6 +613,7 @@ void port_ge_overlay_begin(void) {
     ge_sec = cur_idx;
     GeOvl *o = &sGeOvl[ge_sec];
     o->n = 0;
+    o->nover = 0;
     o->used = 0;
     o->cur ^= 1;
     o->cn[o->cur] = 0;
@@ -725,12 +779,56 @@ int port_ge_overlay_add(const GeArgs *in) {
     it->dw = (int16_t) dw;
     it->dh = (int16_t) dh;
     it->on = 1;
+    it->layer = (uint8_t) (in->layer != 0);
+    if (!it->layer)
+        o->nover++;
     return o->n++;
 }
 
 void port_ge_overlay_cancel(int idx) {
     if (ge_sec >= 0 && idx >= 0 && idx < sGeOvl[ge_sec].n)
         sGeOvl[ge_sec].it[idx].on = 0;
+}
+
+int port_ge_under_ok(void) {
+    return hw_ok && ge_ok && ge_under;
+}
+
+/* the cores' 2D under-layer (menus): the engine's pieces of layer 1 into the colour buffer
+   being drawn, at its size, after the 3D and before the cores' own 2D (gfx_sw.c,
+   underlay_sync: both cores wait for it). The buffer is cached memory: written back before
+   (the engine reads and blends into it) and dropped from the cache after. */
+void port_ge_underlay_run(uint16_t *color, int w, int h) {
+    if (ge_sec < 0 || !hw_ok || color != cbuf[ge_sec])
+        return;
+    GeOvl *o = &sGeOvl[ge_sec];
+    if (o->dmax > o->dmin) {
+        mi.Flush(ge_virt[ge_sec] + o->dmin, o->dmax - o->dmin);
+        o->dmin = ~0u;
+        o->dmax = 0;
+    }
+    const MI_U32 bytes = (MI_U32) w * h * 2;
+    mi.Flush(color, bytes);
+    MI_U16 fence = 0;
+    int n = 0;
+    for (int i = 0; i < o->n; i++) {
+        const GeItem *it = &o->it[i];
+        if (!it->on || !it->layer)
+            continue;
+        const int x0 = (it->dx * w + 320) / 640, x1 = ((it->dx + it->dw) * w + 320) / 640;
+        const int y0 = (it->dy * h + 240) / 480, y1 = ((it->dy + it->dh) * h + 240) / 480;
+        if (x1 <= x0 || y1 <= y0)
+            continue;
+        MI_GFX_Rect_t sr = { 1, 1, it->sw, it->sh };
+        MI_GFX_Rect_t dr = { x0, y0, (MI_U32) (x1 - x0), (MI_U32) (y1 - y0) };
+        if (ge_blit_f(ge_phys[ge_sec] + it->off, it->pw, it->ph, &sr, hw_phys[ge_sec], w, h, &dr, E_MI_GFX_ROTATE_0,
+                      &fence, 1) == 0)
+            n++;
+    }
+    if (n)
+        mi.Wait(TRUE, fence);
+    mi.Flush(color, bytes);
+    ge_under_n += n;
 }
 
 /* flip thread: the pieces of part `sec` over screen page `back` (after the frame's copy) */
@@ -741,7 +839,7 @@ static int ge_draw(int sec, int back, MI_U16 *fq) {
     int n = 0;
     for (int i = 0; i < o->n; i++) {
         const GeItem *it = &o->it[i];
-        if (!it->on)
+        if (!it->on || it->layer)
             continue;
         MI_GFX_Rect_t sr = { 1, 1, it->sw, it->sh };
         MI_GFX_Rect_t dr = { it->dx, it->dy, (MI_U32) it->dw, (MI_U32) it->dh };
@@ -765,7 +863,7 @@ static int ge_take(int idx) {
     }
     ge_sec = -1;
     GeOvl *o = &sGeOvl[idx];
-    if (!o->n)
+    if (!o->nover)
         return -1;
     if (o->dmax > o->dmin)   /* (the new copies are in the CPU cache) */
         mi.Flush(ge_virt[idx] + o->dmin, o->dmax - o->dmin);
@@ -782,6 +880,11 @@ int port_ge_clip_ok(void) {
 }
 int port_ge_overlay_add(const GeArgs *a) {
     return -1;
+}
+int port_ge_under_ok(void) {
+    return 0;
+}
+void port_ge_underlay_run(uint16_t *color, int w, int h) {
 }
 void port_ge_overlay_cancel(int idx) {
 }
@@ -1053,10 +1156,11 @@ static void *flip_proc(void *arg) {
                         frames ? t_conv / frames : 0, frames ? t_cpu / frames : 0, frames ? t_show / frames : 0, frames, ticks,
                         ticks ? tmin : 0, tmax);
 #ifdef HAVE_MI_GFX
-                if (t_gen > 0 || ge_copy_ms > 0)
-                    fprintf(stderr, "perf 2d MI_GFX: %.1f pecas/quadro, desenho %.2f ms/quadro (nucleo 1, cpu %.2f), copias %.2f ms/quadro (jogo)\n",
-                            frames ? t_gen / frames : 0, frames ? t_ge / frames : 0, frames ? t_gecpu / frames : 0,
-                            frames ? ge_copy_ms / frames : 0);
+                if (t_gen > 0 || ge_copy_ms > 0 || ge_under_n > 0)
+                    fprintf(stderr, "perf 2d MI_GFX: %.1f pecas/quadro por cima, %.1f por baixo do 2D dos nucleos, desenho %.2f ms/quadro (nucleo 1, cpu %.2f), copias %.2f ms/quadro (jogo)\n",
+                            frames ? t_gen / frames : 0, frames ? (double) ge_under_n / frames : 0, frames ? t_ge / frames : 0,
+                            frames ? t_gecpu / frames : 0, frames ? ge_copy_ms / frames : 0);
+                ge_under_n = 0;
                 ge_copy_ms = 0;
 #endif
                 fprintf(stderr, "perf ritmo: quadros na tela por 1 atualizacao %d, 2 %d, 3 %d, 4+ %d | prontos depois da sua atualizacao %d\n",

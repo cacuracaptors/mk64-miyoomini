@@ -2708,13 +2708,43 @@ double port_audio_total_ms;   /* (the hitch log) */
 extern double port_now_ms(void);
 /* Called from the game thread once per frame: run one audio frame per elapsed vblank
    (the DC did this on SPINNING_THREAD; doing it here avoids data races with game code). */
+/* In the menus the sound keeps MENU_SOUND_EXTRA game frames more in reserve: a change of
+   screen takes the game one long frame (75 to 105 ms: it decompresses the new screen's
+   pictures, see port/menucache_miyoo.c), and with 3 frames (50 ms) of reserve the sound ran
+   dry at every change. The reserve is filled at once by making those frames of sound right
+   away (the menus' music a little ahead), and emptied the same way when a race starts (that
+   many ticks without making sound, while the reserve plays): no change of pitch, no gap.
+   In the races the reserve stays short (the sound effects follow the game closely). The
+   frames of sound a long frame left out are made right after it (up to 10). */
+#define MENU_SOUND_EXTRA 5
+extern void port_audio_set_extra(int frames);
 void port_audio_pump(void) {
     static uint64_t last_vbltick = 0;
+    static int extra_on, skip;
     uint64_t now = vblticker;
-    if (last_vbltick == 0 || now - last_vbltick > 4)
+    if (last_vbltick == 0 || now - last_vbltick > 10)
         last_vbltick = now - 1;
+    const int menu = gGamestate != RACING;
+    if (menu != extra_on) {
+        extra_on = menu;
+        port_audio_set_extra(menu ? MENU_SOUND_EXTRA : 0);
+        if (menu) {
+            skip = 0;
+            for (int i = 0; i < MENU_SOUND_EXTRA; i++) {
+                create_next_audio_buffer(audio_buffer, SAMPLES_HIGH);
+                if (audio_api)
+                    audio_api->play((u8 *) audio_buffer, SAMPLES_HIGH * 2 * 2);
+            }
+        } else {
+            skip = MENU_SOUND_EXTRA;
+        }
+    }
     while (last_vbltick < now) {
         last_vbltick++;
+        if (skip > 0) {
+            skip--;
+            continue;
+        }
         const double t0 = port_now_ms();
         create_next_audio_buffer(audio_buffer, SAMPLES_HIGH);
         port_audio_ms += port_now_ms() - t0;
