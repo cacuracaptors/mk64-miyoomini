@@ -3009,19 +3009,24 @@ static void prefilter_prepare(void) {
    -hudcpu: all of it by the cores. */
 #define HUD_MAX 1024
 #define GE_UNDER_US 4000
+#define GE_BATCH_US 150   /* (a meeting of the cores and the colour buffer's cache rows: per batch) */
+#define UL_MAX 8
 static int sWorkerOk;   /* (the second core draws: defined with the worker below) */
-/* the menus' 2D under-layer: both cores meet after their 3D, the last one in has the engine
-   draw the layer into the colour buffer (port_ge_underlay_run), then both draw their 2D */
-static int sUlN, sUlParts, sUlArrived, sUlDone;
+/* the menus' 2D under the cores' letters: up to UL_MAX batches, each drawn before the
+   sorted translucent triangle sUlAt[b]. Both cores meet there, the last one in has the
+   engine draw the batch into the colour buffer (port_ge_underlay_run), then both go on. */
+static int sUlN, sUlNb, sUlParts;
+static uint32_t sUlAt[UL_MAX];
+static int sUlArrived[UL_MAX], sUlDone[UL_MAX];
 static pthread_mutex_t sUlMx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sUlCv = PTHREAD_COND_INITIALIZER;
-static void underlay_sync(void) {
+static void underlay_sync(int b) {
     pthread_mutex_lock(&sUlMx);
-    if (++sUlArrived >= sUlParts) {
+    if (++sUlArrived[b] >= sUlParts) {
         pthread_mutex_unlock(&sUlMx);
-        port_ge_underlay_run(port_color, port_render_w, port_render_h);
+        port_ge_underlay_run(port_color, port_render_w, port_render_h, b + 1);
         pthread_mutex_lock(&sUlMx);
-        sUlDone = 1;
+        sUlDone[b] = 1;
         pthread_cond_broadcast(&sUlCv);
     } else {
         /* (never more than 100 ms: a core that does not come would freeze the game) */
@@ -3032,7 +3037,7 @@ static void underlay_sync(void) {
             until.tv_nsec -= 1000000000L;
             until.tv_sec++;
         }
-        while (!sUlDone)
+        while (!sUlDone[b])
             if (pthread_cond_timedwait(&sUlCv, &sUlMx, &until) != 0) {
                 static int logged;
                 if (!logged++)
@@ -3041,6 +3046,18 @@ static void underlay_sync(void) {
             }
     }
     pthread_mutex_unlock(&sUlMx);
+}
+
+static void raster_tr_sorted(uint32_t from, uint32_t to);
+/* the 2D of the sorted translucent list from `from`, with the batches under it in place */
+static void raster_2d(uint32_t from) {
+    for (int b = 0; b < sUlNb; b++) {
+        const uint32_t at = sUlAt[b] > from ? sUlAt[b] : from;
+        raster_tr_sorted(from, at);
+        underlay_sync(b);
+        from = at;
+    }
+    raster_tr_sorted(from, sTrSortN);
 }
 typedef struct {
     uint32_t i0, n;              /* sorted triangles */
@@ -3323,35 +3340,24 @@ static void hud_ge_build(void) {
         }
     }
     /* which layer each engine piece goes to, keeping the game's order:
-       - under the cores' 2D (menus at 30 fps, see underlay_sync): drawn into the colour
-         buffer after the 3D and before the cores' 2D, so it may only have pieces of the same
-         layer before it where it overlaps (the menus' backgrounds and boxes, with the letters
-         of the cores on them);
-       - over the finished picture (flip thread): only pieces of the same layer after it
-         where it overlaps;
+       - over the finished picture (flip thread): when only pieces of the same layer come
+         after it where it overlaps. Preferred: it costs the cores nothing;
+       - else, in the menus at 30 fps, under the cores' 2D, in one of up to UL_MAX batches
+         drawn into the colour buffer between the cores' 2D pieces (see underlay_sync: both
+         cores meet there): a piece joins the batch in front of the cores' pieces that
+         follow it, unless it overlaps one of the cores' pieces since the last batch, which
+         must stay under it: then a new batch starts there (the Data screen: box, letters,
+         box, letters...);
        - else the cores. */
     extern int force_30fps;
     const int under_ok = force_30fps && gGamestate != 4 && port_ge_under_ok();
     static uint8_t lay[HUD_MAX];   /* 0 cores, 1 over, 2 under */
+    static uint8_t bat[HUD_MAX];   /* (under: its batch) */
     for (int k = 0; k < m; k++)
         lay[k] = 0;
-    if (under_ok)
-        for (int k = 0; k < m; k++) {
-            const HudItem *it = &sHudItems[k];
-            if (it->ge < 0)
-                continue;
-            int ok = 1;
-            for (int j = 0; j < k && ok; j++) {
-                const HudItem *g = &sHudItems[j];
-                if (lay[j] != 2 && g->x0 < it->x1 && it->x0 < g->x1 && g->y0 < it->y1 && it->y0 < g->y1)
-                    ok = 0;
-            }
-            if (ok)
-                lay[k] = 2;
-        }
     for (int k = m - 1; k >= 0; k--) {
         const HudItem *it = &sHudItems[k];
-        if (it->ge < 0 || lay[k])
+        if (it->ge < 0)
             continue;
         int ok = 1;
         for (int j = k + 1; j < m && ok; j++) {
@@ -3361,24 +3367,10 @@ static void hud_ge_build(void) {
         }
         if (ok)
             lay[k] = 1;
-        else
-            stGeWhy[3]++;
     }
-    /* time budgets: the under-layer holds both cores (GE_UNDER_US), the over-layer the flip
-       (GE_BUDGET_US); about 35 us a call plus 4 ns a pixel. Cut from the end of the
-       under-layer and from the start of the over-layer: what is left keeps the order. */
+    /* the over-layer's time (the flip): cut from its start, what is left keeps the order */
     {
-        int us = 0, last = -1;
-        for (int k = 0; k < m; k++)
-            if (lay[k] == 2)
-                us += 35 + sHudItems[k].a.dw * sHudItems[k].a.dh / 250;
-        for (int k = m - 1; k >= 0 && us > GE_UNDER_US; k--)
-            if (lay[k] == 2) {
-                us -= 35 + sHudItems[k].a.dw * sHudItems[k].a.dh / 250;
-                lay[k] = 0;
-                stGeWhy[7]++;
-            }
-        us = 0;
+        int us = 0;
         for (int k = 0; k < m; k++)
             if (lay[k] == 1)
                 us += 35 + sHudItems[k].a.dw * sHudItems[k].a.dh / 250;
@@ -3386,10 +3378,50 @@ static void hud_ge_build(void) {
             if (lay[k] == 1) {
                 us -= 35 + sHudItems[k].a.dw * sHudItems[k].a.dh / 250;
                 lay[k] = 0;
+                sHudItems[k].ge = -1;
                 stGeWhy[7]++;
             }
-        (void) last;
     }
+    int nb = 0;          /* batches under the cores' 2D */
+    sUlNb = 0;
+    if (under_ok) {
+        int seg0 = 0;    /* first piece of the cores' current stretch (since the last batch) */
+        int us = 0, open = 0;
+        for (int k = 0; k < m; k++) {
+            HudItem *it = &sHudItems[k];
+            if (lay[k] == 1)
+                continue;
+            if (it->ge < 0)
+                continue;   /* (one of the cores' pieces: part of the current stretch) */
+            int over = 0;   /* does it overlap one of the cores' pieces of the current stretch? */
+            for (int j = seg0; j < k && !over; j++) {
+                const HudItem *g = &sHudItems[j];
+                if (lay[j] == 0 && g->x0 < it->x1 && it->x0 < g->x1 && g->y0 < it->y1 && it->y0 < g->y1)
+                    over = 1;
+            }
+            const int need_new = !open || over;
+            const int cost = 35 + it->a.dw * it->a.dh / 250 + (need_new ? GE_BATCH_US : 0);
+            if ((need_new && nb >= UL_MAX) || us + cost > GE_UNDER_US) {
+                it->ge = -1;   /* the cores (it joins the current stretch) */
+                stGeWhy[7]++;
+                continue;
+            }
+            if (need_new) {
+                sUlAt[nb] = it->i0;   /* the batch is drawn before this piece's place */
+                nb++;
+                seg0 = k;
+                open = 1;
+            }
+            lay[k] = 2;
+            bat[k] = (uint8_t) (nb - 1);
+            us += cost;
+        }
+    }
+    for (int k = 0; k < m; k++)
+        if (lay[k] == 0 && sHudItems[k].ge >= 0) {
+            sHudItems[k].ge = -1;
+            stGeWhy[3]++;
+        }
     /* the texels copied for the engine only now, for the pieces it really draws (no room in
        its memory, rare: all of this frame's 2D on the cores) */
     int fail = 0;
@@ -3400,7 +3432,7 @@ static void hud_ge_build(void) {
             it->ge = -1;
             continue;
         }
-        it->a.layer = lay[k] == 2;
+        it->a.layer = lay[k] == 2 ? 1 + bat[k] : 0;
         const int r = port_ge_overlay_add(&it->a);
         if (r < 0) {
             fail = 1;
@@ -3418,11 +3450,17 @@ static void hud_ge_build(void) {
             it->ge = -1;
         }
         sUlN = 0;
+        nb = 0;
     }
-    if (sUlN) {   /* (the cores meet before their 2D: see underlay_sync) */
+    if (sUlN) {   /* (the cores meet before each batch: see underlay_sync) */
+        sUlNb = nb;
         sUlParts = sWorkerOk ? 2 : 1;
-        sUlArrived = 0;
-        sUlDone = 0;
+        for (int b = 0; b < nb; b++) {
+            sUlArrived[b] = 0;
+            sUlDone[b] = 0;
+        }
+    } else {
+        sUlNb = 0;
     }
     /* what the cores still draw of the 2D (sTrSkip 2) is smoothed by them, like the engine's
        pieces (the minimap under the karts' markers, rotated, that the engine cannot draw) */
@@ -3676,9 +3714,7 @@ static void raster_frame_band(int mask, int val) {
     double t4 = port_now_ms();
     raster_tr_sorted(0, sTrHud);
     double t5 = port_now_ms();
-    if (sUlN)
-        underlay_sync();
-    raster_tr_sorted(sTrHud, sTrSortN);
+    raster_2d(sTrHud);
     double t6 = port_now_ms();
     double *ph = stPhase[val & 1];   /* each core writes only its own row */
     ph[0] += t1 - t0; ph[1] += t2 - t1; ph[2] += t3 - t2; ph[3] += t4 - t3; ph[4] += t5 - t4; ph[5] += t6 - t5;

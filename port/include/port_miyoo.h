@@ -55,14 +55,14 @@ typedef struct {
     uint32_t gen;          /* which upload of the texels (the same gen, the same texels) */
     uint32_t c0, c1;       /* vertex colour (ARGB) */
     uint32_t o0, o1;       /* offset colour (RGB), added after the texture */
-    int layer;             /* 0 over the finished picture, 1 under the cores' 2D (menus) */
+    int layer;             /* 0 over the finished picture, 1 + n: batch n under the cores' 2D (menus) */
 } GeArgs;
 int port_ge_hud_ok(void);
 int port_ge_clip_ok(void);   /* the engine can cut a rectangle at the screen's edges */
 void port_ge_overlay_begin(void);
 int port_ge_overlay_add(const GeArgs *a);   /* index, or -1: no room */
 int port_ge_under_ok(void);   /* the engine can draw into the cores' colour buffer (tested) */
-void port_ge_underlay_run(uint16_t *color, int w, int h);
+void port_ge_underlay_run(uint16_t *color, int w, int h, int layer);   /* layer: 1 + the batch */
 void port_ge_overlay_cancel(int idx);
 extern int port_opt_resdin;          /* -resdin: dynamic resolution */
 

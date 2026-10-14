@@ -328,7 +328,7 @@ typedef struct {
     uint16_t pw, ph, sw, sh;   /* the copy's size (border included) and the picture in it (at 1,1) */
     int16_t dx, dy, dw, dh;    /* where on the 640x480 screen (as the game sees it) */
     uint8_t on;
-    uint8_t layer;             /* 0 over the finished picture (flip thread), 1 under the cores' 2D */
+    uint8_t layer;             /* 0 over the finished picture (flip thread), 1 + n: batch n under the cores' 2D */
 } GeItem;
 typedef struct {
     GeItem it[GE_MAX];
@@ -779,7 +779,7 @@ int port_ge_overlay_add(const GeArgs *in) {
     it->dw = (int16_t) dw;
     it->dh = (int16_t) dh;
     it->on = 1;
-    it->layer = (uint8_t) (in->layer != 0);
+    it->layer = (uint8_t) in->layer;
     if (!it->layer)
         o->nover++;
     return o->n++;
@@ -798,7 +798,7 @@ int port_ge_under_ok(void) {
    being drawn, at its size, after the 3D and before the cores' own 2D (gfx_sw.c,
    underlay_sync: both cores wait for it). The buffer is cached memory: written back before
    (the engine reads and blends into it) and dropped from the cache after. */
-void port_ge_underlay_run(uint16_t *color, int w, int h) {
+void port_ge_underlay_run(uint16_t *color, int w, int h, int layer) {
     if (ge_sec < 0 || !hw_ok || color != cbuf[ge_sec])
         return;
     GeOvl *o = &sGeOvl[ge_sec];
@@ -807,13 +807,26 @@ void port_ge_underlay_run(uint16_t *color, int w, int h) {
         o->dmin = ~0u;
         o->dmax = 0;
     }
-    const MI_U32 bytes = (MI_U32) w * h * 2;
-    mi.Flush(color, bytes);
+    /* (only the rows this batch covers go through the cache flushes) */
+    int r0 = h, r1 = 0;
+    for (int i = 0; i < o->n; i++) {
+        const GeItem *it = &o->it[i];
+        if (!it->on || it->layer != layer)
+            continue;
+        const int y0 = (it->dy * h + 240) / 480, y1 = ((it->dy + it->dh) * h + 240) / 480;
+        if (y0 < r0) r0 = y0 < 0 ? 0 : y0;
+        if (y1 > r1) r1 = y1 > h ? h : y1;
+    }
+    if (r1 <= r0)
+        return;
+    uint16_t *rows = color + (size_t) r0 * w;
+    const MI_U32 bytes = (MI_U32) (r1 - r0) * w * 2;
+    mi.Flush(rows, bytes);
     MI_U16 fence = 0;
     int n = 0;
     for (int i = 0; i < o->n; i++) {
         const GeItem *it = &o->it[i];
-        if (!it->on || !it->layer)
+        if (!it->on || it->layer != layer)
             continue;
         const int x0 = (it->dx * w + 320) / 640, x1 = ((it->dx + it->dw) * w + 320) / 640;
         const int y0 = (it->dy * h + 240) / 480, y1 = ((it->dy + it->dh) * h + 240) / 480;
@@ -827,7 +840,7 @@ void port_ge_underlay_run(uint16_t *color, int w, int h) {
     }
     if (n)
         mi.Wait(TRUE, fence);
-    mi.Flush(color, bytes);
+    mi.Flush(rows, bytes);
     ge_under_n += n;
 }
 
@@ -884,7 +897,7 @@ int port_ge_overlay_add(const GeArgs *a) {
 int port_ge_under_ok(void) {
     return 0;
 }
-void port_ge_underlay_run(uint16_t *color, int w, int h) {
+void port_ge_underlay_run(uint16_t *color, int w, int h, int layer) {
 }
 void port_ge_overlay_cancel(int idx) {
 }
