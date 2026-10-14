@@ -326,7 +326,7 @@ static int ge_sec = -1;      /* the part being filled (the colour buffer being d
 static double ge_copy_ms;    /* (-perf: the copies, game thread) */
 #define GE_HASH 2048
 static struct {
-    uint32_t stamp, gen, color, off;
+    uint32_t stamp, gen, color, color1, off;
     const uint32_t *px;
     int16_t sx, sy, sw, sh;
     uint8_t mode;
@@ -511,21 +511,45 @@ void port_ge_overlay_begin(void) {
     sGeStamp++;
 }
 
+/* the vertex colour at step k of n (the gradient's rows or columns, at their centres) */
+static inline uint32_t ge_lerp(uint32_t c0, uint32_t c1, int k, int n) {
+    if (c0 == c1 || n <= 1)
+        return c0;
+    const uint32_t f = (uint32_t) ((2 * k + 1) * 256 / (2 * n)), g = 256 - f;
+    uint32_t r = 0;
+    for (int s = 0; s < 32; s += 8)
+        r |= ((((c0 >> s) & 255) * g + ((c1 >> s) & 255) * f + 128) >> 8) << s;
+    return r;
+}
+
 int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy, int sw, int sh, int dx, int dy, int dw,
-                        int dh, uint32_t color, int mode) {
+                        int dh, uint32_t c0, uint32_t c1, int grad, int mode) {
     if (ge_sec < 0 || !ge_ok)
         return -1;
     GeOvl *o = &sGeOvl[ge_sec];
+    if (grad == PORT_GE_FLAT)
+        c1 = c0;
+    if (mode == PORT_GE_TEX) {
+        c0 = c1 = 0;
+        grad = PORT_GE_FLAT;
+    } else if (mode == PORT_GE_MOD) {
+        c0 |= 0xFF000000u;   /* (its alpha is not used) */
+        c1 |= 0xFF000000u;
+    }
+    if (c0 == c1)
+        grad = PORT_GE_FLAT;
+    if (!px && grad != PORT_GE_FLAT) {   /* a colour gradient: a strip of it, smoothed by the scaling */
+        const int len = (grad == PORT_GE_ROWS ? dh : dw) / 2;
+        const int n = len < 2 ? 2 : (len > 128 ? 128 : len);
+        sw = grad == PORT_GE_ROWS ? 1 : n;
+        sh = grad == PORT_GE_ROWS ? n : 1;
+    }
     if (o->n >= GE_MAX || sw < 1 || sh < 1 || sw > 1022 || sh > 1022)
         return -1;
-    if (mode == PORT_GE_TEX || mode == PORT_GE_FILL)
-        color = mode == PORT_GE_FILL ? color : 0;
-    else if (mode == PORT_GE_MOD)
-        color |= 0xFF000000u;   /* (its alpha is not used) */
     const int pw = (sw + 2 + 3) & ~3, ph = sh + 2;   /* (rows of a multiple of 16 bytes) */
-    /* the same texels, colour and part already copied in this frame: shared */
-    uint32_t h = gen * 2654435761u ^ color * 40503u ^ (uint32_t) (sx | sy << 10) * 97u ^ (uint32_t) (sw | sh << 10) * 31u ^
-                 (uint32_t) mode;
+    /* the same texels, colours and part already copied in this frame: shared */
+    uint32_t h = gen * 2654435761u ^ c0 * 40503u ^ c1 * 2246822519u ^ (uint32_t) (sx | sy << 10) * 97u ^
+                 (uint32_t) (sw | sh << 10) * 31u ^ (uint32_t) (mode | grad << 4);
     h = (h ^ (h >> 15)) & (GE_HASH - 1);
     int slot = -1;
     for (int k = 0; k < 8; k++) {
@@ -534,8 +558,9 @@ int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy
             slot = (int) j;
             break;
         }
-        if (sGeHash[j].gen == gen && sGeHash[j].px == px && sGeHash[j].color == color && sGeHash[j].mode == mode &&
-            sGeHash[j].sx == sx && sGeHash[j].sy == sy && sGeHash[j].sw == sw && sGeHash[j].sh == sh) {
+        if (sGeHash[j].gen == gen && sGeHash[j].px == px && sGeHash[j].color == c0 && sGeHash[j].color1 == c1 &&
+            sGeHash[j].mode == (uint8_t) (mode | grad << 4) && sGeHash[j].sx == sx && sGeHash[j].sy == sy &&
+            sGeHash[j].sw == sw && sGeHash[j].sh == sh) {
             slot = -2 - (int) j;
             break;
         }
@@ -551,30 +576,46 @@ int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy
         off = o->used;
         o->used += bytes;
         uint32_t *dst = (uint32_t *) (ge_virt[ge_sec] + off);
-        const uint32_t cr = (color >> 16) & 255, cg = (color >> 8) & 255, cb = color & 255, ca = color >> 24;
-        if (!px) {   /* a plain colour */
-            const uint32_t c = ge_texel(color, PORT_GE_TEX, 0, 0, 0, 0);
-            for (int i = 0; i < pw * ph; i++)
-                dst[i] = c;
-        } else {
-            for (int y = 1; y <= sh; y++) {
+        static uint32_t colc[1024];   /* (left to right: the colour of each column) */
+        if (grad == PORT_GE_COLS)
+            for (int x = 0; x < sw; x++)
+                colc[x] = ge_lerp(c0, c1, x, sw);
+        for (int y = 1; y <= sh; y++) {
+            uint32_t *d = dst + (size_t) y * pw;
+            const uint32_t rc = grad == PORT_GE_ROWS ? ge_lerp(c0, c1, y - 1, sh) : c0;
+            if (!px) {   /* a plain colour */
+                if (grad == PORT_GE_COLS)
+                    for (int x = 0; x < sw; x++)
+                        d[x + 1] = ge_texel(colc[x], PORT_GE_TEX, 0, 0, 0, 0);
+                else {
+                    const uint32_t c = ge_texel(rc, PORT_GE_TEX, 0, 0, 0, 0);
+                    for (int x = 0; x < sw; x++)
+                        d[x + 1] = c;
+                }
+            } else {
                 const uint32_t *s = px + (size_t) (sy + y - 1) * tw + sx;
-                uint32_t *d = dst + (size_t) y * pw;
-                for (int x = 0; x < sw; x++)
-                    d[x + 1] = ge_texel(s[x], mode, cr, cg, cb, ca);
-                d[0] = d[1];
-                for (int x = sw + 1; x < pw; x++)
-                    d[x] = d[sw];
+                if (grad == PORT_GE_COLS)
+                    for (int x = 0; x < sw; x++) {
+                        const uint32_t c = colc[x];
+                        d[x + 1] = ge_texel(s[x], mode, (c >> 16) & 255, (c >> 8) & 255, c & 255, c >> 24);
+                    }
+                else
+                    for (int x = 0; x < sw; x++)
+                        d[x + 1] = ge_texel(s[x], mode, (rc >> 16) & 255, (rc >> 8) & 255, rc & 255, rc >> 24);
             }
-            memcpy(dst, dst + pw, (size_t) pw * 4);
-            memcpy(dst + (size_t) (sh + 1) * pw, dst + (size_t) sh * pw, (size_t) pw * 4);
+            d[0] = d[1];
+            for (int x = sw + 1; x < pw; x++)
+                d[x] = d[sw];
         }
+        memcpy(dst, dst + pw, (size_t) pw * 4);
+        memcpy(dst + (size_t) (sh + 1) * pw, dst + (size_t) sh * pw, (size_t) pw * 4);
         if (slot >= 0) {
             sGeHash[slot].stamp = sGeStamp;
             sGeHash[slot].gen = gen;
             sGeHash[slot].px = px;
-            sGeHash[slot].color = color;
-            sGeHash[slot].mode = (uint8_t) mode;
+            sGeHash[slot].color = c0;
+            sGeHash[slot].color1 = c1;
+            sGeHash[slot].mode = (uint8_t) (mode | grad << 4);
             sGeHash[slot].sx = (int16_t) sx;
             sGeHash[slot].sy = (int16_t) sy;
             sGeHash[slot].sw = (int16_t) sw;
@@ -647,7 +688,7 @@ int port_ge_hud_ok(void) {
 void port_ge_overlay_begin(void) {
 }
 int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy, int sw, int sh, int dx, int dy, int dw,
-                        int dh, uint32_t color, int mode) {
+                        int dh, uint32_t c0, uint32_t c1, int grad, int mode) {
     return -1;
 }
 void port_ge_overlay_cancel(int idx) {

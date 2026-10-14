@@ -34,15 +34,20 @@ int port_video_scales(void);         /* video_miyoo.c: any frame size can be sho
 /* video_miyoo.c: the 2D of a frame (HUD, menus) drawn by the 2D engine over the finished
    picture, at 640x480 (see hud_ge_build in gfx_sw.c). mode: 0 the texture, 1 its colour
    times the vertex colour, 2 colour and alpha times the vertex colour, 3 the vertex colour
-   alone (no texture). gen: which upload of the texels (the same gen, the same texels). */
+   alone (no texture). The vertex colour: c0 all over (grad 0), or c0 at the top and c1 at
+   the bottom (grad 1), or c0 at the left and c1 at the right (grad 2). gen: which upload
+   of the texels (the same gen, the same texels). */
 #define PORT_GE_TEX 0
 #define PORT_GE_MOD 1
 #define PORT_GE_MODA 2
 #define PORT_GE_FILL 3
+#define PORT_GE_FLAT 0
+#define PORT_GE_ROWS 1
+#define PORT_GE_COLS 2
 int port_ge_hud_ok(void);
 void port_ge_overlay_begin(void);
 int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy, int sw, int sh, int dx, int dy, int dw,
-                        int dh, uint32_t color, int mode);   /* index, or -1: no room */
+                        int dh, uint32_t c0, uint32_t c1, int grad, int mode);   /* index, or -1: no room */
 void port_ge_overlay_cancel(int idx);
 extern int port_opt_resdin;          /* -resdin: dynamic resolution */
 

@@ -1758,6 +1758,7 @@ static void build_band_owners(void) {
 #define GFX_SW_SKY_FIRST 1   /* (for the bench tools) */
 static __thread int tlSkyMode;   /* 0 normal, 1 record each row's covered span, 2 draw */
 static __thread int tlTrNoDepth;  /* this translucent triangle is in front of every depth written */
+static __thread int tlHudFilt;    /* a 2D piece the cores draw while the 2D engine draws the rest: smoothed like it */
 #define SKY_ROWS 1024
 static int16_t sCovLo[SKY_ROWS], sCovHi[SKY_ROWS];   /* -1 nothing, -2 more than one span */
 
@@ -1948,7 +1949,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
        sprites in the other lists, the HUD has no perspective) */
     const int wraps_ok = (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
     c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo && wraps_ok;
-    if (sMenuFilter && textured && c.uwrap != WR_MIRROR2 && c.uwrap != WR_MIRRORN && c.vwrap != WR_MIRROR2 &&
+    if ((sMenuFilter || tlHudFilt) && textured && c.uwrap != WR_MIRROR2 && c.uwrap != WR_MIRRORN && c.vwrap != WR_MIRROR2 &&
         c.vwrap != WR_MIRRORN)
         c.filt = 1;   /* (a repeat of any size is read as a clamp by the filter: the menus' pictures
                          stay inside their texture; mirrored ones keep the plain sampling) */
@@ -2927,9 +2928,15 @@ static void prefilter_prepare(void) {
    -hudcpu: all of it by the cores. */
 #define HUD_MAX 1024
 typedef struct {
+    const uint32_t *px;          /* what goes to port_ge_overlay_add */
+    int tw, sx, sy, sw, sh, dx, dy, dw, dh, grad, mode;
+    uint32_t gen, c0, c1;
+} GeArgs;
+typedef struct {
     uint32_t i0, n;              /* sorted triangles */
     float x0, y0, x1, y1;        /* bounding box, 640x480 */
-    int ge;                      /* the engine's piece number, -1 = the cores */
+    int ge;                      /* the engine's piece number, -1 = the cores; (before adding: 0 = the engine) */
+    GeArgs a;
 } HudItem;
 static HudItem sHudItems[HUD_MAX];
 static uint8_t sTrSkip[BUCKET_VERTS / 3];
@@ -2945,26 +2952,95 @@ static int px_from(float a) {
     return (int) ceilf(a - 0.5f);
 }
 
-/* the 2D engine draws these two triangles: its piece number, or -1 (why: stGeWhy) */
-static int hud_quad(const dc_fast_t *v, const TrSort *e, const RState *st) {
-    if (!e[0].front || !e[1].front) {
-        stGeWhy[4]++;
-        return -1;
+/* -perf: the first kinds of 2D pieces left to the cores, once each (what to take on next) */
+static void hud_why_note(int why, const dc_fast_t *v, int n, const RState *st) {
+    static uint32_t seen[48];
+    static int nseen;
+    if (!port_opt_perf || nseen >= 48)
+        return;
+    uint32_t key = (uint32_t) why << 24 | (uint32_t) st->texenv << 20 | (uint32_t) (st->tex != 0) << 19 |
+                   (uint32_t) st->fog << 18 | (uint32_t) st->blend_src << 14 | (uint32_t) st->blend_dst << 10 |
+                   (uint32_t) (n & 3) << 8;
+    for (int i = 0; i < 3 * n; i++)
+        key ^= (v[i].color.packed != v[0].color.packed) << 7 | ((v[i].pad0.vertindex & 0x00FFFFFFu) != 0) << 6;
+    for (int i = 0; i < nseen; i++)
+        if (seen[i] == key)
+            return;
+    seen[nseen++] = key;
+    static const char *names[] = { "nao retangulo", "cor/mistura", "textura", "debaixo de outro", "atras da cena", "sem memoria" };
+    fprintf(stderr, "2d nos nucleos (%s): textura %s modo %d mistura %d/%d nevoa %d, %d triangulos, x %.1f..%.1f y %.1f..%.1f z %.4f\n",
+            names[why], st->tex ? "sim" : "nao", st->texenv, st->blend_src, st->blend_dst, st->fog, n, v[0].vert.x,
+            v[1].vert.x, v[0].vert.y, v[1].vert.y, v[0].vert.z);
+    for (int i = 0; i < 3 * n; i++)
+        fprintf(stderr, "   v%d: x %.2f y %.2f u %.4f v %.4f cor %08x extra %08x\n", i, v[i].vert.x, v[i].vert.y,
+                v[i].texture.u, v[i].texture.v, (unsigned) v[i].color.packed, (unsigned) v[i].pad0.vertindex);
+}
+
+/* the opaque and punch-through triangles that could hide 2D (the menus' own opaque pictures
+   and boxes: drawn before every translucent one, they hide what the game drew earlier at a
+   lower 2D depth), for pieces not in front of the whole scene. Built when first needed. */
+#define OCC_MAX 8192
+typedef struct {
+    float x0, y0, x1, y1, z;
+} Occ;
+static Occ sOcc[OCC_MAX];
+static int sOccN = -1;   /* -1 not built, -2 too many */
+static int sPanesNow;    /* (a growing pane this frame: no depth shortcuts) */
+
+static int hud_front(const TrSort *e, const dc_fast_t *v, float x0, float y0, float x1, float y1) {
+    if (e[0].front && e[1].front)
+        return 1;
+    if (sPanesNow)
+        return 0;
+    const float z = fminf(fminf(fminf(v[0].vert.z, v[1].vert.z), fminf(v[2].vert.z, v[3].vert.z)), fminf(v[4].vert.z, v[5].vert.z));
+    if (sOccN == -1) {
+        sOccN = 0;
+        for (int k = 0; k < 2 && sOccN >= 0; k++) {
+            const Bucket *ob = &sRenB[k == 0 ? KIND_OP : KIND_PT];
+            for (uint32_t i = 0; i + 2 < ob->nverts; i += 3) {
+                const dc_fast_t *w = &ob->verts[i];
+                float zm = fmaxf(fmaxf(w[0].vert.z, w[1].vert.z), w[2].vert.z);
+                zm += fabsf(zm) * 0.01f + 1e-6f;   /* (the depth interpolation's margin, as zfront) */
+                if (!(zm >= 0.5f))
+                    continue;   /* (far 3D: below any 2D) */
+                if (sOccN == OCC_MAX) {
+                    sOccN = -2;
+                    break;
+                }
+                Occ *o = &sOcc[sOccN++];
+                o->x0 = fminf(fminf(w[0].vert.x, w[1].vert.x), w[2].vert.x);
+                o->x1 = fmaxf(fmaxf(w[0].vert.x, w[1].vert.x), w[2].vert.x);
+                o->y0 = fminf(fminf(w[0].vert.y, w[1].vert.y), w[2].vert.y);
+                o->y1 = fmaxf(fmaxf(w[0].vert.y, w[1].vert.y), w[2].vert.y);
+                o->z = zm;
+            }
+        }
     }
+    if (sOccN < 0)
+        return 0;
+    for (int i = 0; i < sOccN; i++) {
+        const Occ *o = &sOcc[i];
+        if (o->z >= z && o->x0 < x1 && x0 < o->x1 && o->y0 < y1 && y0 < o->y1)
+            return 0;
+    }
+    return 1;
+}
+
+/* can the 2D engine draw these two triangles? 1 and its arguments, or 0 (why: stGeWhy) */
+static int hud_quad_try(const dc_fast_t *v, const TrSort *e, const RState *st, int *why, GeArgs *a) {
     if (st->fog || st->blend_src != GFX_BLENDF_SRCALPHA || st->blend_dst != GFX_BLENDF_INVSRCALPHA) {
-        stGeWhy[1]++;
+        *why = 1;
         return -1;
     }
-    const uint32_t col = v[0].color.packed;
     float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
     for (int i = 0; i < 6; i++) {
-        if (v[i].color.packed != col || (v[i].pad0.vertindex & 0x00FFFFFFu)) {
-            stGeWhy[1]++;
+        if (v[i].pad0.vertindex & 0x00FFFFFFu) {   /* (an offset colour) */
+            *why = 1;
             return -1;
         }
         const float x = v[i].vert.x, y = v[i].vert.y;
         if (!(x == x) || !(y == y)) {
-            stGeWhy[0]++;
+            *why = 0;
             return -1;
         }
         if (x < x0) x0 = x;
@@ -2972,17 +3048,27 @@ static int hud_quad(const dc_fast_t *v, const TrSort *e, const RState *st) {
         if (y < y0) y0 = y;
         if (y > y1) y1 = y;
     }
-    /* every corner one of the rectangle's, all four there, the texture following the axes */
+    /* every corner one of the rectangle's, all four there, the texture and the colour
+       the same wherever a corner repeats, the texture following the axes */
     float uL = 0, uR = 0, vT = 0, vB = 0;
+    uint32_t cc[4] = { 0, 0, 0, 0 };
     int seen = 0, haveL = 0, haveR = 0, haveT = 0, haveB = 0;
     for (int i = 0; i < 6; i++) {
         const int l = near_eq(v[i].vert.x, x0), r = near_eq(v[i].vert.x, x1);
         const int tp = near_eq(v[i].vert.y, y0), bt = near_eq(v[i].vert.y, y1);
         if ((!l && !r) || (!tp && !bt)) {
-            stGeWhy[0]++;
+            *why = 0;
             return -1;
         }
-        seen |= 1 << ((r ? 1 : 0) | (bt ? 2 : 0));
+        const int corner = (r ? 1 : 0) | (bt ? 2 : 0);
+        if ((seen >> corner) & 1) {
+            if (cc[corner] != v[i].color.packed) {
+                *why = 1;
+                return -1;
+            }
+        }
+        cc[corner] = v[i].color.packed;
+        seen |= 1 << corner;
         const float u = v[i].texture.u, w = v[i].texture.v;
         int bad = 0;
         if (l) { bad |= haveL && fabsf(u - uL) > 1e-4f; uL = u; haveL = 1; }
@@ -2990,26 +3076,51 @@ static int hud_quad(const dc_fast_t *v, const TrSort *e, const RState *st) {
         if (tp) { bad |= haveT && fabsf(w - vT) > 1e-4f; vT = w; haveT = 1; }
         else    { bad |= haveB && fabsf(w - vB) > 1e-4f; vB = w; haveB = 1; }
         if (bad) {
-            stGeWhy[0]++;
+            *why = 0;
             return -1;
         }
     }
     const int dx = px_from(x0), dy = px_from(y0), dw = px_from(x1) - dx, dh = px_from(y1) - dy;
     if (seen != 15 || dw < 1 || dh < 1 || dx < 0 || dy < 0 || dx + dw > 640 || dy + dh > 480) {
-        stGeWhy[0]++;
+        *why = 0;
         return -1;
     }
+    if (!hud_front(e, v, x0, y0, x1, y1)) {
+        *why = 4;
+        return -1;
+    }
+    /* the colour: one, or changing from top to bottom (the letters of the menus and the
+       race's messages: white at the top, their colour at the bottom) or from left to right.
+       Both triangles then interpolate it the same way: it goes into the engine's copy, row
+       by row (or column by column) */
+    int grad;
+    uint32_t c0 = cc[0], c1 = cc[0];
+    if (cc[0] == cc[1] && cc[0] == cc[2] && cc[0] == cc[3])
+        grad = PORT_GE_FLAT;
+    else if (cc[0] == cc[1] && cc[2] == cc[3]) {
+        grad = PORT_GE_ROWS;
+        c1 = cc[2];
+    } else if (cc[0] == cc[2] && cc[1] == cc[3]) {
+        grad = PORT_GE_COLS;
+        c1 = cc[1];
+    } else {
+        *why = 1;
+        return -1;
+    }
+    a->dx = dx; a->dy = dy; a->dw = dw; a->dh = dh;
+    a->c0 = c0; a->c1 = c1; a->grad = grad;
     const struct SwTex *tx = st->tex ? &sTexRd[st->tex] : NULL;
-    int r;
     if (!tx || !tx->px) {   /* a plain colour (with its alpha) */
-        r = port_ge_overlay_add(NULL, 0, 0, 0, 0, 1, 1, dx, dy, dw, dh, col, PORT_GE_FILL);
-        if (r < 0)
-            stGeWhy[5]++;
-        return r;
+        a->px = NULL;
+        a->tw = 0; a->gen = 0; a->sx = a->sy = 0; a->sw = a->sh = 1;
+        a->mode = PORT_GE_FILL;
+        return 1;
     }
     int mode;
-    if (st->texenv == GFX_TEXENV_REPLACE || col == 0xFFFFFFFFu)
-        mode = st->texenv == GFX_TEXENV_DECAL ? -1 : PORT_GE_TEX;
+    if (st->texenv == GFX_TEXENV_DECAL)
+        mode = -1;
+    else if (st->texenv == GFX_TEXENV_REPLACE || (c0 == 0xFFFFFFFFu && c1 == 0xFFFFFFFFu))
+        mode = PORT_GE_TEX;
     else if (st->texenv == GFX_TEXENV_MODULATE)
         mode = PORT_GE_MOD;
     else if (st->texenv == GFX_TEXENV_MODULATEALPHA)
@@ -3020,18 +3131,48 @@ static int hud_quad(const dc_fast_t *v, const TrSort *e, const RState *st) {
     const int sx = (int) lroundf(su0), sy = (int) lroundf(sv0);
     const int sw = (int) lroundf(su1) - sx, sh = (int) lroundf(sv1) - sy;
     if (mode < 0 || sw < 1 || sh < 1 || sx < 0 || sy < 0 || sx + sw > tx->w || sy + sh > tx->h) {
-        stGeWhy[2]++;
+        *why = 2;
         return -1;
     }
-    r = port_ge_overlay_add(tx->px, tx->w, tx->gen, sx, sy, sw, sh, dx, dy, dw, dh, col, mode);
-    if (r < 0)
-        stGeWhy[5]++;
-    return r;
+    a->px = tx->px;
+    a->tw = tx->w; a->gen = tx->gen;
+    a->sx = sx; a->sy = sy; a->sw = sw; a->sh = sh;
+    a->mode = mode;
+    return 1;
+}
+
+static int hud_quad(const dc_fast_t *v, const TrSort *e, const RState *st, GeArgs *a) {
+    int why = 0;
+    if (hud_quad_try(v, e, st, &why, a) > 0)
+        return 0;
+    stGeWhy[why]++;
+    hud_why_note(why, v, 2, st);
+    return -1;
+}
+
+/* the game's order, from piece `top` down: an engine piece under a later piece of the
+   cores' goes to the cores (and then, in turn, what is under it) */
+static void hud_order(int top) {
+    for (int k = top; k >= 0; k--) {
+        const HudItem *c = &sHudItems[k];
+        if (c->ge >= 0)
+            continue;
+        for (int j = 0; j < k; j++) {
+            HudItem *g = &sHudItems[j];
+            if (g->ge >= 0 && g->x0 < c->x1 && c->x0 < g->x1 && g->y0 < c->y1 && c->y0 < g->y1) {
+                if (g->ge > 0)
+                    port_ge_overlay_cancel(g->ge - 1);
+                g->ge = -1;
+                stGeWhy[3]++;
+            }
+        }
+    }
 }
 
 static void hud_ge_build(void) {
     memset(sTrSkip, 0, sTrSkipHi);
     sTrSkipHi = 0;
+    sOccN = -1;
     port_ge_overlay_begin();
     if (sNoGe || sCapF || port_opt_hudcpu || sTrHud >= sTrSortN || !port_ge_hud_ok())
         return;
@@ -3055,44 +3196,49 @@ static void hud_ge_build(void) {
         }
         it->x0 = x0; it->y0 = y0; it->x1 = x1; it->y1 = y1;
         if (paired) {
-            it->ge = hud_quad(v, e, &b->batch[e->batch].st);
+            it->ge = hud_quad(v, e, &b->batch[e->batch].st, &it->a);
         } else {
             it->ge = -1;
             stGeWhy[0]++;
+            hud_why_note(0, v, 1, &b->batch[e->batch].st);
         }
         i += it->n;
     }
     if (i < sTrSortN)   /* (more pieces than HUD_MAX: all by the cores, in the game's order) */
         for (int k = 0; k < m; k++)
-            if (sHudItems[k].ge >= 0) {
-                port_ge_overlay_cancel(sHudItems[k].ge);
-                sHudItems[k].ge = -1;
-            }
-    /* the game's order: an engine piece under a later piece of the cores' goes to the cores */
-    for (int k = m - 1; k >= 0; k--) {
-        const HudItem *c = &sHudItems[k];
-        if (c->ge >= 0)
+            sHudItems[k].ge = -1;
+    hud_order(m - 1);
+    /* the texels copied for the engine only now, for the pieces it really draws */
+    for (int k = 0; k < m; k++) {
+        HudItem *it = &sHudItems[k];
+        if (it->ge < 0)
             continue;
-        for (int j = 0; j < k; j++) {
-            HudItem *g = &sHudItems[j];
-            if (g->ge >= 0 && g->x0 < c->x1 && c->x0 < g->x1 && g->y0 < c->y1 && c->y0 < g->y1) {
-                port_ge_overlay_cancel(g->ge);
-                g->ge = -1;
-                stGeWhy[3]++;
-            }
+        const GeArgs *a = &it->a;
+        const int r = port_ge_overlay_add(a->px, a->tw, a->gen, a->sx, a->sy, a->sw, a->sh, a->dx, a->dy, a->dw, a->dh,
+                                          a->c0, a->c1, a->grad, a->mode);
+        if (r >= 0) {
+            it->ge = r + 1;
+            continue;
         }
+        it->ge = -1;   /* no room in the engine's memory: the cores, and what is under it too */
+        stGeWhy[5]++;
+        hud_order(k);
     }
+    /* what the cores still draw of the 2D (sTrSkip 2) is smoothed by them, like the engine's
+       pieces (the minimap under the karts' markers, rotated, that the engine cannot draw) */
     for (int k = 0; k < m; k++) {
         const HudItem *it = &sHudItems[k];
         if (it->ge < 0) {
             stGeCpuTris += it->n;
-            continue;
+            memset(sTrSkip + it->i0, 2, it->n);
+        } else {
+            sTrSkip[it->i0] = sTrSkip[it->i0 + 1] = 1;
+            stGeItems++;
         }
-        sTrSkip[it->i0] = sTrSkip[it->i0 + 1] = 1;
-        sTrSkipHi = it->i0 + 2;
-        stGeItems++;
     }
+    memset(sTrSkip + i, 2, sTrSortN - i);
     stGeCpuTris += sTrSortN - i;
+    sTrSkipHi = sTrSortN;
 }
 
 static void sort_tr(void) {
@@ -3137,6 +3283,7 @@ static void sort_tr(void) {
                 panes = 1;
                 break;
             }
+    sPanesNow = panes;
     int zok = sUseNeon && nt && !panes;
     float zmin = 1e30f, zmax = -1e30f;
     const Bucket *ob[2] = { &sRenB[KIND_OP], &sRenB[KIND_PT] };
@@ -3192,13 +3339,15 @@ static void sort_tr(void) {
 static void raster_tr_sorted(uint32_t from, uint32_t to) {
     Bucket *b = &sRenB[KIND_TR];
     for (uint32_t i = from; i < to; i++) {
-        if (sTrSkip[i])   /* (drawn by the 2D engine over the finished picture: hud_ge_build) */
+        if (sTrSkip[i] == 1)   /* (drawn by the 2D engine over the finished picture: hud_ge_build) */
             continue;
+        tlHudFilt = sTrSkip[i] == 2 && port_opt_filter;   /* (the cores' filter is only set up with -filtro*) */
         const dc_fast_t *v = &b->verts[sTrSort[i].seq];
         tlTrNoDepth = sTrSort[i].front;
         raster_tri(&v[0], &v[1], &v[2], &b->batch[sTrSort[i].batch].st, KIND_TR);
     }
     tlTrNoDepth = 0;
+    tlHudFilt = 0;
 }
 
 static void raster_sky(void) {
