@@ -83,7 +83,7 @@ You can edit its `Arguments` line:
 |---|---|
 | `-hires` | Renders at 640x480 (without it: 320x240, faster and blurrier) |
 | `-60fps` | Single-player races at up to 60 FPS (without it: 30 FPS, as on the N64) |
-| `-resdin` | Dynamic resolution (with `-hires`), in the races only: smaller frames only while a frame doesn't fit in 1/60 s (with `-filtroleve`, below the smallest size the exact filter steps out) |
+| `-resdin` | Dynamic resolution (with `-hires`), in the races only: smaller frames only while a frame doesn't fit in 1/60 s |
 | `-filtroleve` | Texture filter on the road and other 3D surfaces, worked out in advance (looks like the N64's filter, costs about half as much) |
 | `-filtro` | The N64's texture filter itself, computed as it draws (slower) |
 | `-hudcpu` | The HUD and the menus' 2D drawn by the CPU cores only (without it, their large pictures are drawn by the chip's 2D engine at 640x480, smoothed) |
@@ -107,9 +107,7 @@ You can edit its `Arguments` line:
   the booster pads' moving arrows; dynamic resolution only in the races (the menus always at full size), the
   menus' large pictures drawn by the 2D engine under the letters too; no more sound cuts when the menu screen
   changes (the menus' pictures are decompressed once); faster scenes with many layers (D.K.'s Jungle Parkway
-  bridge): the solid surfaces are drawn nearest first and what is hidden behind them is skipped; when even the
-  smallest dynamic resolution is late, the exact texture filter in front of the camera steps out for a moment
-  (the lighter filter stays).
+  bridge): the solid surfaces are drawn nearest first and what is hidden behind them is skipped.
 - **v1.1.0** - Save states and Game Switcher integration (Menu, Menu+R2/L2), save on power-off with automatic
   resume, low battery warning icon without flicker and automatic shutdown, faster texture filter (`-filtroleve`,
   the new default) with the exact filter near the camera, dynamic resolution tuning, fixed stutters, fixed

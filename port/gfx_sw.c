@@ -354,7 +354,7 @@ static float sCore0Share;   /* defined with the band split below */
 static double stLeadMs, stPresentMs, stWaitMs;   /* -paralelo: core 1 alone, showing the frame, core 0 waiting for core 1 */
 static int sPipe;                       /* -paralelo on (see pipe_init) */
 static volatile int sCpuMhz;            /* -perf: the CPU clock as measured (watchdog thread) */
-static int sResFrames[5];               /* -resdin: frames drawn at each size since the last report (4: 448x336 without the 3D filter) */
+static int sResFrames[4];               /* -resdin: frames drawn at each size since the last report */
 /* this frame only, for the hitch log (gfx_wm_miyoo.c): where a slow frame's time went */
 static SwFrameStats sFS;
 void gfx_sw_frame_stats(SwFrameStats *out) {
@@ -429,8 +429,8 @@ void gfx_sw_perf_report(int frames, double ms) {
         port_opt_near_elim = near[mode];
     }
     if (port_opt_resdin) {
-        fprintf(stderr, "perf resdin: quadros em 640x480 %d  576x432 %d  512x384 %d  448x336 %d  448x336 so filtro pronto %d\n",
-                sResFrames[0], sResFrames[1], sResFrames[2], sResFrames[3], sResFrames[4]);
+        fprintf(stderr, "perf resdin: quadros em 640x480 %d  576x432 %d  512x384 %d  448x336 %d\n",
+                sResFrames[0], sResFrames[1], sResFrames[2], sResFrames[3]);
         memset(sResFrames, 0, sizeof(sResFrames));
     }
     memset(stPhase, 0, sizeof(stPhase));
@@ -1869,7 +1869,6 @@ static uint32_t sky_fill_row(const TriCtx *c, int py, int xs, int xe, const floa
 /* -filtro on a translucent surface: one that writes depth on the N64 (Z_UPD), with a modulated
    texture. That is the ice of Sherbet Land (bilinear on the N64, like the road); smoke, item
    boxes, water and the kart effects do not write depth and stay unfiltered. */
-static int sFiltOff;   /* -resdin, its last step: this frame's 3D without the exact filter (resdin_pick) */
 static inline int tr_ground(const RState *st) {
     return st->depth_write && (st->texenv == GFX_TEXENV_MODULATE || st->texenv == GFX_TEXENV_MODULATEALPHA);
 }
@@ -2018,14 +2017,7 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
     c.elim = port_opt_filter_lite && c.pf ? port_opt_near_elim : 8192;
     c.pfs = tpfs;
     c.pf1 = c.pf ? c.pf + ((size_t) c.tw << tpfs) * ((size_t) c.th << tpfs) : NULL;
-    if (sFiltOff && persp_geo && c.filt) {
-        /* -resdin's last step: only the filter worked out in advance (no exact filter in
-           front of the camera; a texture without it, one that changes all the time, plain) */
-        c.elim = 0;
-        if (!c.pf)
-            c.filt = 0;
-    }
-    if (port_opt_filter && kind == KIND_OP && persp_geo && !c.filt && !sFiltOff) {
+    if (port_opt_filter && kind == KIND_OP && persp_geo && !c.filt) {
         /* (a 3D opaque texture the filter cannot take: noted once per kind, for the log) */
         static uint32_t seen[16];
         static int nseen;
@@ -3997,18 +3989,14 @@ static void pipe_finish(int adapt) {
    Jungle Parkway, three steps took a quarter of a second at 45 fps, felt as a stutter);
    when the estimate one step up (the drawing grows with the pixels, the rest does not)
    fits in 15 ms they grow back, after 30 frames without a change.
-   -filtro*: one more step below the smallest size, the 3D with only the filter worked out in
-   advance (no exact filter; the HUD keeps its own). Measured at the bridge of D.K.'s Jungle
-   Parkway: 448x336 with -filtroleve 48-57 fps, with no filter at all 57-60; the planks
-   themselves are not filtered (a mirrored texture), the cost is the filtered walls and road
-   around them. Back up when the estimate with the whole filter, at most about 1.2 times the
-   drawing (the run without any), fits. */
-static const int kResW[5] = { 640, 576, 512, 448, 448 }, kResH[5] = { 480, 432, 384, 336, 336 };
-#define RES_FILT_COST 1.2
+   (A step below the smallest size with only the filter worked out in advance was tried: at
+   D.K.'s Jungle Parkway's bridge the exact filter draws no pixels, the cost there is the one
+   worked out in advance on the walls and road, so it gained nothing; elsewhere it showed the
+   filter's cells. Without any filter the bridge ran at 57-60 fps against 48-57.) */
+static const int kResW[4] = { 640, 576, 512, 448 }, kResH[4] = { 480, 432, 384, 336 };
 static int sResLevel, sResHold, sResDownHold;
 static double sResEma, sResLastT, sResLastPacing, sResWait;
 static void resdin_pick(void) {
-    sFiltOff = 0;
     if (!port_opt_resdin && sResLevel) {   /* (switched off while smaller: back to full size) */
         sResLevel = 0;
         port_render_w = kResW[0];
@@ -4048,18 +4036,14 @@ static void resdin_pick(void) {
     /* (at 30 fps -- the menus, 2-4 player races -- a frame has twice the time) */
     extern int force_30fps;
     const double budget = force_30fps ? 28.0 : 16.4, spike = force_30fps ? 33.0 : 20.0, up_fit = force_30fps ? 24.0 : 15.0;   /* (at 30 fps a step up waits for more room: frames over 1/30 s are felt) */
-    const int lowest = port_opt_filter && !port_opt_exact ? 4 : 3;
-    if (sResLevel > lowest)
-        sResLevel = lowest;
-    if (sResLevel < lowest && !sResDownHold && (sResEma > budget || c > spike)) {
+    if (sResLevel < 3 && !sResDownHold && (sResEma > budget || c > spike)) {
         sResLevel++;
         sResDownHold = 4;
         sResHold = 30;
     } else if (sResLevel > 0 && !sResHold) {
         const double cur = (double) kResW[sResLevel] * kResH[sResLevel], up = (double) kResW[sResLevel - 1] * kResH[sResLevel - 1];
         const double fixed = 2.5;   /* the game and the display list: they do not shrink with the frame */
-        const double grow = sResLevel == 4 ? RES_FILT_COST : up / cur;
-        if ((sResEma - fixed) * grow + fixed < up_fit) {
+        if ((sResEma - fixed) * (up / cur) + fixed < up_fit) {
             sResLevel--;
             sResHold = 30;
         }
@@ -4067,7 +4051,6 @@ static void resdin_pick(void) {
     sResFrames[sResLevel]++;
     port_render_w = kResW[sResLevel];
     port_render_h = kResH[sResLevel];
-    sFiltOff = sResLevel == 4;
 }
 
 /* -paralelo: the lists just filled become the frame to draw; the textures it uses are
