@@ -363,18 +363,19 @@ void gfx_sw_frame_stats(SwFrameStats *out) {
 static volatile int sMainStage, sWorkerStage;
 static volatile unsigned sFramesDone;
 
-static uint32_t stGeItems, stGeCpuTris, stGeWhy[7];
+static uint32_t stGeItems, stGeCpuTris, stGeWhy[8];
 #define GE_MIN_AREA 2048
+#define GE_BUDGET_US 5000
 void gfx_sw_perf_report(int frames, double ms) {
     (void) ms;
     if (frames <= 0)
         return;
     if (stGeItems || stGeCpuTris)
         fprintf(stderr, "perf 2d: %.1f pecas/quadro pelo MI_GFX, %.1f triangulos 2D pelos nucleos (nao retangulo %.1f, "
-                        "cor/mistura %.1f, textura %.1f, debaixo de outro %.1f, atras da cena %.1f, sem memoria %.1f, pequeno %.1f)\n",
+                        "cor/mistura %.1f, textura %.1f, debaixo de outro %.1f, atras da cena %.1f, sem memoria %.1f, pequeno %.1f, fora do tempo %.1f)\n",
                 (double) stGeItems / frames, (double) stGeCpuTris / frames, (double) stGeWhy[0] / frames,
                 (double) stGeWhy[1] / frames, (double) stGeWhy[2] / frames, (double) stGeWhy[3] / frames,
-                (double) stGeWhy[4] / frames, (double) stGeWhy[5] / frames, (double) stGeWhy[6] / frames);
+                (double) stGeWhy[4] / frames, (double) stGeWhy[5] / frames, (double) stGeWhy[6] / frames, (double) stGeWhy[7] / frames);
     stGeItems = stGeCpuTris = 0;
     memset(stGeWhy, 0, sizeof stGeWhy);
     fprintf(stderr, "perf gfx: tris %u (op %u pt %u tr %u)  pixels %u  tex uploads %u  per frame | walk %.2f  raster %.2f (core0 %.2f core1 %.2f) ms/frame  %dx%d\n",
@@ -2872,9 +2873,45 @@ static int pf_job_step(double until) {
     sPfJob.active = 0;
     return 1;
 }
+/* a mirrored texture that changes too often for the filter worked out in advance (the
+   booster pads' moving arrows: new texels every frame) still gets its mirrored copy, made
+   at once (small: at most 128x64): the exact filter then reads it as a plain repeat. Before
+   this it had no filter at all (the exact filter does not mirror). */
+static void mirror_bake_now(void) {
+    for (int k = 0; k < 2; k++) {
+        const Bucket *b = &sRenB[k == 0 ? KIND_OP : KIND_TR];
+        for (int i = 0; i < b->nbatch; i++) {
+            const RState *st = &b->batch[i].st;
+            const int axes = (st->mirru && !st->clampu) | ((st->mirrv && !st->clampv) << 1);
+            if (!axes || !st->tex || !b->batch[i].count || (k == 1 && !tr_ground(st)))
+                continue;
+            struct SwTex *t = &sTex[st->tex];
+            if (!t->px || !t->pfnever || t->mpx || t->w > 64 || t->h > 64 || (t->w & (t->w - 1)) || (t->h & (t->h - 1)))
+                continue;
+            const int w = t->w << (axes & 1), h = t->h << ((axes >> 1) & 1);
+            uint32_t *m = malloc((size_t) w * h * 4);
+            if (!m)
+                continue;
+            for (int y = 0; y < h; y++) {
+                const int sy = y < t->h ? y : 2 * t->h - 1 - y;
+                for (int x = 0; x < w; x++) {
+                    const int sx = x < t->w ? x : 2 * t->w - 1 - x;
+                    m[y * w + x] = t->px[sy * t->w + sx];
+                }
+            }
+            t->mpx = m;
+            t->mw = (uint16_t) w;
+            t->mh = (uint16_t) h;
+            t->mbake = (uint8_t) axes;
+            t->mpf = NULL;
+        }
+    }
+}
+
 static void prefilter_prepare(void) {
     if (!port_opt_filter || port_opt_exact)
         return;
+    mirror_bake_now();
     const double t0 = port_now_ms(), until = t0 + PF_BUDGET_MS;
     int built = 0;
     for (;;) {
@@ -3224,6 +3261,23 @@ static void hud_ge_build(void) {
         if (it->ge >= 0 && it->a.dw * it->a.dh < GE_MIN_AREA) {
             it->ge = -1;
             stGeWhy[6]++;
+        }
+    }
+    /* and a time budget: the engine's pieces are drawn by the flip thread before the flip,
+       and a frame of them past GE_BUDGET_US (measured: about 35 us a call plus 4 ns a
+       pixel) pushed the flip past the next refresh (the Player Select screen: 152 pieces,
+       14 ms). What does not fit stays on the cores, in the game's order. */
+    {
+        int us = 0;
+        for (int k = 0; k < m; k++) {
+            HudItem *it = &sHudItems[k];
+            if (it->ge < 0)
+                continue;
+            us += 35 + it->a.dw * it->a.dh / 250;
+            if (us > GE_BUDGET_US) {
+                it->ge = -1;
+                stGeWhy[7]++;
+            }
         }
     }
     hud_order(m - 1);

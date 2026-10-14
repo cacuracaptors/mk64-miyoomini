@@ -315,6 +315,13 @@ typedef struct {
     GeItem it[GE_MAX];
     int n;
     uint32_t used;
+    /* the copies made into this part, in order (what its memory holds): a frame that makes
+       the same copies at the same places as the last one here (three frames before: a
+       screen that does not change) leaves them as they are */
+    GeArgs ca[2][GE_MAX];
+    uint32_t coff[2][GE_MAX];
+    int cn[2], cur;
+    uint32_t dmin, dmax;   /* what was written this frame (flushed for the engine) */
 } GeOvl;
 static GeOvl sGeOvl[3];
 static MI_PHY ge_phys[3];
@@ -543,8 +550,13 @@ int port_ge_hud_ok(void) {
 
 void port_ge_overlay_begin(void) {
     ge_sec = cur_idx;
-    sGeOvl[ge_sec].n = 0;
-    sGeOvl[ge_sec].used = 0;
+    GeOvl *o = &sGeOvl[ge_sec];
+    o->n = 0;
+    o->used = 0;
+    o->cur ^= 1;
+    o->cn[o->cur] = 0;
+    o->dmin = ~0u;
+    o->dmax = 0;
     sGeStamp++;
 }
 
@@ -630,9 +642,21 @@ int port_ge_overlay_add(const GeArgs *in) {
         const uint32_t bytes = ((uint32_t) pw * ph * 4 + 63) & ~63u;
         if (o->used + bytes > ge_cap)
             return -1;
-        const double t0 = port_opt_perf ? port_now_ms() : 0;
         off = o->used;
         o->used += bytes;
+        const int c = o->cn[o->cur], pv = o->cur ^ 1;
+        const int same = c < o->cn[pv] && o->coff[pv][c] == off && ge_same(&o->ca[pv][c], &a);
+        if (c < GE_MAX) {
+            o->ca[o->cur][c] = a;
+            o->coff[o->cur][c] = off;
+            o->cn[o->cur] = c + 1;
+        }
+        if (!same) {
+        const double t0 = port_opt_perf ? port_now_ms() : 0;
+        if (off < o->dmin)
+            o->dmin = off;
+        if (off + bytes > o->dmax)
+            o->dmax = off + bytes;
         uint32_t *dst = (uint32_t *) (ge_virt[ge_sec] + off);
         static uint32_t colc[1024], colo[1024];   /* (left to right: the colours of each column) */
         static int colx[1024];                    /* (and its texel column) */
@@ -672,13 +696,14 @@ int port_ge_overlay_add(const GeArgs *in) {
             if (y == sh)
                 memcpy(dst + (size_t) (sh + 1) * pw, rowb, (size_t) pw * 4);
         }
+        if (port_opt_perf)
+            ge_copy_ms += port_now_ms() - t0;
+        }
         if (slot >= 0) {
             sGeHash[slot].stamp = sGeStamp;
             sGeHash[slot].a = a;
             sGeHash[slot].off = off;
         }
-        if (port_opt_perf)
-            ge_copy_ms += port_now_ms() - t0;
     }
     const int dx = a.dx, dy = a.dy, dw = a.dw, dh = a.dh;
     GeItem *it = &o->it[o->n];
@@ -734,7 +759,8 @@ static int ge_take(int idx) {
     GeOvl *o = &sGeOvl[idx];
     if (!o->n)
         return -1;
-    mi.Flush(ge_virt[idx], o->used);   /* (the copies are in the CPU cache) */
+    if (o->dmax > o->dmin)   /* (the new copies are in the CPU cache) */
+        mi.Flush(ge_virt[idx] + o->dmin, o->dmax - o->dmin);
     return idx;
 }
 #else
@@ -958,14 +984,26 @@ static void *flip_proc(void *arg) {
                 continue;
             }
             fast = 0;
+            int missed = 0;
             if (last_tick != 0) {
                 double d = now - last_tick;
                 if (d < tmin) tmin = d;
                 if (d > tmax) tmax = d;
+                /* a pass that took more than one refresh (a long copy and 2D before the
+                   flip, the menus' big pictures) went past a vsync without ticking: the
+                   game's clock (its 30 fps beat, the sound) gets those ticks now instead of
+                   losing them (it stuttered and the sound ran dry) */
+                missed = (int) (d / 16.68 + 0.5) - 1;
+                if (missed > 3)
+                    missed = 3;
             }
             last_tick = now;
-            ticks++;
             port_flip_stage = 5;   /* game clock tick */
+            for (; missed > 0; missed--) {
+                ticks++;
+                vsync_cb();
+            }
+            ticks++;
             vsync_cb();
             port_flip_stage = 6;
         }
