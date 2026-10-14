@@ -1470,8 +1470,9 @@ static inline __attribute__((always_inline)) void nv_lerp8(uint32_t *out, const 
 
 /* -filtro in the span: the opaque list, and the translucent list's modulated textures (the
    ice of Sherbet Land, see raster_tri); the other translucent spans do not get the code */
-#define FILT_SPAN(OUT, TEX) ((OUT) == KIND_OP || ((OUT) == KIND_TR && \
-                             ((TEX) == GFX_TEXENV_MODULATE || (TEX) == GFX_TEXENV_MODULATEALPHA)))
+#define FILT_SPAN(OUT, TEX) ((OUT) == KIND_OP || (OUT) == KIND_PT || (OUT) == KIND_TR)
+/* (outside the races any list can be filtered: see sMenuFilter; in a race c->filt is only set
+   for the lists above, so the races draw exactly as before) */
 static inline __attribute__((always_inline)) uint32_t nv_span(const TriCtx *c, int py, int xs, int xe, const float *a,
                                                                const float *ddx, const int OUT, const int TEX, const int COL) {
     const int W = port_render_w;
@@ -1805,6 +1806,11 @@ static inline int tr_ground(const RState *st) {
     return st->depth_write && (st->texenv == GFX_TEXENV_MODULATE || st->texenv == GFX_TEXENV_MODULATEALPHA);
 }
 
+/* outside the races (title, logo, menus, ceremony...): every texture the game asks to be
+   filtered (bilinear on the N64), 2D or 3D, in any list, gets the exact filter; the scenes are
+   light there. In a race only the 3D surfaces above (-filtro / -filtroleve). */
+static int sMenuFilter;
+
 /* draw one triangle with state st and list kind */
 static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t *v2, const RState *st, int kind) {
     const int W = port_render_w, H = port_render_h;
@@ -1926,6 +1932,8 @@ static void raster_tri(const dc_fast_t *v0, const dc_fast_t *v1, const dc_fast_t
        sprites in the other lists, the HUD has no perspective) */
     const int wraps_ok = (c.uwrap == WR_REPEAT2 || c.uwrap == WR_CLAMP) && (c.vwrap == WR_REPEAT2 || c.vwrap == WR_CLAMP);
     c.filt = port_opt_filter && (kind == KIND_OP || tr_ground(st)) && persp_geo && wraps_ok;
+    if (sMenuFilter && textured && st->filter && wraps_ok)
+        c.filt = 1;
     c.flim = 65536;
     c.pfmin = 0;
     c.pfc = port_opt_pf_level == 2 ? 0 : (port_opt_pf_level == 1 ? 16384 : 0x7FFFFFFF);
@@ -2619,6 +2627,7 @@ static void sw_on_resize(void) {
 static double sFrameT0;
 
 static void sw_start_frame(void) {
+    sMenuFilter = port_opt_filter && gGamestate != 4;   /* (4: RACING, include/defines.h) */
     sFrameT0 = port_now_ms();
     if (sCapRequest && !sCapF) {
         sCapRequest = 0;
