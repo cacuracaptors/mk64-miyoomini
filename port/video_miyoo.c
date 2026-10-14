@@ -644,8 +644,11 @@ int port_ge_overlay_add(const GeArgs *in) {
             if (a.px)
                 colx[x] = ge_wrap(a.sx + x, a.tw, a.wu);
         }
+        /* (each row is made in ordinary memory and copied over in one go: written a texel at
+           a time, the engine's memory took about 45 us a piece) */
+        static uint32_t rowb[1024 + 4] __attribute__((aligned(16)));
         for (int y = 1; y <= sh; y++) {
-            uint32_t *d = dst + (size_t) y * pw;
+            uint32_t *d = rowb;
             const uint32_t rc = a.grad == PORT_GE_ROWS ? ge_lerp(a.c0, a.c1, y - 1, sh) : a.c0;
             const uint32_t ro = a.grad == PORT_GE_ROWS ? ge_lerp(a.o0, a.o1, y - 1, sh) : a.o0;
             if (!a.px) {
@@ -663,9 +666,12 @@ int port_ge_overlay_add(const GeArgs *in) {
             d[0] = d[1];
             for (int x = sw + 1; x < pw; x++)
                 d[x] = d[sw];
+            memcpy(dst + (size_t) y * pw, rowb, (size_t) pw * 4);
+            if (y == 1)   /* (the border rows: the first and last row again) */
+                memcpy(dst, rowb, (size_t) pw * 4);
+            if (y == sh)
+                memcpy(dst + (size_t) (sh + 1) * pw, rowb, (size_t) pw * 4);
         }
-        memcpy(dst, dst + pw, (size_t) pw * 4);
-        memcpy(dst + (size_t) (sh + 1) * pw, dst + (size_t) sh * pw, (size_t) pw * 4);
         if (slot >= 0) {
             sGeHash[slot].stamp = sGeStamp;
             sGeHash[slot].a = a;

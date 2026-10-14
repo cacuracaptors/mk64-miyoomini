@@ -3215,21 +3215,13 @@ static void hud_ge_build(void) {
         for (int k = 0; k < m; k++)
             sHudItems[k].ge = -1;
     /* small pieces cost the engine more than the cores: each one is a call into its driver
-       (about 35 us of CPU on core 1) and a copy (measured with 300 letters a frame in the
-       menus: 11 ms of calls and 14 ms of copies, slower than the cores drawing them). A piece
-       under GE_MIN_AREA pixels (of the 640x480 screen) stays on the cores, unless it lies over
-       an engine piece (a letter on an engine box: the box keeps the engine, the letter goes
-       with it). */
+       (about 35 us of CPU on core 1, which draws too) and a copy. Measured in the menus: 300
+       letters a frame took 10 ms of calls and 14 ms of copies, far more than the cores need
+       for them. A piece under GE_MIN_AREA pixels (of the 640x480 screen) stays on the cores;
+       an engine piece under it then goes to the cores too (hud_order), as before the engine. */
     for (int k = 0; k < m; k++) {
         HudItem *it = &sHudItems[k];
-        if (it->ge < 0 || it->a.dw * it->a.dh >= GE_MIN_AREA)
-            continue;
-        int over = 0;
-        for (int j = k - 1; j >= 0 && !over; j--) {
-            const HudItem *g = &sHudItems[j];
-            over = g->ge >= 0 && g->x0 < it->x1 && it->x0 < g->x1 && g->y0 < it->y1 && it->y0 < g->y1;
-        }
-        if (!over) {
+        if (it->ge >= 0 && it->a.dw * it->a.dh < GE_MIN_AREA) {
             it->ge = -1;
             stGeWhy[6]++;
         }
