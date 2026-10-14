@@ -32,22 +32,33 @@ extern volatile unsigned port_flip_loops;
 extern double port_pacing_ms;        /* gfx_wm_miyoo.c: time waited for the 30 fps beat */
 int port_video_scales(void);         /* video_miyoo.c: any frame size can be shown (2D engine) */
 /* video_miyoo.c: the 2D of a frame (HUD, menus) drawn by the 2D engine over the finished
-   picture, at 640x480 (see hud_ge_build in gfx_sw.c). mode: 0 the texture, 1 its colour
-   times the vertex colour, 2 colour and alpha times the vertex colour, 3 the vertex colour
-   alone (no texture). The vertex colour: c0 all over (grad 0), or c0 at the top and c1 at
-   the bottom (grad 1), or c0 at the left and c1 at the right (grad 2). gen: which upload
-   of the texels (the same gen, the same texels). */
-#define PORT_GE_TEX 0
-#define PORT_GE_MOD 1
-#define PORT_GE_MODA 2
-#define PORT_GE_FILL 3
-#define PORT_GE_FLAT 0
-#define PORT_GE_ROWS 1
-#define PORT_GE_COLS 2
+   picture, at 640x480 (see hud_ge_build in gfx_sw.c), one rectangle each. */
+#define PORT_GE_TEX 0      /* the texture */
+#define PORT_GE_MOD 1      /* its colour times the vertex colour */
+#define PORT_GE_MODA 2     /* colour and alpha times the vertex colour */
+#define PORT_GE_FILL 3     /* the vertex colour alone (no texture) */
+#define PORT_GE_DECAL 4    /* the texture over the vertex colour by its alpha, the vertex alpha */
+#define PORT_GE_FLAT 0     /* the vertex colours: c0 / o0 all over */
+#define PORT_GE_ROWS 1     /* c0 / o0 at the top, c1 / o1 at the bottom */
+#define PORT_GE_COLS 2     /* c0 / o0 at the left, c1 / o1 at the right */
+#define PORT_GE_CLAMP 0    /* outside the texture: its edge */
+#define PORT_GE_REPEAT 1   /* it repeats */
+#define PORT_GE_MIRROR 2   /* it repeats mirrored */
+typedef struct {
+    const uint32_t *px;    /* the texels (ARGB8888), NULL: a plain colour */
+    int tw, th;            /* the texture's size */
+    int sx, sy, sw, sh;    /* the texels shown (may go outside the texture: wu, wv) */
+    int wu, wv;
+    int dx, dy, dw, dh;    /* where on the 640x480 screen (as the game sees it; may go past its edges) */
+    int grad, mode;
+    uint32_t gen;          /* which upload of the texels (the same gen, the same texels) */
+    uint32_t c0, c1;       /* vertex colour (ARGB) */
+    uint32_t o0, o1;       /* offset colour (RGB), added after the texture */
+} GeArgs;
 int port_ge_hud_ok(void);
+int port_ge_clip_ok(void);   /* the engine can cut a rectangle at the screen's edges */
 void port_ge_overlay_begin(void);
-int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy, int sw, int sh, int dx, int dy, int dw,
-                        int dh, uint32_t c0, uint32_t c1, int grad, int mode);   /* index, or -1: no room */
+int port_ge_overlay_add(const GeArgs *a);   /* index, or -1: no room */
 void port_ge_overlay_cancel(int idx);
 extern int port_opt_resdin;          /* -resdin: dynamic resolution */
 

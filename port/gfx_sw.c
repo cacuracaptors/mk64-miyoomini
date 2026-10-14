@@ -2928,11 +2928,6 @@ static void prefilter_prepare(void) {
    -hudcpu: all of it by the cores. */
 #define HUD_MAX 1024
 typedef struct {
-    const uint32_t *px;          /* what goes to port_ge_overlay_add */
-    int tw, sx, sy, sw, sh, dx, dy, dw, dh, grad, mode;
-    uint32_t gen, c0, c1;
-} GeArgs;
-typedef struct {
     uint32_t i0, n;              /* sorted triangles */
     float x0, y0, x1, y1;        /* bounding box, 640x480 */
     int ge;                      /* the engine's piece number, -1 = the cores; (before adding: 0 = the engine) */
@@ -3032,12 +3027,10 @@ static int hud_quad_try(const dc_fast_t *v, const TrSort *e, const RState *st, i
         *why = 1;
         return -1;
     }
+    const struct SwTex *tx = st->tex ? &sTexRd[st->tex] : NULL;
+    const int textured = tx && tx->px;
     float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
     for (int i = 0; i < 6; i++) {
-        if (v[i].pad0.vertindex & 0x00FFFFFFu) {   /* (an offset colour) */
-            *why = 1;
-            return -1;
-        }
         const float x = v[i].vert.x, y = v[i].vert.y;
         if (!(x == x) || !(y == y)) {
             *why = 0;
@@ -3048,10 +3041,10 @@ static int hud_quad_try(const dc_fast_t *v, const TrSort *e, const RState *st, i
         if (y < y0) y0 = y;
         if (y > y1) y1 = y;
     }
-    /* every corner one of the rectangle's, all four there, the texture and the colour
+    /* every corner one of the rectangle's, all four there, the texture and the colours
        the same wherever a corner repeats, the texture following the axes */
     float uL = 0, uR = 0, vT = 0, vB = 0;
-    uint32_t cc[4] = { 0, 0, 0, 0 };
+    uint32_t cc[4] = { 0, 0, 0, 0 }, oc[4] = { 0, 0, 0, 0 };
     int seen = 0, haveL = 0, haveR = 0, haveT = 0, haveB = 0;
     for (int i = 0; i < 6; i++) {
         const int l = near_eq(v[i].vert.x, x0), r = near_eq(v[i].vert.x, x1);
@@ -3061,13 +3054,14 @@ static int hud_quad_try(const dc_fast_t *v, const TrSort *e, const RState *st, i
             return -1;
         }
         const int corner = (r ? 1 : 0) | (bt ? 2 : 0);
-        if ((seen >> corner) & 1) {
-            if (cc[corner] != v[i].color.packed) {
-                *why = 1;
-                return -1;
-            }
+        /* (the offset colour: only with a texture, added after it, as the cores do) */
+        const uint32_t off = textured ? v[i].pad0.vertindex & 0x00FFFFFFu : 0;
+        if (((seen >> corner) & 1) && (cc[corner] != v[i].color.packed || oc[corner] != off)) {
+            *why = 1;
+            return -1;
         }
         cc[corner] = v[i].color.packed;
+        oc[corner] = off;
         seen |= 1 << corner;
         const float u = v[i].texture.u, w = v[i].texture.v;
         int bad = 0;
@@ -3081,7 +3075,13 @@ static int hud_quad_try(const dc_fast_t *v, const TrSort *e, const RState *st, i
         }
     }
     const int dx = px_from(x0), dy = px_from(y0), dw = px_from(x1) - dx, dh = px_from(y1) - dy;
-    if (seen != 15 || dw < 1 || dh < 1 || dx < 0 || dy < 0 || dx + dw > 640 || dy + dh > 480) {
+    if (seen != 15 || dw < 1 || dh < 1 || dw > 2048 || dh > 2048) {
+        *why = 0;
+        return -1;
+    }
+    /* partly off the screen: the engine cuts it (when its test said it can) */
+    if (dx >= 640 || dy >= 480 || dx + dw <= 0 || dy + dh <= 0 ||
+        ((dx < 0 || dy < 0 || dx + dw > 640 || dy + dh > 480) && !port_ge_clip_ok())) {
         *why = 0;
         return -1;
     }
@@ -3089,54 +3089,60 @@ static int hud_quad_try(const dc_fast_t *v, const TrSort *e, const RState *st, i
         *why = 4;
         return -1;
     }
-    /* the colour: one, or changing from top to bottom (the letters of the menus and the
-       race's messages: white at the top, their colour at the bottom) or from left to right.
-       Both triangles then interpolate it the same way: it goes into the engine's copy, row
-       by row (or column by column) */
+    /* the colours: the same on all corners, or changing from top to bottom (the letters of
+       the menus and the race's messages: white at the top, their colour at the bottom) or
+       from left to right. Both triangles then interpolate them the same way: they go into
+       the engine's copy, row by row (or column by column) */
     int grad;
-    uint32_t c0 = cc[0], c1 = cc[0];
-    if (cc[0] == cc[1] && cc[0] == cc[2] && cc[0] == cc[3])
+    int c1i = 0;
+    if (cc[0] == cc[1] && cc[0] == cc[2] && cc[0] == cc[3] && oc[0] == oc[1] && oc[0] == oc[2] && oc[0] == oc[3])
         grad = PORT_GE_FLAT;
-    else if (cc[0] == cc[1] && cc[2] == cc[3]) {
+    else if (cc[0] == cc[1] && cc[2] == cc[3] && oc[0] == oc[1] && oc[2] == oc[3]) {
         grad = PORT_GE_ROWS;
-        c1 = cc[2];
-    } else if (cc[0] == cc[2] && cc[1] == cc[3]) {
+        c1i = 2;
+    } else if (cc[0] == cc[2] && cc[1] == cc[3] && oc[0] == oc[2] && oc[1] == oc[3]) {
         grad = PORT_GE_COLS;
-        c1 = cc[1];
+        c1i = 1;
     } else {
         *why = 1;
         return -1;
     }
     a->dx = dx; a->dy = dy; a->dw = dw; a->dh = dh;
-    a->c0 = c0; a->c1 = c1; a->grad = grad;
-    const struct SwTex *tx = st->tex ? &sTexRd[st->tex] : NULL;
-    if (!tx || !tx->px) {   /* a plain colour (with its alpha) */
+    a->c0 = cc[0]; a->c1 = cc[c1i]; a->o0 = oc[0]; a->o1 = oc[c1i]; a->grad = grad;
+    if (!textured) {   /* a plain colour (with its alpha) */
         a->px = NULL;
-        a->tw = 0; a->gen = 0; a->sx = a->sy = 0; a->sw = a->sh = 1;
+        a->tw = a->th = 0; a->gen = 0; a->sx = a->sy = 0; a->sw = a->sh = 1; a->wu = a->wv = 0;
         a->mode = PORT_GE_FILL;
         return 1;
     }
     int mode;
+    const int white = a->c0 == 0xFFFFFFFFu && a->c1 == 0xFFFFFFFFu;
     if (st->texenv == GFX_TEXENV_DECAL)
-        mode = -1;
-    else if (st->texenv == GFX_TEXENV_REPLACE || (c0 == 0xFFFFFFFFu && c1 == 0xFFFFFFFFu))
+        mode = PORT_GE_DECAL;
+    else if (st->texenv == GFX_TEXENV_REPLACE || white)
         mode = PORT_GE_TEX;
     else if (st->texenv == GFX_TEXENV_MODULATE)
         mode = PORT_GE_MOD;
-    else if (st->texenv == GFX_TEXENV_MODULATEALPHA)
-        mode = PORT_GE_MODA;
     else
-        mode = -1;
+        mode = PORT_GE_MODA;
+    /* the texels covered, with the texture's own repeat, mirror or clamp outside it (the
+       copy for the engine is made that way) */
     const float su0 = uL * tx->w, su1 = uR * tx->w, sv0 = vT * tx->h, sv1 = vB * tx->h;
+    if (!(fabsf(su0) < 65536.0f && fabsf(su1) < 65536.0f && fabsf(sv0) < 65536.0f && fabsf(sv1) < 65536.0f)) {
+        *why = 2;
+        return -1;
+    }
     const int sx = (int) lroundf(su0), sy = (int) lroundf(sv0);
     const int sw = (int) lroundf(su1) - sx, sh = (int) lroundf(sv1) - sy;
-    if (mode < 0 || sw < 1 || sh < 1 || sx < 0 || sy < 0 || sx + sw > tx->w || sy + sh > tx->h) {
+    if (sw < 1 || sh < 1 || sw > 1022 || sh > 1022) {
         *why = 2;
         return -1;
     }
     a->px = tx->px;
-    a->tw = tx->w; a->gen = tx->gen;
+    a->tw = tx->w; a->th = tx->h; a->gen = tx->gen;
     a->sx = sx; a->sy = sy; a->sw = sw; a->sh = sh;
+    a->wu = st->clampu ? PORT_GE_CLAMP : (st->mirru ? PORT_GE_MIRROR : PORT_GE_REPEAT);
+    a->wv = st->clampv ? PORT_GE_CLAMP : (st->mirrv ? PORT_GE_MIRROR : PORT_GE_REPEAT);
     a->mode = mode;
     return 1;
 }
@@ -3214,8 +3220,7 @@ static void hud_ge_build(void) {
         if (it->ge < 0)
             continue;
         const GeArgs *a = &it->a;
-        const int r = port_ge_overlay_add(a->px, a->tw, a->gen, a->sx, a->sy, a->sw, a->sh, a->dx, a->dy, a->dw, a->dh,
-                                          a->c0, a->c1, a->grad, a->mode);
+        const int r = port_ge_overlay_add(a);
         if (r >= 0) {
             it->ge = r + 1;
             continue;

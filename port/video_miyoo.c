@@ -325,11 +325,10 @@ static int ge_place;         /* 0: the rectangle where it is asked for (turned i
 static int ge_sec = -1;      /* the part being filled (the colour buffer being drawn) */
 static double ge_copy_ms;    /* (-perf: the copies, game thread) */
 #define GE_HASH 2048
+static int ge_clip;          /* the engine cuts rectangles at the screen's edges (tested) */
 static struct {
-    uint32_t stamp, gen, color, color1, off;
-    const uint32_t *px;
-    int16_t sx, sy, sw, sh;
-    uint8_t mode;
+    uint32_t stamp, off;
+    GeArgs a;   /* (dx..dh not compared) */
 } sGeHash[GE_HASH];
 static uint32_t sGeStamp;
 
@@ -434,6 +433,42 @@ static int ge_selftest(void) {
                  (unsigned) (d[(ge_place ? 4 : 3) * 8 + (ge_place ? 4 : 2)] & 0xFFFFFF), (unsigned) want);
         goto out;
     }
+    /* 3: a rectangle past the game's top left corner (the menus' pictures sliding in): cut
+       right? A 2x2 picture A B / C D at the game's (-1,-1): only D shows, at the game's (0,0),
+       which is the page's (7,7) (the page is turned). Failing this only keeps such pieces on
+       the cores. */
+    for (int i = 0; i < 16; i++)
+        s[i] = 0xFF0000FFu;
+    s[5] = 0xFFFF0000u;    /* A */
+    s[6] = 0xFF00FF00u;    /* B */
+    s[9] = 0xFF00FFFFu;    /* C */
+    s[10] = 0xFFFFFF00u;   /* D */
+    memset(vd, 0, 4096);
+    mi.Flush(vs, 4096);
+    mi.Flush(vd, 4096);
+    {
+        MI_GFX_Rect_t sr3 = { 1, 1, 2, 2 }, dr3 = { -1, -1, 2, 2 };
+        if (!ge_place) {   /* (the place turned here, as in ge_draw: 8 - x - w) */
+            dr3.s32Xpos = 8 - (-1) - 2;
+            dr3.s32Ypos = 8 - (-1) - 2;
+        }
+        ge_clip = 0;
+        int n = snprintf(why, sizeof why, "a copia falhou");
+        if (ge_blit(ps, 4, 4, &sr3, pd, 8, 8, &dr3, E_MI_GFX_ROTATE_180, &fence) == 0) {
+            mi.Wait(TRUE, fence);
+            mi.Flush(vd, 4096);
+            int nz = 0;
+            for (int i = 0; i < 64; i++)
+                nz += (d[i] & 0xFFFFFFu) != 0;
+            ge_clip = nz == 1 && (d[7 * 8 + 7] & 0xFFFFFF) == 0xFFFF00;
+            n = snprintf(why, sizeof why, "resultado:");
+            for (int i = 0; i < 64 && n < (int) sizeof why - 16; i++)
+                if (d[i] & 0xFFFFFFu)
+                    n += snprintf(why + n, sizeof why - n, " (%d,%d)=%06x", i % 8, i / 8, (unsigned) (d[i] & 0xFFFFFF));
+        }
+        if (!ge_clip)
+            printf("video: MI_GFX nao corta nas bordas (%s): pecas fora da tela ficam nos nucleos\n", why);
+    }
     ok = 1;
 out:
     if (vs) mi.Munmap(vs, 4096);
@@ -482,15 +517,38 @@ static inline uint32_t mul255(uint32_t a, uint32_t b) {
     return (x + (x >> 8)) >> 8;
 }
 
-/* one texel as the cores would blend it, premultiplied */
-static inline uint32_t ge_texel(uint32_t t, int mode, uint32_t cr, uint32_t cg, uint32_t cb, uint32_t ca) {
+/* one texel as the cores would blend it, premultiplied: c the vertex colour, o the offset */
+static inline uint32_t ge_texel(uint32_t t, int mode, uint32_t c, uint32_t o) {
     uint32_t a = t >> 24, r = (t >> 16) & 255, g = (t >> 8) & 255, b = t & 255;
-    if (mode == PORT_GE_MOD || mode == PORT_GE_MODA) {
-        r = mul255(r, cr);
-        g = mul255(g, cg);
-        b = mul255(b, cb);
-        if (mode == PORT_GE_MODA)
-            a = mul255(a, ca);
+    const uint32_t cr = (c >> 16) & 255, cg = (c >> 8) & 255, cb = c & 255, ca = c >> 24;
+    switch (mode) {
+        case PORT_GE_FILL:
+            r = cr; g = cg; b = cb; a = ca;
+            break;
+        case PORT_GE_MOD:
+        case PORT_GE_MODA:
+            r = mul255(r, cr);
+            g = mul255(g, cg);
+            b = mul255(b, cb);
+            if (mode == PORT_GE_MODA)
+                a = mul255(a, ca);
+            break;
+        case PORT_GE_DECAL:
+            r = mul255(cr, 255 - a) + mul255(r, a);
+            g = mul255(cg, 255 - a) + mul255(g, a);
+            b = mul255(cb, 255 - a) + mul255(b, a);
+            a = ca;
+            break;
+        default:
+            break;
+    }
+    if (o && mode != PORT_GE_FILL) {
+        r += (o >> 16) & 255;
+        g += (o >> 8) & 255;
+        b += o & 255;
+        if (r > 255) r = 255;
+        if (g > 255) g = 255;
+        if (b > 255) b = 255;
     }
     if (a != 255) {
         r = mul255(r, a);
@@ -498,6 +556,22 @@ static inline uint32_t ge_texel(uint32_t t, int mode, uint32_t cr, uint32_t cg, 
         b = mul255(b, a);
     }
     return a << 24 | r << 16 | g << 8 | b;
+}
+
+/* a texel coordinate outside the texture, as the cores read it */
+static inline int ge_wrap(int i, int n, int mode) {
+    if (i >= 0 && i < n)
+        return i;
+    if (mode == PORT_GE_CLAMP)
+        return i < 0 ? 0 : n - 1;
+    if (mode == PORT_GE_MIRROR) {
+        int k = i % (2 * n);
+        if (k < 0)
+            k += 2 * n;
+        return k < n ? k : 2 * n - 1 - k;
+    }
+    int k = i % n;
+    return k < 0 ? k + n : k;
 }
 
 int port_ge_hud_ok(void) {
@@ -522,34 +596,55 @@ static inline uint32_t ge_lerp(uint32_t c0, uint32_t c1, int k, int n) {
     return r;
 }
 
-int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy, int sw, int sh, int dx, int dy, int dw,
-                        int dh, uint32_t c0, uint32_t c1, int grad, int mode) {
+int port_ge_clip_ok(void) {
+    return ge_clip;
+}
+
+static int ge_same(const GeArgs *x, const GeArgs *y) {
+    return x->px == y->px && x->gen == y->gen && x->tw == y->tw && x->th == y->th && x->sx == y->sx &&
+           x->sy == y->sy && x->sw == y->sw && x->sh == y->sh && x->wu == y->wu && x->wv == y->wv &&
+           x->grad == y->grad && x->mode == y->mode && x->c0 == y->c0 && x->c1 == y->c1 && x->o0 == y->o0 &&
+           x->o1 == y->o1;
+}
+
+int port_ge_overlay_add(const GeArgs *in) {
     if (ge_sec < 0 || !ge_ok)
         return -1;
     GeOvl *o = &sGeOvl[ge_sec];
-    if (grad == PORT_GE_FLAT)
-        c1 = c0;
-    if (mode == PORT_GE_TEX) {
-        c0 = c1 = 0;
-        grad = PORT_GE_FLAT;
-    } else if (mode == PORT_GE_MOD) {
-        c0 |= 0xFF000000u;   /* (its alpha is not used) */
-        c1 |= 0xFF000000u;
+    GeArgs a = *in;
+    if (a.grad == PORT_GE_FLAT) {
+        a.c1 = a.c0;
+        a.o1 = a.o0;
     }
-    if (c0 == c1)
-        grad = PORT_GE_FLAT;
-    if (!px && grad != PORT_GE_FLAT) {   /* a colour gradient: a strip of it, smoothed by the scaling */
-        const int len = (grad == PORT_GE_ROWS ? dh : dw) / 2;
-        const int n = len < 2 ? 2 : (len > 128 ? 128 : len);
-        sw = grad == PORT_GE_ROWS ? 1 : n;
-        sh = grad == PORT_GE_ROWS ? n : 1;
+    if (a.mode == PORT_GE_TEX) {
+        a.c0 = a.c1 = 0;
+    } else if (a.mode == PORT_GE_MOD) {
+        a.c0 |= 0xFF000000u;   /* (its alpha is not used) */
+        a.c1 |= 0xFF000000u;
+    } else if (a.mode == PORT_GE_FILL) {
+        a.o0 = a.o1 = 0;
     }
-    if (o->n >= GE_MAX || sw < 1 || sh < 1 || sw > 1022 || sh > 1022)
+    if (a.c0 == a.c1 && a.o0 == a.o1)
+        a.grad = PORT_GE_FLAT;
+    if (!a.px) {   /* a plain colour; a gradient: a strip of it, smoothed by the scaling */
+        a.tw = a.th = 0;
+        a.sx = a.sy = 0;
+        a.sw = a.sh = 1;
+        if (a.grad != PORT_GE_FLAT) {
+            const int len = (a.grad == PORT_GE_ROWS ? a.dh : a.dw) / 2;
+            const int n = len < 2 ? 2 : (len > 128 ? 128 : len);
+            a.sw = a.grad == PORT_GE_ROWS ? 1 : n;
+            a.sh = a.grad == PORT_GE_ROWS ? n : 1;
+        }
+    }
+    if (o->n >= GE_MAX || a.sw < 1 || a.sh < 1 || a.sw > 1022 || a.sh > 1022)
         return -1;
+    const int sw = a.sw, sh = a.sh;
     const int pw = (sw + 2 + 3) & ~3, ph = sh + 2;   /* (rows of a multiple of 16 bytes) */
     /* the same texels, colours and part already copied in this frame: shared */
-    uint32_t h = gen * 2654435761u ^ c0 * 40503u ^ c1 * 2246822519u ^ (uint32_t) (sx | sy << 10) * 97u ^
-                 (uint32_t) (sw | sh << 10) * 31u ^ (uint32_t) (mode | grad << 4);
+    uint32_t h = a.gen * 2654435761u ^ a.c0 * 40503u ^ a.c1 * 2246822519u ^ a.o0 * 3266489917u ^ a.o1 * 668265263u ^
+                 (uint32_t) ((a.sx & 0xFFFF) | a.sy << 16) * 97u ^ (uint32_t) (sw | sh << 10) * 31u ^
+                 (uint32_t) (a.mode | a.grad << 4 | a.wu << 8 | a.wv << 10) ^ (uint32_t) (uintptr_t) a.px;
     h = (h ^ (h >> 15)) & (GE_HASH - 1);
     int slot = -1;
     for (int k = 0; k < 8; k++) {
@@ -558,9 +653,7 @@ int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy
             slot = (int) j;
             break;
         }
-        if (sGeHash[j].gen == gen && sGeHash[j].px == px && sGeHash[j].color == c0 && sGeHash[j].color1 == c1 &&
-            sGeHash[j].mode == (uint8_t) (mode | grad << 4) && sGeHash[j].sx == sx && sGeHash[j].sy == sy &&
-            sGeHash[j].sw == sw && sGeHash[j].sh == sh) {
+        if (ge_same(&sGeHash[j].a, &a)) {
             slot = -2 - (int) j;
             break;
         }
@@ -576,32 +669,31 @@ int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy
         off = o->used;
         o->used += bytes;
         uint32_t *dst = (uint32_t *) (ge_virt[ge_sec] + off);
-        static uint32_t colc[1024];   /* (left to right: the colour of each column) */
-        if (grad == PORT_GE_COLS)
-            for (int x = 0; x < sw; x++)
-                colc[x] = ge_lerp(c0, c1, x, sw);
+        static uint32_t colc[1024], colo[1024];   /* (left to right: the colours of each column) */
+        static int colx[1024];                    /* (and its texel column) */
+        for (int x = 0; x < sw; x++) {
+            if (a.grad == PORT_GE_COLS) {
+                colc[x] = ge_lerp(a.c0, a.c1, x, sw);
+                colo[x] = ge_lerp(a.o0, a.o1, x, sw);
+            }
+            if (a.px)
+                colx[x] = ge_wrap(a.sx + x, a.tw, a.wu);
+        }
         for (int y = 1; y <= sh; y++) {
             uint32_t *d = dst + (size_t) y * pw;
-            const uint32_t rc = grad == PORT_GE_ROWS ? ge_lerp(c0, c1, y - 1, sh) : c0;
-            if (!px) {   /* a plain colour */
-                if (grad == PORT_GE_COLS)
-                    for (int x = 0; x < sw; x++)
-                        d[x + 1] = ge_texel(colc[x], PORT_GE_TEX, 0, 0, 0, 0);
-                else {
-                    const uint32_t c = ge_texel(rc, PORT_GE_TEX, 0, 0, 0, 0);
-                    for (int x = 0; x < sw; x++)
-                        d[x + 1] = c;
-                }
+            const uint32_t rc = a.grad == PORT_GE_ROWS ? ge_lerp(a.c0, a.c1, y - 1, sh) : a.c0;
+            const uint32_t ro = a.grad == PORT_GE_ROWS ? ge_lerp(a.o0, a.o1, y - 1, sh) : a.o0;
+            if (!a.px) {
+                for (int x = 0; x < sw; x++)
+                    d[x + 1] = ge_texel(0, PORT_GE_FILL, a.grad == PORT_GE_COLS ? colc[x] : rc, 0);
             } else {
-                const uint32_t *s = px + (size_t) (sy + y - 1) * tw + sx;
-                if (grad == PORT_GE_COLS)
-                    for (int x = 0; x < sw; x++) {
-                        const uint32_t c = colc[x];
-                        d[x + 1] = ge_texel(s[x], mode, (c >> 16) & 255, (c >> 8) & 255, c & 255, c >> 24);
-                    }
+                const uint32_t *s = a.px + (size_t) ge_wrap(a.sy + y - 1, a.th, a.wv) * a.tw;
+                if (a.grad == PORT_GE_COLS)
+                    for (int x = 0; x < sw; x++)
+                        d[x + 1] = ge_texel(s[colx[x]], a.mode, colc[x], colo[x]);
                 else
                     for (int x = 0; x < sw; x++)
-                        d[x + 1] = ge_texel(s[x], mode, (rc >> 16) & 255, (rc >> 8) & 255, rc & 255, rc >> 24);
+                        d[x + 1] = ge_texel(s[colx[x]], a.mode, rc, ro);
             }
             d[0] = d[1];
             for (int x = sw + 1; x < pw; x++)
@@ -611,20 +703,13 @@ int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy
         memcpy(dst + (size_t) (sh + 1) * pw, dst + (size_t) sh * pw, (size_t) pw * 4);
         if (slot >= 0) {
             sGeHash[slot].stamp = sGeStamp;
-            sGeHash[slot].gen = gen;
-            sGeHash[slot].px = px;
-            sGeHash[slot].color = c0;
-            sGeHash[slot].color1 = c1;
-            sGeHash[slot].mode = (uint8_t) (mode | grad << 4);
-            sGeHash[slot].sx = (int16_t) sx;
-            sGeHash[slot].sy = (int16_t) sy;
-            sGeHash[slot].sw = (int16_t) sw;
-            sGeHash[slot].sh = (int16_t) sh;
+            sGeHash[slot].a = a;
             sGeHash[slot].off = off;
         }
         if (port_opt_perf)
             ge_copy_ms += port_now_ms() - t0;
     }
+    const int dx = a.dx, dy = a.dy, dw = a.dw, dh = a.dh;
     GeItem *it = &o->it[o->n];
     it->off = off;
     it->pw = (uint16_t) pw;
@@ -687,8 +772,10 @@ int port_ge_hud_ok(void) {
 }
 void port_ge_overlay_begin(void) {
 }
-int port_ge_overlay_add(const uint32_t *px, int tw, uint32_t gen, int sx, int sy, int sw, int sh, int dx, int dy, int dw,
-                        int dh, uint32_t c0, uint32_t c1, int grad, int mode) {
+int port_ge_clip_ok(void) {
+    return 0;
+}
+int port_ge_overlay_add(const GeArgs *a) {
     return -1;
 }
 void port_ge_overlay_cancel(int idx) {
@@ -820,7 +907,7 @@ volatile unsigned port_flip_loops;
 static void *flip_proc(void *arg) {
     (void) arg;
     double t_cpu = 0;
-    double t_conv = 0, t_show = 0, last_print = 0, last_tick = 0, tmin = 1e9, tmax = 0, t_ge = 0, t_gen = 0;
+    double t_conv = 0, t_show = 0, last_print = 0, last_tick = 0, tmin = 1e9, tmax = 0, t_ge = 0, t_gen = 0, t_gecpu = 0;
     int frames = 0, ticks = 0, fast = 0;
     pin_cpu(1);
     for (;;) {
@@ -852,10 +939,12 @@ static void *flip_proc(void *arg) {
 #ifdef HAVE_MI_GFX
                 /* the 2D over it (its part is only reused three frames later, after this pass) */
                 if (hw && ge >= 0) {
-                    const double g0 = port_opt_perf ? port_now_ms() : 0;
+                    const double g0 = port_opt_perf ? port_now_ms() : 0, gc = port_opt_perf ? thread_cpu_ms() : 0;
                     t_gen += ge_draw(ge, back);
-                    if (port_opt_perf)
+                    if (port_opt_perf) {
                         t_ge += port_now_ms() - g0;
+                        t_gecpu += thread_cpu_ms() - gc;
+                    }
                 }
 #else
                 (void) ge;
@@ -920,11 +1009,12 @@ static void *flip_proc(void *arg) {
                         ticks ? tmin : 0, tmax);
 #ifdef HAVE_MI_GFX
                 if (t_gen > 0 || ge_copy_ms > 0)
-                    fprintf(stderr, "perf 2d MI_GFX: %.1f pecas/quadro, desenho %.2f ms/quadro (nucleo 1), copias %.2f ms/quadro (jogo)\n",
-                            frames ? t_gen / frames : 0, frames ? t_ge / frames : 0, frames ? ge_copy_ms / frames : 0);
+                    fprintf(stderr, "perf 2d MI_GFX: %.1f pecas/quadro, desenho %.2f ms/quadro (nucleo 1, cpu %.2f), copias %.2f ms/quadro (jogo)\n",
+                            frames ? t_gen / frames : 0, frames ? t_ge / frames : 0, frames ? t_gecpu / frames : 0,
+                            frames ? ge_copy_ms / frames : 0);
                 ge_copy_ms = 0;
 #endif
-                t_conv = t_show = t_cpu = t_ge = t_gen = 0;
+                t_conv = t_show = t_cpu = t_ge = t_gen = t_gecpu = 0;
                 frames = ticks = 0;
                 tmin = 1e9; tmax = 0;
                 last_print = now;
