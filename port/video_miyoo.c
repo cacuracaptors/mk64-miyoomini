@@ -185,7 +185,12 @@ static void *open_lib(const char *name) {
     return NULL;
 }
 
+static int hw_blit_q(MI_PHY src, int sw, int sh, MI_PHY dst, int dw, int dh, int rotate, int mirror, MI_U16 *fq);
 static int hw_blit(MI_PHY src, int sw, int sh, MI_PHY dst, int dw, int dh, int rotate, int mirror) {
+    return hw_blit_q(src, sw, sh, dst, dw, dh, rotate, mirror, NULL);
+}
+/* fq: queue it without waiting (its fence there); NULL: wait for it */
+static int hw_blit_q(MI_PHY src, int sw, int sh, MI_PHY dst, int dw, int dh, int rotate, int mirror, MI_U16 *fq) {
     MI_GFX_Surface_t s = { src, E_MI_GFX_FMT_RGB565, (MI_U32) sw, (MI_U32) sh, (MI_U32) sw * 2 };
     MI_GFX_Surface_t d = { dst, E_MI_GFX_FMT_ARGB8888, (MI_U32) dw, (MI_U32) dh, (MI_U32) dw * 4 };
     MI_GFX_Rect_t sr = { 0, 0, (MI_U32) sw, (MI_U32) sh }, dr = { 0, 0, (MI_U32) dw, (MI_U32) dh };
@@ -200,7 +205,10 @@ static int hw_blit(MI_PHY src, int sw, int sh, MI_PHY dst, int dw, int dh, int r
     MI_U16 fence = 0;
     if (mi.Blit(&s, &sr, &d, &dr, &opt, &fence) != 0)
         return -1;
-    mi.Wait(TRUE, fence);
+    if (fq)
+        *fq = fence;
+    else
+        mi.Wait(TRUE, fence);
     return 0;
 }
 
@@ -726,7 +734,7 @@ void port_ge_overlay_cancel(int idx) {
 }
 
 /* flip thread: the pieces of part `sec` over screen page `back` (after the frame's copy) */
-static int ge_draw(int sec, int back) {
+static int ge_draw(int sec, int back, MI_U16 *fq) {
     const GeOvl *o = &sGeOvl[sec];
     const MI_PHY page = (MI_PHY) fb_phys + (MI_PHY) back * PANEL_W * PANEL_H * 4;
     MI_U16 fence = 0;
@@ -745,7 +753,7 @@ static int ge_draw(int sec, int back) {
             n++;
     }
     if (n)
-        mi.Wait(TRUE, fence);
+        *fq = fence;   /* (waited for with the frame's copy, in the flip thread) */
     return n;
 }
 
@@ -841,7 +849,7 @@ static int hw_init(size_t bytes) {
 }
 
 /* frame index -> show it in screen page `back` with the 2D engine; 0 = done */
-static int hw_present(const uint16_t *src, int back, int w, int h) {
+static int hw_present(const uint16_t *src, int back, int w, int h, uint16_t *fq) {
 #ifdef HAVE_MI_GFX
     int idx = src == cbuf[0] ? 0 : (src == cbuf[1] ? 1 : (src == cbuf[2] ? 2 : -1));
     if (!hw_ok || idx < 0)
@@ -849,14 +857,14 @@ static int hw_present(const uint16_t *src, int back, int w, int h) {
     const size_t bytes = (size_t) w * h * 2;
     mi.Flush((void *) src, (MI_U32) bytes);   /* the drawing is in the CPU cache */
     MI_PHY dst = (MI_PHY) fb_phys + (MI_PHY) back * PANEL_W * PANEL_H * 4;
-    if (hw_blit(hw_phys[idx], w, h, dst, PANEL_W, PANEL_H, hw_rotate, hw_mirror)) {
+    if (hw_blit_q(hw_phys[idx], w, h, dst, PANEL_W, PANEL_H, hw_rotate, hw_mirror, (MI_U16 *) fq)) {
         printf("video: MI_GFX falhou no jogo, voltando para a copia pela CPU\n");
         hw_ok = 0;
         return -1;
     }
     return 0;
 #else
-    (void) src; (void) back; (void) w; (void) h;
+    (void) src; (void) back; (void) w; (void) h; (void) fq;
     return -1;
 #endif
 }
@@ -905,6 +913,8 @@ static void *flip_proc(void *arg) {
     (void) arg;
     double t_cpu = 0;
     double t_conv = 0, t_show = 0, last_print = 0, last_tick = 0, tmin = 1e9, tmax = 0, t_ge = 0, t_gen = 0, t_gecpu = 0;
+    double p_prev = 0;           /* -perf, the rhythm: when the last frame was flipped */
+    int p_hist[4] = { 0 }, p_late = 0;
     int frames = 0, ticks = 0, fast = 0;
     pin_cpu(1);
     for (;;) {
@@ -929,23 +939,41 @@ static void *flip_proc(void *arg) {
                 int back = fb_page ^ 1;
                 const double c0 = port_opt_perf ? thread_cpu_ms() : 0;
                 port_flip_stage = 2;   /* copying a frame */
-                const int hw = hw_present(src, back, sw, sh) == 0;
+                /* the next refresh, the one this frame should make (-perf: did it?) */
+                double due = 0;
+                if (last_tick != 0)
+                    due = last_tick + 16.68 * (double) (int) ((t0 - last_tick) / 16.68 + 1.0);
+                uint16_t fence = 0;
+                const int hw = hw_present(src, back, sw, sh, &fence) == 0;   /* (queued: the engine works on it) */
                 if (!hw)
                     convert_frame(src, sw, sh, (uint32_t *) (fb_mem + (size_t) back * PANEL_W * PANEL_H * 4));
-                release_snap();   /* copied: the game may queue the next frame during the vsync wait */
 #ifdef HAVE_MI_GFX
-                /* the 2D over it (its part is only reused three frames later, after this pass) */
+                /* the 2D over it, queued right behind the frame's copy: the calls into the
+                   driver (about 35 us each) are made while the engine is still busy with the
+                   copy, and one wait covers both (waiting for the copy first, then making the
+                   calls, added ~1 ms between the frame being done and its flip; a frame that
+                   came late enough then missed its refresh). Its part is only reused three
+                   frames later, after this pass. */
                 if (hw && ge >= 0) {
                     const double g0 = port_opt_perf ? port_now_ms() : 0, gc = port_opt_perf ? thread_cpu_ms() : 0;
-                    t_gen += ge_draw(ge, back);
+                    MI_U16 gf = 0;
+                    const int n = ge_draw(ge, back, &gf);
+                    if (n)
+                        fence = gf;
+                    t_gen += n;
                     if (port_opt_perf) {
                         t_ge += port_now_ms() - g0;
                         t_gecpu += thread_cpu_ms() - gc;
                     }
                 }
+                if (hw)
+                    mi.Wait(TRUE, fence);
 #else
                 (void) ge;
 #endif
+                release_snap();   /* copied: the game may queue the next frame during the vsync wait */
+                if (port_opt_perf && due != 0 && port_now_ms() > due - 0.3)
+                    p_late++;   /* (ready after the refresh it was meant for) */
                 if (port_opt_perf)
                     t_cpu += thread_cpu_ms() - c0;
                 double t1 = port_now_ms();
@@ -954,7 +982,15 @@ static void *flip_proc(void *arg) {
                 port_flip_stage = 3;   /* showing it (vsync) */
                 ioctl(fb_fd, FBIOPAN_DISPLAY, &fb_var);
                 fb_page = back;
-                t_show += port_now_ms() - t1;
+                const double tp = port_now_ms();
+                t_show += tp - t1;
+                if (port_opt_perf) {   /* how many refreshes the frame before stayed on screen */
+                    if (p_prev != 0) {
+                        const int r = (int) ((tp - p_prev) / 16.68 + 0.5);
+                        p_hist[r <= 1 ? 0 : (r >= 4 ? 3 : r - 1)]++;
+                    }
+                    p_prev = tp;
+                }
             } else {
                 fb_var.yoffset = fb_page * PANEL_H;   /* same page: just wait for the vsync */
                 port_flip_stage = 4;   /* no frame: vsync */
@@ -1023,6 +1059,10 @@ static void *flip_proc(void *arg) {
                             frames ? ge_copy_ms / frames : 0);
                 ge_copy_ms = 0;
 #endif
+                fprintf(stderr, "perf ritmo: quadros na tela por 1 atualizacao %d, 2 %d, 3 %d, 4+ %d | prontos depois da sua atualizacao %d\n",
+                        p_hist[0], p_hist[1], p_hist[2], p_hist[3], p_late);
+                memset(p_hist, 0, sizeof p_hist);
+                p_late = 0;
                 t_conv = t_show = t_cpu = t_ge = t_gen = t_gecpu = 0;
                 frames = ticks = 0;
                 tmin = 1e9; tmax = 0;
