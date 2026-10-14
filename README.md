@@ -86,6 +86,7 @@ You can edit its `Arguments` line:
 | `-resdin` | Dynamic resolution (with `-hires`): smaller frames only while a frame doesn't fit in 1/60 s |
 | `-filtroleve` | Texture filter on the road and other 3D surfaces, worked out in advance (looks like the N64's filter, costs about half as much) |
 | `-filtro` | The N64's texture filter itself, computed as it draws (slower) |
+| `-hudcpu` | The HUD and the menus' 2D drawn by the CPU cores only (without it, their large pictures are drawn by the chip's 2D engine at 640x480, smoothed) |
 | `-mudo` | No sound |
 | `-perf` | Timing lines in `log.txt` every 2 seconds |
 
@@ -93,10 +94,17 @@ You can edit its `Arguments` line:
 
 - Occasionally, the second screen showing your competitors after the race finishes briefly flashes with random rendering artifacts.
 - An OnionOS screenshot (Menu+Power) pauses the game for about a second while it is saved.
+- The Game Switcher's picture of a saved state leaves out the 2D pieces drawn by the 2D engine (the minimap, the
+  menus' large pictures).
 - The game's log is in `log.txt`, in `Roms/PORTS/Games/MarioKart64/` - please attach it to your reports.
 
 ## Changelog
 
+- **v1.1.5** - Smoothed HUD and menus: their large pictures are drawn by the chip's 2D engine (MI_GFX) at 640x480,
+  the rest by the CPU with the texture filter (`-hudcpu` keeps it all on the CPU); menus without stutters or
+  sound dropouts (Player Select), the game clock no longer loses screen refreshes; L Option / R Data banners
+  centred on the Game Select screen; "Copy N64 Controller Pak" removed from the Option menu; texture filter on
+  the booster pads' moving arrows.
 - **v1.1.0** - Save states and Game Switcher integration (Menu, Menu+R2/L2), save on power-off with automatic
   resume, low battery warning icon without flicker and automatic shutdown, faster texture filter (`-filtroleve`,
   the new default) with the exact filter near the camera, dynamic resolution tuning, fixed stutters, fixed
