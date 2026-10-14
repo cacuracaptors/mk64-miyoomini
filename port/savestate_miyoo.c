@@ -107,23 +107,7 @@ static unsigned sLoadedAt;
 static uint32_t sRomDataHash, sRomBssHash;
 static int sRomBssHashed;
 
-/* DIAGNOSTIC (temporary, for the tests): the state lines also go to state_log.txt, which
-   (unlike log.txt) is not cleared when the game starts again */
-#include <stdarg.h>
-#include <time.h>
-static void slog(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    va_end(ap);
-    FILE *f = fopen("state_log.txt", "a");
-    if (f) {
-        va_start(ap, fmt);
-        vfprintf(f, fmt, ap);
-        va_end(ap);
-        fclose(f);
-    }
-}
+#define slog printf
 
 static int exists(const char *path) {
     return access(path, F_OK) == 0;
@@ -841,12 +825,6 @@ void port_state_disable(const char *why) {
 }
 
 void port_state_init(const char *argv0) {
-    {
-        const time_t now = time(NULL);
-        char when[32];
-        strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", localtime(&now));
-        slog("estado: ---- jogo aberto %s ----\n", when);
-    }
     sOnion = exists(ONION_DIR);
     mkdir(SAVE_DIR, 0777);
     remove(AUTO_STATE ".tmp");
