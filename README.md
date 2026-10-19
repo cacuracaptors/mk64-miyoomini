@@ -15,13 +15,13 @@ own ROM.
 - Native 640x480
 - 60 FPS + V-sync single-player races, with dynamic resolution: in the heaviest moments the picture drops for an
   instant to as low as 448x336 instead of the frame rate dropping
+- No overclock
 - A software renderer made for the Miyoo Mini Plus:
   - perspective-correct textures and a proper depth buffer
   - rendering pipelined over both CPU cores
   - a texture filter on the road and other 3D surfaces, worked out in advance (the N64's own 3-point filter right
     in front of the camera), and dynamic resolution that keeps the heaviest tracks smooth
   - a smooth, filtered waterfall in D.K.'s Jungle Parkway
-- No overclock
 - Smooth controls: steering ramps up while held
 - Full sound: the N64 music and sound effects, mixed in software
 - Records, options and ghosts are saved
