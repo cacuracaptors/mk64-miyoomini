@@ -92,6 +92,7 @@ You can edit its `Arguments` line:
 
 ## Known issues
 
+- It crashes on the Mini Flip and Mini V4 due to their different screen resolution.
 - Occasionally, the second screen showing your competitors after the race finishes briefly flashes with random rendering artifacts.
 - An OnionOS screenshot (Menu+Power) pauses the game for about a second while it is saved.
 - The Game Switcher's picture of a saved state leaves out the 2D pieces drawn by the 2D engine (the minimap, the
