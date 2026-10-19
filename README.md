@@ -12,7 +12,7 @@ own ROM.
 
 ## OnionOS Exclusive Features
 
-- Native 640x480, no overclock needed
+- Native 640x480, V-sync on, no overclock needed
 - 60 FPS single-player races, with dynamic resolution: in the heaviest moments the picture drops for an
   instant to as low as 448x336 instead of the frame rate dropping
 - A software renderer made for the Miyoo Mini Plus:
