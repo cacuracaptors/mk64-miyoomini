@@ -103,6 +103,8 @@ You can edit its `Arguments` line:
 
 - **v1.1.6** - Mini V4 and Mini Flip: a game resumed from the Game Switcher no longer stays frozen with only
   the music playing (the screen was left at 752x560; it is now switched to 640x480, stretched over the whole panel).
+  A screen left with a single page (seen once on RedOnion: torn pictures) is also switched back to two pages, so
+  the vsync works.
 - **v1.1.5** - Smoothed HUD and menus: their large pictures are drawn by the chip's 2D engine (MI_GFX) at 640x480,
   the rest by the CPU with the texture filter (`-hudcpu` keeps it all on the CPU); menus without stutters or
   sound dropouts (Player Select), the game clock no longer loses screen refreshes; L Option / R Data banners
