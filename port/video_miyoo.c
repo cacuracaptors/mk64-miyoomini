@@ -1239,6 +1239,18 @@ static void fb_init(void) {
             v.blue.offset = 0; v.blue.length = 8;
             v.transp.offset = 24; v.transp.length = 8;
         }
+        /* the screen memory is blanked first: it still holds the previous program's picture at
+           the old row length (the Game Switcher's, 752 pixels a row), which the new mode would
+           show sheared until the game's first frame (a v4 user: a glitch of a fraction of a
+           second). Black instead, as RedOnion's fbmode --preclear does; a few ms, once. */
+        struct fb_fix_screeninfo ofix;
+        if (ioctl(fb_fd, FBIOGET_FSCREENINFO, &ofix) == 0 && ofix.smem_len) {
+            void *m = mmap(NULL, ofix.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
+            if (m != MAP_FAILED) {
+                memset(m, 0, ofix.smem_len);
+                munmap(m, ofix.smem_len);
+            }
+        }
         const int r = ioctl(fb_fd, FBIOPUT_VSCREENINFO, &v);
         printf("video: tela em %ux%u %ubpp (virtual %u linhas), passando para %dx%d com 2 paginas: %s\n", ow, oh,
                obpp, ovy, PANEL_W, PANEL_H, r == 0 ? "ok" : strerror(errno));
