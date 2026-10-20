@@ -1210,16 +1210,23 @@ static void fb_init(void) {
         printf("video: sem /dev/fb0 (nada sera mostrado)\n");
         return;
     }
-    /* the Miyoo Mini v4 and the Mini Flip (752x560 panel): /dev/fb0 can be left at 752x560 by
-       OnionOS (it switches it only around the programs it launches with FullResolution=1, and
-       back to 640x480 after them), and a game resumed from the Game Switcher there showed
-       nothing (a v4 user: the music plays, the picture stays still). As OnionOS's own
-       change_resolution does (fbset -g 640 480 640 960 32): 640x480 with two pages, which the
-       display stretches over the whole panel; batmon and keymon are told, as OnionOS tells
-       them, so their icons follow. A 640x480 screen (the Mini Plus) is left exactly as it is. */
+    /* /dev/fb0 as the previous program left it is not always 640x480 with two pages:
+       - the Miyoo Mini v4 and the Mini Flip (752x560 panel): OnionOS can leave it at 752x560
+         (it switches it only around the programs it launches with FullResolution=1, and back
+         to 640x480 after them), and a game resumed from the Game Switcher there showed nothing
+         (a v4 user: the music plays, the picture stays still);
+       - one page only (yres_virtual 480), which a previous program's SDL can put back when it
+         closes (RedOnion's menu closes SDL before each program it starts; a first RedOnion
+         install showed torn pictures in our ports): the game then drew into the page on
+         screen, without the vsync.
+       As OnionOS's own change_resolution does (fbset -g 640 480 640 960 32): 640x480 with two
+       pages, which the display stretches over the whole panel; batmon and keymon are told, as
+       OnionOS tells them, so their icons follow. Once, at the start: nothing per frame. A
+       640x480 screen with two or three pages (OnionOS on the Mini Plus) is left as it is. */
     if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &fb_var) == 0 &&
-        (fb_var.xres != PANEL_W || fb_var.yres != PANEL_H || fb_var.bits_per_pixel != 32)) {
-        const unsigned ow = fb_var.xres, oh = fb_var.yres, obpp = fb_var.bits_per_pixel;
+        (fb_var.xres != PANEL_W || fb_var.yres != PANEL_H || fb_var.bits_per_pixel != 32 ||
+         fb_var.yres_virtual < PANEL_H * 2)) {
+        const unsigned ow = fb_var.xres, oh = fb_var.yres, obpp = fb_var.bits_per_pixel, ovy = fb_var.yres_virtual;
         struct fb_var_screeninfo v = fb_var;
         v.xres = v.xres_virtual = PANEL_W;
         v.yres = PANEL_H;
@@ -1233,8 +1240,8 @@ static void fb_init(void) {
             v.transp.offset = 24; v.transp.length = 8;
         }
         const int r = ioctl(fb_fd, FBIOPUT_VSCREENINFO, &v);
-        printf("video: tela em %ux%u %ubpp, passando para %dx%d: %s\n", ow, oh, obpp, PANEL_W, PANEL_H,
-               r == 0 ? "ok" : strerror(errno));
+        printf("video: tela em %ux%u %ubpp (virtual %u linhas), passando para %dx%d com 2 paginas: %s\n", ow, oh,
+               obpp, ovy, PANEL_W, PANEL_H, r == 0 ? "ok" : strerror(errno));
         if (r == 0) {
             const int k = system("killall -SIGUSR1 batmon >/dev/null 2>&1; killall -SIGUSR1 keymon >/dev/null 2>&1");
             (void) k;
