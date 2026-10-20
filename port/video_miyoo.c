@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -1208,6 +1209,36 @@ static void fb_init(void) {
     if (fb_fd < 0) {
         printf("video: sem /dev/fb0 (nada sera mostrado)\n");
         return;
+    }
+    /* the Miyoo Mini v4 and the Mini Flip (752x560 panel): /dev/fb0 can be left at 752x560 by
+       OnionOS (it switches it only around the programs it launches with FullResolution=1, and
+       back to 640x480 after them), and a game resumed from the Game Switcher there showed
+       nothing (a v4 user: the music plays, the picture stays still). As OnionOS's own
+       change_resolution does (fbset -g 640 480 640 960 32): 640x480 with two pages, which the
+       display stretches over the whole panel; batmon and keymon are told, as OnionOS tells
+       them, so their icons follow. A 640x480 screen (the Mini Plus) is left exactly as it is. */
+    if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &fb_var) == 0 &&
+        (fb_var.xres != PANEL_W || fb_var.yres != PANEL_H || fb_var.bits_per_pixel != 32)) {
+        const unsigned ow = fb_var.xres, oh = fb_var.yres, obpp = fb_var.bits_per_pixel;
+        struct fb_var_screeninfo v = fb_var;
+        v.xres = v.xres_virtual = PANEL_W;
+        v.yres = PANEL_H;
+        v.yres_virtual = PANEL_H * 2;
+        v.xoffset = v.yoffset = 0;
+        if (obpp != 32) {
+            v.bits_per_pixel = 32;
+            v.red.offset = 16; v.red.length = 8;
+            v.green.offset = 8; v.green.length = 8;
+            v.blue.offset = 0; v.blue.length = 8;
+            v.transp.offset = 24; v.transp.length = 8;
+        }
+        const int r = ioctl(fb_fd, FBIOPUT_VSCREENINFO, &v);
+        printf("video: tela em %ux%u %ubpp, passando para %dx%d: %s\n", ow, oh, obpp, PANEL_W, PANEL_H,
+               r == 0 ? "ok" : strerror(errno));
+        if (r == 0) {
+            const int k = system("killall -SIGUSR1 batmon >/dev/null 2>&1; killall -SIGUSR1 keymon >/dev/null 2>&1");
+            (void) k;
+        }
     }
     if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &fb_var) || ioctl(fb_fd, FBIOGET_FSCREENINFO, &fix) ||
         fb_var.xres != PANEL_W || fb_var.yres != PANEL_H || fb_var.bits_per_pixel != 32 ||
