@@ -512,6 +512,17 @@ out:
     return ok;
 }
 
+/* how much MMA is still free (for the log): 1 MB pieces taken until it says no, then given back */
+static unsigned mma_free_mb(void) {
+    MI_PHY got[96];
+    unsigned n = 0;
+    while (n < 96 && mi.MmaAlloc(NULL, 1u << 20, &got[n]) == 0)
+        n++;
+    for (unsigned i = 0; i < n; i++)
+        mi.MmaFree(got[i]);
+    return n;
+}
+
 static void ge_init(void) {
     if (!ge_selftest())
         return;
@@ -531,8 +542,8 @@ static void ge_init(void) {
         if (i == 3) {
             ge_cap = sizes[k];
             ge_ok = 1;
-            printf("video: 2D (HUD, menus) pelo MI_GFX, %u KB por quadro%s\n", (unsigned) (ge_cap >> 10),
-                   ge_place ? " (o MI_GFX gira o lugar)" : "");
+            printf("video: 2D (HUD, menus) pelo MI_GFX, %u KB por quadro%s; MMA livre depois disso: %u MB\n",
+                   (unsigned) (ge_cap >> 10), ge_place ? " (o MI_GFX gira o lugar)" : "", mma_free_mb());
             return;
         }
         while (i-- > 0) {
@@ -541,7 +552,7 @@ static void ge_init(void) {
             ge_virt[i] = NULL;
         }
     }
-    printf("video: 2D pelo MI_GFX desligado (sem memoria MMA)\n");
+    printf("video: 2D pelo MI_GFX desligado (sem memoria MMA: %u MB livres)\n", mma_free_mb());
 }
 
 static inline uint32_t mul255(uint32_t a, uint32_t b) {
@@ -1384,6 +1395,15 @@ void port_video_shutdown(void) {
         /* the mappings stay until the process ends (another thread may still look at them) */
         for (int i = 0; i < 3; i++)
             mi.MmaFree(hw_phys[i]);
+        /* and the 2D engine's copies (3 x up to 2 MB): left behind, the system did not get them
+           back when the game closed, and after a day of starts there was no MMA left for the 2D
+           (the HUD and the menus drawn by the cores, unsmoothed, until a reboot) */
+        if (ge_ok) {
+            ge_ok = 0;
+            for (int i = 0; i < 3; i++)
+                if (ge_phys[i])
+                    mi.MmaFree(ge_phys[i]);
+        }
         mi.GfxClose();
     }
 #endif
