@@ -101,6 +101,9 @@ You can edit its `Arguments` line:
 
 ## Changelog
 
+- **v1.1.7** - Mini V4 and Mini Flip: no more brief glitch when the game is resumed from the Game Switcher (the
+  screen is cleared before it is switched to 640x480). The 2D engine's memory is given back when the game closes,
+  and `log.txt` tells how much of it was free at the start.
 - **v1.1.6** - Mini V4 and Mini Flip: a game resumed from the Game Switcher no longer stays frozen with only
   the music playing (the screen was left at 752x560; it is now switched to 640x480, stretched over the whole panel).
   A screen left with a single page (seen once on RedOnion: torn pictures) is also switched back to two pages, so
