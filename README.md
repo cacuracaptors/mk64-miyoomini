@@ -185,3 +185,7 @@ only where each piece comes from in the ROM, plus the few bytes the port itself 
 The decompilation and the Dreamcast port this fork is based on come without a license file; the code added for
 the Miyoo Mini Plus follows the same terms. tinf is under the zlib license (see `port/romkit/tinflate.c`).
 Mario Kart 64 is a trademark of Nintendo; no game data is included - you need your own copy of the game.
+
+## AI-Assisted
+
+Claude Opus 5.5 was used to write parts of the code and to speed up debugging and optimization.
