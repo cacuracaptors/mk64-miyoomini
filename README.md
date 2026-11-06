@@ -188,4 +188,4 @@ Mario Kart 64 is a trademark of Nintendo; no game data is included - you need yo
 
 ## AI-Assisted
 
-Claude Opus 5.5 was used to write parts of the code and to speed up debugging and optimization.
+Claude Opus 5.5 was used to write most part of the code and to speed up debugging and optimization. Even though I'm no software engineer, I have a background in the modding community, so I understand how basic rendering tricks work. I don't write complex code myself (that's why I use Claude) but I understand how it's logic works and what's going on most of the time, so I can control what Claude is doing more tightly.
