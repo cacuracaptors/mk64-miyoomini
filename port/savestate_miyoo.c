@@ -891,8 +891,11 @@ void port_state_request(int what) {
 }
 
 void port_state_menu(int press) {
-    if (press >= 0 && press < 3)
+    static const char *names[] = { "toque", "segurado", "dois toques" };
+    if (press >= 0 && press < 3) {
+        slog("botoes: MENU (%s, t=%.0f ms)\n", names[press], port_now_ms());
         sMenuPress = press;
+    }
 }
 
 int port_state_menu_double_used(void) {
@@ -977,6 +980,8 @@ void port_state_boundary(void) {
     if (sMenuPress >= 0) {
         const int press = sMenuPress;
         sMenuPress = -1;
+        slog("estado: MENU tratado no quadro (t=%.0f ms), acao %d\n", port_now_ms(),
+             sOnion ? sMenuAction[press] : -1);
         if (!sOnion) {   /* (outside OnionOS: MENU closes the game, as before) */
             if (press == PORT_MENU_SINGLE)
                 exit_saving(EXIT_QUIT);
