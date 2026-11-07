@@ -68,6 +68,8 @@ extern int port_opt_resdin;          /* -resdin: dynamic resolution */
 
 /* src/main.c (TARGET_MIYOO) */
 void port_audio_pump(void);
+void port_audio_shutdown(void);   /* audio_miyoo.c: quitting: output thread stopped, MI_AO closed */
+void gfx_sw_quiesce(void);        /* gfx_sw.c: quitting: core 1 done with its frame */
 
 /* port/video_miyoo.c: the software renderer draws into port_color / port_depth */
 extern int port_render_w, port_render_h;
@@ -76,6 +78,7 @@ extern uint32_t *port_depth;   /* 1/w x 2^28, larger = nearer, cleared to 0 */
 void port_video_init(int hires);
 void port_video_present(void);
 void port_video_shutdown(void);
+void port_video_stop(void);    /* quitting: the flip thread ends (before port_video_shutdown; not from a signal) */
 void port_video_membench(void);
 int port_video_set_vsync_clock(void (*fn)(void), void (*fallback)(void));   /* 1 = fn runs at every real vsync */
 uint16_t port_fb_pixel565(int x, int y);   /* last presented frame, N64 320x240 coords */

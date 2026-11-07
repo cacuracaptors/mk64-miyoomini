@@ -299,6 +299,20 @@ static void am_play(uint8_t *buf, size_t len) {
     pthread_mutex_unlock(&ring_mutex);
 }
 
+/* Quitting: the output thread stopped and MI_AO closed, rather than left open for the
+   process's end to tear down (as the Ocarina of Time port does) */
+void port_audio_shutdown(void) {
+#ifdef HAVE_MI_AO
+    if (started && running) {
+        running = 0;
+        pthread_join(ao_thread, NULL);
+        ao.DisableChn(0, 0);
+        ao.Disable(0);
+    }
+#endif
+    started = 0;
+}
+
 struct AudioAPI audio_dc = { am_init, am_buffered, am_get_desired_buffered, am_play };
 
 void mute_stream(void) {

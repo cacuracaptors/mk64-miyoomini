@@ -3776,6 +3776,28 @@ static void *worker_proc(void *arg) {
     return NULL;
 }
 
+/* Quitting: core 1 done with the frame it was drawing (-paralelo), so it doesn't use the 2D
+   engine or the colour buffers while they are given back. At most 0.5 s. */
+void gfx_sw_quiesce(void) {
+    if (!sWorkerOk)
+        return;
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += 500 * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec++;
+        until.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&sWMutex);
+    while (sWorkDone != sWorkGen)
+        if (pthread_cond_timedwait(&sWCond, &sWMutex, &until) != 0)
+            break;
+    const int idle = sWorkDone == sWorkGen;
+    pthread_mutex_unlock(&sWMutex);
+    if (!idle)
+        printf("gfx: o nucleo 1 nao terminou o quadro em 0,5 s\n");
+}
+
 /* -paralelo: the frame is handed to core 1 at the end of the game's frame and drawn
    while core 0 runs the game and the display list of the next one; core 0 joins in when
    it gets there. The picture is the same, shown one frame later. */

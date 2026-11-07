@@ -55,9 +55,17 @@ double port_now_ms(void) {
 }
 
 void port_quit(int code) {
+    printf("fim: fechando (t=%.0f ms)\n", port_now_ms());
+    /* everything that uses the 2D engine stops before it is given back: the flip thread,
+       then core 1's frame; then the sound */
+    port_video_stop();
+    gfx_sw_quiesce();
+    port_audio_shutdown();
+    printf("fim: tela, desenho e som parados (t=%.0f ms)\n", port_now_ms());
     port_battery_release();
     port_state_release();
     port_video_shutdown();
+    printf("fim: video liberado (t=%.0f ms)\n", port_now_ms());
     fflush(stdout);
     fflush(stderr);
     sync();

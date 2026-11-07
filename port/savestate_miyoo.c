@@ -905,7 +905,11 @@ int port_state_menu_double_used(void) {
 static void exit_saving(int kind) {
     static const char *names[] = { "fechar", "Game Switcher", "desligar", "bateria baixa", "jogo anterior" };
     const int off = kind == EXIT_POWEROFF || kind == EXIT_BATTERY;
-    slog("estado: saindo (%s)\n", names[kind]);
+    slog("estado: saindo (%s, t=%.0f ms)\n", names[kind], port_now_ms());
+    /* last resort: if anything on the way out hangs, SIGALRM ends the process (nothing
+       catches it) and OnionOS takes over, instead of a frozen screen. The state and the
+       saves are written with fsync, so 15 s is plenty */
+    alarm(15);
     if (sBootLoadPending) {
         /* the resume has not happened yet: the state on the card is still the one to go on from */
         if (off) {
