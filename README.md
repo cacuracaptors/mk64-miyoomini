@@ -136,12 +136,50 @@ This port cross-compiles for ARMv7 hard-float on Windows + WSL2, with the
   (or point `CROSS_PREFIX` at your own `arm-linux-gnueabihf-`)
 - Your Mario Kart 64 (USA) ROM as `baserom.us.z64` in the root of this repository
 
+### First time: the game's assets
+
+The decompilation's headers and data (`include/assets/`, `assets/code/`, the textures and kart pictures) are
+generated from the ROM by [Torch](https://github.com/HarbourMasters/Torch), a submodule. On a fresh clone:
+
+```bash
+git submodule update --init tools/torch
+make -C tools/torch type=release    # Torch (C++20)
+make -f Makefile.miyoo assets       # Torch: the headers and code from baserom.us.z64
+```
+
+Torch needs a C++20 compiler (the Miyoo toolchain's container has GCC 8.3: too old for it), so build it and run
+the extraction with the system's own compiler; the port and its small host tools (`n64graphics`, `mio0`...,
+which `build_miyoo.sh` builds by itself) are built where the Miyoo toolchain is. On a recent macOS (Apple clang 21,
+CMake 4), Torch's pinned dependencies need a few extra flags, and its `CMakeLists.txt` replaces `CMAKE_CXX_FLAGS`
+instead of adding to it, so the flags only get through once that line appends:
+
+```bash
+cd tools/torch
+sed -i '' 's/set(CMAKE_CXX_FLAGS "-Wno-narrowing")/set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-narrowing")/' CMakeLists.txt
+CXXFLAGS="-DFMT_CONSTEVAL= -Wno-parentheses" SDKROOT="$(xcrun --show-sdk-path)" \
+    CMAKE_POLICY_VERSION_MINIMUM=3.5 gmake type=release   # brew install cmake make
+cd ../..
+T=tools/torch/cmake-build-release/torch
+$T code baserom.us.z64 && $T header baserom.us.z64 && $T modding export baserom.us.z64
+```
+
+(`-DFMT_CONSTEVAL=`: the old fmt bundled with spdlog uses `consteval` in a way clang 21 rejects;
+`-Wno-parentheses`: Torch has a chained comparison that clang 21 makes an error; `SDKROOT`: CMake 4 no longer
+passes the macOS SDK, without which the C++ headers aren't found.) Building inside the toolchain's container
+afterwards prints a harmless CMake error about Torch's cache directory: `make -C tools` tries to rebuild it there.
+
 ### Steps
 
 ```bash
 sh port/build_miyoo.sh          # the game, with its data, in ~/fallout-miyoo/mk64-pacote (for testing)
 sh port/release_miyoo.sh 1.0.0  # the release zip, without any game data
 ```
+
+The toolchain can also be used straight from a container (for instance OnionOS's
+[dev-miyoomini-toolchain](https://github.com/OnionUI/dev-miyoomini-toolchain), which runs on Apple silicon): put
+this repository in its `workspace/` folder and run `sh port/build_miyoo.sh` inside `make shell` (the compiler is
+found in `/opt/miyoomini-toolchain`). The package is written inside the container, in `~/fallout-miyoo`: copy
+it to `~/workspace` to get it out.
 
 `release_miyoo.sh` takes the game data out of the executable (`port/romkit/romdata.py`), writes the recipe
 `mk64.rcp` that rebuilds it - and all of `dc_data/` - from the player's ROM (`port/romkit/romrecipe.c`), checks
