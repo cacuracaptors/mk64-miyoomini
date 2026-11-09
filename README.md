@@ -182,8 +182,20 @@ only where each piece comes from in the ROM, plus the few bytes the port itself 
 
 ## License
 
-The decompilation and the Dreamcast port this fork is based on come without a license file; the code added for
-the Miyoo Mini Plus follows the same terms. tinf is under the zlib license (see `port/romkit/tinflate.c`).
+The code written for this port is under the MIT License (see `LICENSE`): `port/` (renderer, video, input, sound
+output, save states, setup and romkit, build and release tools), except for the parts listed below, and
+`Makefile.miyoo`. The lines changed for the Miyoo Mini in the game's own source files are MIT too, but those files
+as a whole stay under the terms of the projects they come from.
+
+These parts come from other projects and keep their own terms; they are not covered by the MIT License:
+
+- The Mario Kart 64 decompilation (n64decomp/mk64) and the Dreamcast port this fork is based on (jnmartin84/mk64-dc),
+  which come without a license file (`src/`, `include/`, `assets/`, `courses/`, the build files and tools).
+- The software audio mixer in `port/mixer_miyoo.c` follows sm64-port's `mixer.c` (no license file); its NEON
+  version is as in mr-finster's miyoo64 MK64 port (MIT).
+- `port/romkit/tinflate.c` and `port/romkit/tinf.h`: tinf by Joergen Ibsen, zlib license.
+- The setup screen font (`port/setup_font.h`), rendered from DejaVu Sans Mono (Bitstream Vera / DejaVu font license).
+
 Mario Kart 64 is a trademark of Nintendo; no game data is included - you need your own copy of the game.
 
 ## AI-Assisted
