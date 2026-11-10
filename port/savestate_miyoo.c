@@ -891,8 +891,11 @@ void port_state_request(int what) {
 }
 
 void port_state_menu(int press) {
-    if (press >= 0 && press < 3)
+    static const char *names[] = { "toque", "segurado", "dois toques" };
+    if (press >= 0 && press < 3) {
+        slog("botoes: MENU (%s, t=%.0f ms)\n", names[press], port_now_ms());
         sMenuPress = press;
+    }
 }
 
 int port_state_menu_double_used(void) {
@@ -902,7 +905,11 @@ int port_state_menu_double_used(void) {
 static void exit_saving(int kind) {
     static const char *names[] = { "fechar", "Game Switcher", "desligar", "bateria baixa", "jogo anterior" };
     const int off = kind == EXIT_POWEROFF || kind == EXIT_BATTERY;
-    slog("estado: saindo (%s)\n", names[kind]);
+    slog("estado: saindo (%s, t=%.0f ms)\n", names[kind], port_now_ms());
+    /* last resort: if anything on the way out hangs, SIGALRM ends the process (nothing
+       catches it) and OnionOS takes over, instead of a frozen screen. The state and the
+       saves are written with fsync, so 15 s is plenty */
+    alarm(15);
     if (sBootLoadPending) {
         /* the resume has not happened yet: the state on the card is still the one to go on from */
         if (off) {
@@ -977,6 +984,8 @@ void port_state_boundary(void) {
     if (sMenuPress >= 0) {
         const int press = sMenuPress;
         sMenuPress = -1;
+        slog("estado: MENU tratado no quadro (t=%.0f ms), acao %d\n", port_now_ms(),
+             sOnion ? sMenuAction[press] : -1);
         if (!sOnion) {   /* (outside OnionOS: MENU closes the game, as before) */
             if (press == PORT_MENU_SINGLE)
                 exit_saving(EXIT_QUIT);

@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <sys/ioctl.h>
 
 #include <ultra64.h>
 #include <macros.h>
@@ -53,23 +54,16 @@ static int quit_flag;
 /* MENU on its own, timed as OnionOS's keymon times it for RetroArch: a press shorter than
    0.7 s is a single press (held longer: a long press, at 0.7 s); a second press within 0.3 s
    of the first is a double press (the single press waits that long only when a double press
-   does something). No other key (mapped or not: POWER, volume...) may be down meanwhile. */
+   does something). It is not MENU on its own when a key is pressed while MENU is down
+   (OnionOS's MENU+POWER screenshot, MENU+volume brightness, MENU+R2/L2 states...), or when a
+   system key (POWER, volume...) is already down. Game buttons already held don't count: in
+   a race A (accelerate) or the D-pad is almost always down, and counting them would make
+   MENU do nothing whenever it was pressed mid-race. */
 #define MENU_LONG_MS 700.0
 #define MENU_DOUBLE_MS 300.0
 static unsigned char down_any[KEY_MAX / 8 + 1];   /* every key code down now */
 static int menu_down, menu_mixed, menu_long_done, menu_single_wait, menu_skip_release;
 static double menu_press_t;
-
-static int others_down(void) {
-    for (int i = 0; i < (int) sizeof(down_any); i++) {
-        unsigned char m = down_any[i];
-        if (i == KEY_ESC / 8)
-            m &= (unsigned char) ~(1u << (KEY_ESC % 8));
-        if (m)
-            return 1;
-    }
-    return 0;
-}
 
 static int key_index(int code) {
     switch (code) {
@@ -92,6 +86,24 @@ static int key_index(int code) {
     }
 }
 
+/* a key down that isn't one of the game's buttons (or MENU): POWER, volume... */
+static int system_keys_down(void) {
+    for (int code = 0; code < KEY_MAX; code++)
+        if ((down_any[code / 8] & (1u << (code % 8))) && key_index(code) < 0)
+            return 1;
+    return 0;
+}
+
+/* (log) the key codes down now, as " 57 103" */
+static void log_keys_down(const char *what) {
+    char list[96] = "";
+    size_t len = 0;
+    for (int code = 0; code < KEY_MAX && len < sizeof(list) - 8; code++)
+        if (code != KEY_ESC && (down_any[code / 8] & (1u << (code % 8))))
+            len += (size_t) snprintf(list + len, sizeof(list) - len, " %d", code);
+    printf("botoes: %s (t=%.0f ms; outras teclas apertadas:%s)\n", what, port_now_ms(), len ? list : " nenhuma");
+}
+
 void port_input_init(void) {
     ev_fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
     if (ev_fd < 0)
@@ -108,6 +120,20 @@ void port_input_poll(void) {
             break;
         int n = (int) (r / sizeof(ev[0]));
         for (int i = 0; i < n; i++) {
+            if (ev[i].type == EV_SYN && ev[i].code == SYN_DROPPED) {
+                /* the kernel's queue overflowed (the game didn't read it for a while): events
+                   were lost, maybe a release, which would leave a key "down" for ever. Ask the
+                   kernel which keys are down now instead */
+                memset(down_any, 0, sizeof(down_any));
+                ioctl(ev_fd, EVIOCGKEY(sizeof(down_any)), down_any);
+                for (int code = 0; code < KEY_MAX; code++) {
+                    const int k = key_index(code);
+                    if (k >= 0)
+                        held[k] = (down_any[code / 8] >> (code % 8)) & 1;
+                }
+                log_keys_down("eventos perdidos (SYN_DROPPED): teclas relidas");
+                continue;
+            }
             if (ev[i].type != EV_KEY)
                 continue;
             const int code = ev[i].code;
@@ -125,19 +151,25 @@ void port_input_poll(void) {
                     menu_skip_release = 0;
                 }
                 menu_down = 1;
-                menu_mixed = others_down();
+                menu_mixed = system_keys_down();
                 menu_long_done = 0;
                 menu_press_t = now;
+                log_keys_down(menu_mixed ? "MENU apertado, com tecla do sistema (ignorado)" : "MENU apertado");
             } else if (code == KEY_ESC && ev[i].value == 0) {   /* MENU released */
-                if (menu_down && !menu_mixed && !menu_long_done && !menu_skip_release && !others_down()) {
+                if (menu_down && !menu_mixed && !menu_long_done && !menu_skip_release && !system_keys_down()) {
                     if (port_state_menu_double_used())
                         menu_single_wait = 1;                   /* single, unless a second press comes */
                     else
                         port_state_menu(PORT_MENU_SINGLE);
+                } else if (menu_down && !menu_long_done && !menu_skip_release) {
+                    log_keys_down(menu_mixed ? "MENU solto: era combinacao (ignorado)"
+                                             : "MENU solto com tecla do sistema (ignorado)");
                 }
                 menu_down = 0;
                 menu_skip_release = 0;
             } else if (code != KEY_ESC && ev[i].value == 1 && menu_down) {
+                if (!menu_mixed)
+                    printf("botoes: tecla %d com o MENU: combinacao (t=%.0f ms)\n", code, port_now_ms());
                 menu_mixed = 1;                                 /* another key with MENU */
                 if (code == KEY_BACKSPACE)                      /* MENU+R2 */
                     port_state_request(PORT_REQ_SAVE);
@@ -156,7 +188,7 @@ void port_input_poll(void) {
     double now = port_now_ms();
     if (menu_down && !menu_mixed && !menu_long_done && !menu_skip_release && now - menu_press_t >= MENU_LONG_MS) {
         menu_long_done = 1;                                     /* held: long press */
-        if (!others_down())
+        if (!system_keys_down())
             port_state_menu(PORT_MENU_LONG);
     }
     if (menu_single_wait && now - menu_press_t > MENU_DOUBLE_MS) {

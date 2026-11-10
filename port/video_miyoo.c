@@ -62,6 +62,7 @@ static pthread_t flip_thread;
 static pthread_mutex_t flip_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t flip_cond = PTHREAD_COND_INITIALIZER;
 static int flip_started;
+static int flip_quit, flip_done;   /* port_video_stop: the flip thread ends (under flip_mutex) */
 static int job_pending;
 static int snap_free = 1;
 static const uint16_t *snap;
@@ -1053,8 +1054,14 @@ static void *flip_proc(void *arg) {
            wait even with no frame queued: with -paralelo the first frame is only shown after
            the game's next frame, and that one waits for the clock (it used to stay here
            until a frame came, so both waited for each other at startup) */
-        while (!job_pending && !(vsync_cb && fb_pages == 2))
+        while (!job_pending && !flip_quit && !(vsync_cb && fb_pages == 2))
             pthread_cond_wait(&flip_cond, &flip_mutex);
+        if (flip_quit) {   /* quitting (port_video_stop): no more work for the 2D engine */
+            flip_done = 1;
+            pthread_cond_broadcast(&flip_cond);
+            pthread_mutex_unlock(&flip_mutex);
+            return NULL;
+        }
         int job = job_pending;
         job_pending = 0;
         const uint16_t *src = snap;
@@ -1328,6 +1335,33 @@ void port_video_init(int hires) {
         pthread_detach(flip_thread);
         flip_started = 1;
     }
+}
+
+/* Quitting: the flip thread ends before the 2D engine's memory is given back
+   (port_video_shutdown). It is the vsync clock, so it never stops on its own: the engine's
+   memory was freed and the engine closed while it could still be queueing copies and waiting
+   on the engine (a likely cause of the freezes seen on the way to the Game Switcher). Not
+   from a signal handler (it locks). */
+void port_video_stop(void) {
+    if (!flip_started)
+        return;
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += 500 * 1000000L;   /* a copy and a vsync take ~20 ms */
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec++;
+        until.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&flip_mutex);
+    flip_quit = 1;
+    pthread_cond_broadcast(&flip_cond);
+    while (!flip_done)
+        if (pthread_cond_timedwait(&flip_cond, &flip_mutex, &until) != 0)
+            break;
+    const int done = flip_done;
+    pthread_mutex_unlock(&flip_mutex);
+    if (!done)
+        printf("video: a thread da tela nao parou em 0,5 s (etapa %d)\n", port_flip_stage);
 }
 
 void port_video_present(void) {

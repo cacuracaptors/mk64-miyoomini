@@ -558,6 +558,13 @@ ASSET_INCLUDES := $(shell find $(ASSET_DIR)/include -type f -name "*.mk")
 
 $(foreach inc,$(ASSET_INCLUDES),$(eval include $(inc)))
 
+# Each assembly file depends on the generated asset files it .incbin's. The asset rules above
+# hang them off other objects (the karts' .bin off data/karts/*_kart.o, for instance), but
+# data/zkarts/all_kart.s and data/textures_0a.s pull them in too: without this, a parallel build
+# could assemble those first and stop at "file not found" on a fresh checkout.
+incbin_assets = $(shell sed -n 's/.*incbin "\(assets\/[^"]*\)".*/\1/p' $(1))
+$(foreach s,$(S_FILES),$(eval $(BUILD_DIR)/$(s:.s=.o): $(call incbin_assets,$(s))))
+
 
 
 #==============================================================================#
